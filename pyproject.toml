@@ -27,6 +27,7 @@ classifiers=[
 
 dependencies = [
     "assoc-scan",
+    "einx>=0.3.0",
     "einops>=0.8.0",
     "rotary-embedding-torch",
     "torch>=2.4"
@@ -37,7 +38,12 @@ Homepage = "https://pypi.org/project/locoformer/"
 Repository = "https://github.com/lucidrains/locoformer"
 
 [project.optional-dependencies]
-examples = []
+
+examples = [
+    "accelerate",
+    "tqdm"
+]
+
 test = [
     "pytest"
 ]

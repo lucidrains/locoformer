@@ -1,3 +1,4 @@
+from __future__ import annotations
 from functools import partial
 
 import torch
@@ -149,10 +150,14 @@ class Attention(Module):
         pre_rmsnorm = True
     ):
         super().__init__()
-        self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
         self.scale = dim_head ** -0.5
+
+        self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
+
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        self.rotary_embed = RotaryEmbedding(dim_head)
 
         dim_inner = dim_head * heads
         self.to_q = LinearNoBias(dim, dim_inner)
@@ -171,14 +176,25 @@ class Attention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
+        q = q * self.scale
+
+        if return_kv_cache:
+            next_kv_cache = stack((k, v))
+
         if exists(kv_cache):
             ck, cv = kv_cache
             k = cat((ck, k), dim = -2)
             v = cat((cv, v), dim = -2)
 
-        q = q * self.scale
+        q, k = self.rotary_embed.rotate_queries_with_cached_keys(q, k)
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+
+        i, j = sim.shape[-2:]
+
+        causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
+
+        sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim = -1)
 
@@ -191,7 +207,7 @@ class Attention(Module):
         if not return_kv_cache:
             return out
 
-        return out, stack((k, v))
+        return out, next_kv_cache
 
 class FeedForward(Module):
     def __init__(
@@ -266,17 +282,44 @@ class TransformerXL(Module):
             x = attn_out + x
             x = ff(x) + x
 
-        out = self.norm(x)
+        embed = self.norm(x)
 
         if not return_kv_cache:
-            return out
+            return embed
 
-        return out, next_kv_caches
+        return embed, stack(next_kv_caches)
 
 # class
 
-class Actor(Module):
+class Locoformer(Module):
     def __init__(
-        self
+        self,
+        embedder: Module,
+        unembedder: Module,
+        transformer: dict | TransformerXL
     ):
         super().__init__()
+
+        if isinstance(transformer, dict):
+            transformer = TransformerXL(**transformer)
+
+        self.transformer = transformer
+        self.embedder = embedder
+        self.unembedder = unembedder
+
+    def forward(
+        self,
+        seq,
+        cache: Tensor | None = None,
+        detach_cache = False
+    ):
+        tokens = self.embedder(seq)
+
+        embed, kv_cache = self.transformer(tokens, cache = cache, return_kv_cache = True)
+
+        logits = self.unembedder(embed)
+
+        if detach_cache:
+            kv_cache = detach_all(kv_cache)
+
+        return logits, kv_cache
