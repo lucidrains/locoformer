@@ -6,7 +6,6 @@
 # ]
 # ///
 
-import random
 import tqdm
 import gzip
 from math import ceil
@@ -162,18 +161,17 @@ for i in range(NUM_BATCHES):
         model.eval()
 
         val_seq = next(val_loader_iter)
-        prime = random.choice(val_seq)[:PRIME_LENGTH]
-        prime = rearrange(prime, 'n -> 1 n')
+        prime = val_seq[0, :PRIME_LENGTH]
 
         prime = prime.to(model.device)
         out = prime
 
-        stateful_forward, logits = model.get_stateful_forward(SEQ_LEN, initial_states = prime, inference_mode = True)
+        stateful_forward, logits = model.get_stateful_forward(SEQ_LEN, has_batch_dim = False, initial_states = prime, inference_mode = True)
 
         # sample
 
         while out.shape[-1] < GENERATE_LENGTH:
-            filtered_logits = topk_logits_filter(logits[:, -1])
+            filtered_logits = topk_logits_filter(logits[-1])
 
             sampled = gumbel_sample(filtered_logits)
             out = torch.cat((out, sampled), dim = -1)
@@ -182,8 +180,8 @@ for i in range(NUM_BATCHES):
 
         # decoded
 
-        decoded_prime = decode_tokens(prime[0].cpu())
-        decoded_string = decode_tokens(out[0, PRIME_LENGTH:].cpu())
+        decoded_prime = decode_tokens(prime.cpu())
+        decoded_string = decode_tokens(out[PRIME_LENGTH:].cpu())
 
         print(f'\n\n[prime]: {decoded_prime}\n\n')
         print('*' * 100)

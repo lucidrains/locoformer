@@ -323,21 +323,34 @@ class Locoformer(Module):
         segment_size,
         initial_states: Tensor | None = None,
         inference_mode = False,
+        has_batch_dim = False,
         **kwargs
     ):
         cache = None
 
-        def stateful_forward(state: Tensor):
+        def stateful_forward(state: Tensor, override_kwargs: dict = dict()):
             nonlocal cache
 
-            out, cache = self.forward(state, cache = cache, **kwargs)
+            # handle no batch, for easier time rolling out against envs
 
-            cache_len = cache.shape[-2]
+            if not has_batch_dim:
+                state = rearrange(state, '... -> 1 ...')
+
+            # forwards
+
+            out, cache = self.forward(state, cache = cache, **{**kwargs, **override_kwargs})
 
             # handle cache
 
+            cache_len = cache.shape[-2]
+
             if divisible_by(cache_len, segment_size * 2):
                 cache = cache[..., -segment_size:, :]
+
+            # maybe remove batch
+
+            if not has_batch_dim:
+                out = tree_map_tensor(out, lambda t: rearrange(t, '1 ... -> ...'))
 
             return out
 
@@ -352,10 +365,11 @@ class Locoformer(Module):
         initial_logits = []
 
         for state_segments in initial_states.split(segment_size, dim = -1):
-            logits = stateful_forward(state_segments)
+
+            logits = stateful_forward(state_segments, return_values = False)
             initial_logits.append(logits)
 
-        initial_logits = cat(initial_logits, dim = 1)
+        initial_logits = cat(initial_logits, dim = -2)
 
         return stateful_forward, initial_logits
 
