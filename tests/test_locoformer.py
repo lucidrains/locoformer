@@ -4,6 +4,8 @@ param = pytest.mark.parametrize
 import torch
 from x_mlps_pytorch import MLP
 
+from einops import rearrange
+
 def test_locoformer():
     from locoformer.locoformer import Locoformer
     from torch import nn
@@ -25,3 +27,11 @@ def test_locoformer():
     (logits, values), cache = model(seq, return_values = True, cache = cache)
 
     assert logits.shape == (3, 512, 256)
+
+    stateful_forward = model.get_stateful_forward(256, return_values = True, inference_mode = True)
+
+    for state in seq.unbind(dim = -1):
+        state = rearrange(state, 'b -> b 1')
+
+        logits, values = stateful_forward(state)
+        assert logits.shape == (3, 1, 256)

@@ -24,6 +24,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def tree_map_tensor(x, fn):
     return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
 
@@ -178,13 +181,13 @@ class Attention(Module):
 
         q = q * self.scale
 
-        if return_kv_cache:
-            next_kv_cache = stack((k, v))
-
         if exists(kv_cache):
             ck, cv = kv_cache
             k = cat((ck, k), dim = -2)
             v = cat((cv, v), dim = -2)
+
+        if return_kv_cache:
+            next_kv_cache = stack((k, v))
 
         q, k = self.rotary_embed.rotate_queries_with_cached_keys(q, k)
 
@@ -311,6 +314,37 @@ class Locoformer(Module):
 
         self.value_network = value_network
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def get_stateful_forward(
+        self,
+        segment_size,
+        inference_mode = False,
+        **kwargs
+    ):
+        cache = None
+
+        def stateful_forward(state: Tensor):
+            nonlocal cache
+
+            out, cache = self.forward(state, cache = cache, **kwargs)
+
+            cache_len = cache.shape[-2]
+
+            # handle cache
+
+            if divisible_by(cache_len, segment_size * 2):
+                cache = cache[..., -segment_size:, :]
+
+            return out
+
+        if inference_mode:
+            stateful_forward = torch.inference_mode()(stateful_forward)
+
+        return stateful_forward
+
     def forward(
         self,
         state: Tensor,
@@ -318,6 +352,7 @@ class Locoformer(Module):
         detach_cache = False,
         return_values = False
     ):
+
         tokens = self.embedder(state)
 
         embed, kv_cache = self.transformer(tokens, cache = cache, return_kv_cache = True)

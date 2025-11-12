@@ -9,6 +9,7 @@
 import random
 import tqdm
 import gzip
+from math import ceil
 import numpy as np
 
 import torch
@@ -27,14 +28,14 @@ from locoformer.locoformer import Locoformer
 
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 16
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 
-GENERATE_EVERY  = 500
-PRIME_LENGTH    = 512
+GENERATE_EVERY  = 50
+PRIME_LENGTH    = 32
 GENERATE_LENGTH = 1024
 
-SEQ_LEN = 512
+SEQ_LEN = 256
 NUM_SEGMENTS = 4
 
 # helpers
@@ -44,11 +45,35 @@ def cycle(loader):
         for data in loader:
             yield data
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def decode_token(token):
     return str(chr(max(32, token)))
 
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
+
+# sampling
+
+def log(t, eps = 1e-20):
+    return t.clamp(min = eps).log()
+
+def gumbel_noise(t):
+    return -log(-log(torch.rand_like(t)))
+
+def gumbel_sample(logits, temperature = 1., eps = 1e-6, keepdim = True):
+    noise = gumbel_noise(logits)
+    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1, keepdim = keepdim)
+
+def topk_logits_filter(logits, frac_num_tokens = 0.1):
+    num_tokens = logits.shape[-1]
+    k = ceil(frac_num_tokens * num_tokens)
+
+    val, ind = torch.topk(logits, k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(-1, ind, val)
+    return probs
 
 # instantiate model
 
@@ -66,7 +91,7 @@ model = Locoformer(
 # prepare enwik8 data
 
 with gzip.open('./data/enwik8.gz') as file:
-    data = np.fromstring(file.read(int(95e6)), dtype = np.uint8)
+    data = np.frombuffer(file.read(int(95e6)), dtype = np.uint8).copy()
     train_data, valid_data = np.split(data, [int(90e6)])
     data_train, data_val = from_numpy(train_data), from_numpy(valid_data)
 
@@ -104,8 +129,10 @@ model, optim, train_loader = accelerate.prepare(model, optim, train_loader)
 # training loop
 
 train_loader_iter = cycle(train_loader)
+val_loader_iter = cycle(val_loader)
 
-for _ in range(NUM_BATCHES):
+for i in range(NUM_BATCHES):
+    model.train()
 
     seq = next(train_loader_iter)
     seq, labels = seq[:, :-1], seq[:, 1:]
@@ -126,7 +153,39 @@ for _ in range(NUM_BATCHES):
         )
 
         accelerate.backward(loss / NUM_SEGMENTS)
-        accelerate.print(f'loss: {loss.item():.3f}')
+        accelerate.print(f'[{i}] loss: {loss.item():.3f}')
 
         optim.step()
         optim.zero_grad()
+
+    if divisible_by(i + 1, GENERATE_EVERY):
+        model.eval()
+
+        val_seq = next(val_loader_iter)
+        prime = random.choice(val_seq)[:PRIME_LENGTH]
+        prime = rearrange(prime, 'n -> 1 n')
+
+        stateful_forward = model.get_stateful_forward(SEQ_LEN, inference_mode = True)
+
+        out = prime.to(model.device)
+        next_input = out
+
+        # sample
+
+        while out.shape[-1] < GENERATE_LENGTH:
+            logits = stateful_forward(next_input)
+
+            filtered_logits = topk_logits_filter(logits[:, -1])
+            sampled = gumbel_sample(filtered_logits)
+
+            out = torch.cat((out, sampled), dim = -1)
+            next_input = sampled
+
+        # decoded
+
+        decoded_prime = decode_tokens(prime[0].cpu())
+        decoded_string = decode_tokens(out[0, PRIME_LENGTH:].cpu())
+
+        print(f'\n\n[prime]: {decoded_prime}\n\n')
+        print('*' * 100)
+        print(f'\n\n [generated]: {decoded_string}\n\n')
