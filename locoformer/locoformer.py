@@ -321,6 +321,7 @@ class Locoformer(Module):
     def get_stateful_forward(
         self,
         segment_size,
+        initial_states: Tensor | None = None,
         inference_mode = False,
         **kwargs
     ):
@@ -343,7 +344,20 @@ class Locoformer(Module):
         if inference_mode:
             stateful_forward = torch.inference_mode()(stateful_forward)
 
-        return stateful_forward
+        # handle prompt
+
+        if not exists(initial_states):
+            return stateful_forward
+
+        initial_logits = []
+
+        for state_segments in initial_states.split(segment_size, dim = -1):
+            logits = stateful_forward(state_segments)
+            initial_logits.append(logits)
+
+        initial_logits = cat(initial_logits, dim = 1)
+
+        return stateful_forward, initial_logits
 
     def forward(
         self,

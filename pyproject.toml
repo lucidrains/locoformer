@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.0.3"
+version = "0.0.4"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

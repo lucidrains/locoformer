@@ -31,7 +31,7 @@ BATCH_SIZE = 16
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 
-GENERATE_EVERY  = 50
+GENERATE_EVERY  = 250
 PRIME_LENGTH    = 32
 GENERATE_LENGTH = 1024
 
@@ -165,21 +165,20 @@ for i in range(NUM_BATCHES):
         prime = random.choice(val_seq)[:PRIME_LENGTH]
         prime = rearrange(prime, 'n -> 1 n')
 
-        stateful_forward = model.get_stateful_forward(SEQ_LEN, inference_mode = True)
+        prime = prime.to(model.device)
+        out = prime
 
-        out = prime.to(model.device)
-        next_input = out
+        stateful_forward, logits = model.get_stateful_forward(SEQ_LEN, initial_states = prime, inference_mode = True)
 
         # sample
 
         while out.shape[-1] < GENERATE_LENGTH:
-            logits = stateful_forward(next_input)
-
             filtered_logits = topk_logits_filter(logits[:, -1])
-            sampled = gumbel_sample(filtered_logits)
 
+            sampled = gumbel_sample(filtered_logits)
             out = torch.cat((out, sampled), dim = -1)
-            next_input = sampled
+
+            logits = stateful_forward(sampled)
 
         # decoded
 
