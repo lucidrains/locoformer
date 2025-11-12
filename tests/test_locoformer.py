@@ -28,7 +28,7 @@ def test_locoformer():
 
     assert logits.shape == (3, 512, 256)
 
-    stateful_forward = model.get_stateful_forward(256, return_values = True, inference_mode = True)
+    stateful_forward = model.get_stateful_forward(256, has_batch_dim = True, return_values = True, inference_mode = True)
 
     for state in seq.unbind(dim = -1):
         state = rearrange(state, 'b -> b 1')
