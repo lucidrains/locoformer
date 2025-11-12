@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity
 from torch.utils._pytree import tree_map
 
-from einops import einsum
+from einops import rearrange, einsum
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -296,7 +296,8 @@ class Locoformer(Module):
         self,
         embedder: Module,
         unembedder: Module,
-        transformer: dict | TransformerXL
+        transformer: dict | TransformerXL,
+        value_network: Module | None = None
     ):
         super().__init__()
 
@@ -304,22 +305,47 @@ class Locoformer(Module):
             transformer = TransformerXL(**transformer)
 
         self.transformer = transformer
+
         self.embedder = embedder
         self.unembedder = unembedder
 
+        self.value_network = value_network
+
     def forward(
         self,
-        seq,
+        state: Tensor,
         cache: Tensor | None = None,
-        detach_cache = False
+        detach_cache = False,
+        return_values = False
     ):
-        tokens = self.embedder(seq)
+        tokens = self.embedder(state)
 
         embed, kv_cache = self.transformer(tokens, cache = cache, return_kv_cache = True)
 
-        logits = self.unembedder(embed)
+        # unembed to actions - in language models this would be the next state
+
+        action_logits = self.unembedder(embed)
+
+        out = action_logits
+
+        # maybe detach cache
 
         if detach_cache:
             kv_cache = detach_all(kv_cache)
 
-        return logits, kv_cache
+        # handle returning of values
+
+        if return_values:
+            assert exists(self.value_network)
+
+            values = self.value_network(embed)
+
+            if values.ndim == 3:
+                assert values.shape[-1] == 1
+                values = rearrange(values, '... 1 -> ...')
+
+            out = (out, values)
+
+        # output and cache
+
+        return out, kv_cache
