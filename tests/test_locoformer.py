@@ -16,7 +16,8 @@ def test_locoformer():
         value_network = MLP(128, 32, 1),
         transformer = dict(
             dim = 128,
-            depth = 1
+            depth = 1,
+            window_size = 256
         )
     )
 

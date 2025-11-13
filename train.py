@@ -36,6 +36,7 @@ GENERATE_LENGTH = 1024
 
 SEQ_LEN = 256
 NUM_SEGMENTS = 4
+FIXED_WINDOW_SIZE = False
 
 # helpers
 
@@ -83,7 +84,9 @@ model = Locoformer(
     unembedder = nn.Linear(dim_model, 256, bias = False),
     transformer = dict(
         dim = dim_model,
-        depth = 6
+        depth = 6,
+        fixed_window_size = FIXED_WINDOW_SIZE,
+        window_size = SEQ_LEN
     )
 )
 
@@ -166,7 +169,7 @@ for i in range(NUM_BATCHES):
         prime = prime.to(model.device)
         out = prime
 
-        stateful_forward, logits = model.get_stateful_forward(SEQ_LEN, has_batch_dim = False, initial_states = prime, inference_mode = True)
+        stateful_forward, logits = model.get_stateful_forward(has_batch_dim = False, initial_states = prime, inference_mode = True)
 
         # sample
 
