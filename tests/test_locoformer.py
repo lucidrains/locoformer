@@ -16,7 +16,8 @@ def test_locoformer():
         value_network = MLP(128, 32, 1),
         transformer = dict(
             dim = 128,
-            depth = 1
+            depth = 1,
+            window_size = 512
         )
     )
 
@@ -28,7 +29,7 @@ def test_locoformer():
 
     assert logits.shape == (3, 512, 256)
 
-    stateful_forward = model.get_stateful_forward(256, has_batch_dim = True, return_values = True, inference_mode = True)
+    stateful_forward = model.get_stateful_forward(has_batch_dim = True, return_values = True, inference_mode = True)
 
     for state in seq.unbind(dim = -1):
         state = rearrange(state, 'b -> b 1')

@@ -2,11 +2,12 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import cat, stack, is_tensor
+from torch import nn, cat, stack, arange, is_tensor
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity
+from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map
 
+import einx
 from einops import rearrange, einsum
 from einops.layers.torch import Rearrange
 
@@ -23,6 +24,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def first(arr):
+    return arr[0]
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -148,9 +152,12 @@ class Attention(Module):
     def __init__(
         self,
         dim,
+        window_size,
         dim_head = 64,
         heads = 8,
-        pre_rmsnorm = True
+        pre_rmsnorm = True,
+        fixed_window_size = False,
+        accept_value_residual = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -167,19 +174,54 @@ class Attention(Module):
         self.to_kv = LinearNoBias(dim, dim_inner * 2)
         self.to_out = LinearNoBias(dim_inner, dim)
 
+        self.to_v_gates = Sequential(
+            LinearNoBias(dim, heads),
+            Rearrange('b n h -> b h n 1'),
+            nn.Sigmoid()
+        )
+
+        # value residual
+
+        self.accept_value_residual = accept_value_residual
+
+        if accept_value_residual:
+            self.to_value_residual_mix = Sequential(
+                LinearNoBias(dim, heads),
+                Rearrange('b n h -> b h n 1'),
+                nn.Sigmoid()                
+            )
+
+        # fixed window size
+
+        self.fixed_window_size = fixed_window_size
+        self.window_size = window_size
+
     def forward(
         self,
         tokens,
+        value_residual = None,
         kv_cache = None,
-        return_kv_cache = False
+        return_kv_cache = False,
     ):
+        seq_len = tokens.shape[-2]
+        assert seq_len <= self.window_size
+
+        device = tokens.device
+
         tokens = self.norm(tokens)
 
         q, k, v = (self.to_q(tokens), *self.to_kv(tokens).chunk(2, dim = -1))
 
         q, k, v = map(self.split_heads, (q, k, v))
 
+        orig_v = v
+
         q = q * self.scale
+
+        if exists(value_residual):
+            assert self.accept_value_residual
+            mix = self.to_value_residual_mix(tokens)
+            v = v.lerp(value_residual, mix)
 
         if exists(kv_cache):
             ck, cv = kv_cache
@@ -195,13 +237,21 @@ class Attention(Module):
 
         i, j = sim.shape[-2:]
 
-        causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
+        if self.fixed_window_size:
+            i_seq = arange(i, device = device)
+            j_seq = arange(j, device = device) - (j - i)
+            dist = einx.subtract('i, j -> i j', i_seq, j_seq)
+            causal_mask = (dist < 0) | (dist > self.window_size)
+        else:
+            causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
 
         sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim = -1)
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        out = out * self.to_v_gates(tokens)
 
         out = self.merge_heads(out)
 
@@ -210,7 +260,7 @@ class Attention(Module):
         if not return_kv_cache:
             return out
 
-        return out, next_kv_cache
+        return out, (next_kv_cache, orig_v)
 
 class FeedForward(Module):
     def __init__(
@@ -244,17 +294,21 @@ class TransformerXL(Module):
         self,
         dim,
         depth,
+        window_size,
         dim_head = 64,
         heads = 8,
         expansion_factor = 4.,
-        final_norm = True
+        final_norm = True,
+        fixed_window_size = False,
     ):
         super().__init__()
 
         layers = ModuleList([])
 
-        for _ in range(depth):
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads)
+        for i in range(depth):
+            is_first = i == 0
+
+            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first)
 
             ff = FeedForward(dim = dim, expansion_factor = expansion_factor)
 
@@ -264,6 +318,11 @@ class TransformerXL(Module):
 
         self.layers = layers
         self.norm = RMSNorm(dim) if final_norm else Identity()
+
+        # fixed window size
+
+        self.fixed_window_size = fixed_window_size
+        self.window_size = window_size
 
     def forward(
         self,
@@ -275,22 +334,28 @@ class TransformerXL(Module):
         cache = default(cache, (None,) * len(self.layers))
 
         next_kv_caches = []
+        value_residual = None
 
         for (attn, ff), kv_cache in zip(self.layers, cache):
 
-            attn_out, next_kv_cache = attn(x, kv_cache = kv_cache, return_kv_cache = True)
-
-            next_kv_caches.append(next_kv_cache)
+            attn_out, (next_kv_cache, values) = attn(x, value_residual = value_residual, kv_cache = kv_cache, return_kv_cache = True)
 
             x = attn_out + x
             x = ff(x) + x
+
+            next_kv_caches.append(next_kv_cache)
+            value_residual = default(value_residual, values)
 
         embed = self.norm(x)
 
         if not return_kv_cache:
             return embed
 
-        return embed, stack(next_kv_caches)
+        next_kv_cache = stack(next_kv_caches)
+
+        next_kv_cache = next_kv_cache[..., -self.window_size:, :]
+
+        return embed, next_kv_cache
 
 # class
 
@@ -314,21 +379,25 @@ class Locoformer(Module):
 
         self.value_network = value_network
 
+        self.fixed_window_size = transformer.fixed_window_size
+        self.window_size = transformer.window_size
+
     @property
     def device(self):
         return next(self.parameters()).device
 
     def get_stateful_forward(
         self,
-        segment_size,
         initial_states: Tensor | None = None,
         inference_mode = False,
         has_batch_dim = False,
         **kwargs
     ):
+        window_size = self.window_size
+
         cache = None
 
-        def stateful_forward(state: Tensor, override_kwargs: dict = dict()):
+        def stateful_forward(state: Tensor, **override_kwargs):
             nonlocal cache
 
             # handle no batch, for easier time rolling out against envs
@@ -344,8 +413,8 @@ class Locoformer(Module):
 
             cache_len = cache.shape[-2]
 
-            if divisible_by(cache_len, segment_size * 2):
-                cache = cache[..., -segment_size:, :]
+            if self.fixed_window_size or divisible_by(cache_len, window_size * 2):
+                cache = cache[..., -window_size:, :]
 
             # maybe remove batch
 
@@ -364,7 +433,7 @@ class Locoformer(Module):
 
         initial_logits = []
 
-        for state_segments in initial_states.split(segment_size, dim = -1):
+        for state_segments in initial_states.split(self.window_size, dim = -1):
 
             logits = stateful_forward(state_segments, return_values = False)
             initial_logits.append(logits)
