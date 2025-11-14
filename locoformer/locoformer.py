@@ -2,7 +2,7 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn, cat, stack, arange, is_tensor
+from torch import nn, cat, stack, arange, Tensor, is_tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map
@@ -386,11 +386,18 @@ class Locoformer(Module):
     def device(self):
         return next(self.parameters()).device
 
+    def actor_parameters(self):
+        return self.unembedder.parameters()
+
+    def critic_parameters(self):
+        return self.value_network.parameters()
+
     def get_stateful_forward(
         self,
         initial_states: Tensor | None = None,
         inference_mode = False,
         has_batch_dim = False,
+        has_time_dim = False,
         **kwargs
     ):
         window_size = self.window_size
@@ -400,10 +407,13 @@ class Locoformer(Module):
         def stateful_forward(state: Tensor, **override_kwargs):
             nonlocal cache
 
-            # handle no batch, for easier time rolling out against envs
+            # handle no batch or time, for easier time rolling out against envs
 
             if not has_batch_dim:
                 state = rearrange(state, '... -> 1 ...')
+
+            if not has_time_dim:
+                state = rearrange(state, '... d -> ... 1 d')
 
             # forwards
 
@@ -416,7 +426,10 @@ class Locoformer(Module):
             if self.fixed_window_size or divisible_by(cache_len, window_size * 2):
                 cache = cache[..., -window_size:, :]
 
-            # maybe remove batch
+            # maybe remove batch or time
+
+            if not has_time_dim:
+                out = tree_map_tensor(out, lambda t: rearrange(t, '... 1 d -> ... d'))
 
             if not has_batch_dim:
                 out = tree_map_tensor(out, lambda t: rearrange(t, '1 ... -> ...'))
