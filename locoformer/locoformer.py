@@ -1,8 +1,10 @@
 from __future__ import annotations
 from functools import partial
 
+from numpy import ndarray
+
 import torch
-from torch import nn, cat, stack, arange, Tensor, is_tensor
+from torch import nn, cat, stack, arange, Tensor, tensor, is_tensor, from_numpy
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map
@@ -392,6 +394,31 @@ class Locoformer(Module):
     def critic_parameters(self):
         return self.value_network.parameters()
 
+    def wrap_env_functions(self, env):
+
+        def wrapped_reset(*args, **kwargs):
+            state, _ =  env.reset(*args, **kwargs)
+
+            if isinstance(state, ndarray):
+                state = from_numpy(state)
+
+            return state, _
+
+        def wrapped_step(action, *args, **kwargs):
+            out = env.step(action.item(), *args, **kwargs)
+
+            def transform_output(el):
+                if isinstance(el, ndarray):
+                    return from_numpy(el)
+                elif isinstance(el, (int, bool, float)):
+                    return tensor(el)
+                else:
+                    return el
+
+            return tree_map(transform_output, out)
+
+        return wrapped_reset, wrapped_step
+
     def get_stateful_forward(
         self,
         initial_states: Tensor | None = None,
@@ -462,6 +489,8 @@ class Locoformer(Module):
         detach_cache = False,
         return_values = False
     ):
+
+        state = state.to(self.device)
 
         tokens = self.embedder(state)
 
