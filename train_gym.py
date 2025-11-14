@@ -1,0 +1,168 @@
+# /// script
+# dependencies = [
+#     "accelerate",
+#     "fire",
+#     "gymnasium[box2d]>=1.0.0",
+#     "locoformer",
+#     "moviepy",
+#     "tqdm"
+# ]
+# ///
+
+from fire import Fire
+from shutil import rmtree
+from tqdm import tqdm
+from collections import deque
+
+from accelerate import Accelerator
+
+import gymnasium as gym
+
+import torch
+from torch import from_numpy, randint, tensor, stack
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
+from torch.optim import Adam
+
+from locoformer.locoformer import Locoformer
+from x_mlps_pytorch import MLP
+
+# helper functions
+
+def exists(v):
+    return v is not None
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def log(t, eps = 1e-20):
+    return t.clamp(min = eps).log()
+
+def gumbel_noise(t):
+    return -log(-log(torch.rand_like(t)))
+
+def gumbel_sample(logits, temperature = 1., eps = 1e-6):
+    noise = gumbel_noise(logits)
+    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1)
+
+# main function
+
+def main(
+    env_name = 'LunarLander-v3',
+    num_episode = 50_000,
+    max_timestep = 500,
+    num_timestep_before_learn = 5000,
+    clear_video = True,
+    video_folder = 'recordings',
+    record_every_episode = 250,
+    discount_factor = 0.99,
+    learning_rate = 1e-4,
+    batch_size = 16,
+    epochs = 2
+):
+
+    # accelerate
+
+    accelerate = Accelerator()
+    device = accelerate.device
+
+    # environment
+
+    env = gym.make(env_name, render_mode = 'rgb_array')
+
+    if clear_video:
+        rmtree(video_folder, ignore_errors = True)
+
+    env = gym.wrappers.RecordVideo(
+        env = env,
+        video_folder = video_folder,
+        name_prefix = 'lunar-video',
+        episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
+        disable_logger = True
+    )
+
+    dim_state = env.observation_space.shape[0]
+    num_actions = env.action_space.n
+
+    # memory
+
+    memories = deque([])
+
+    # networks
+
+    locoformer = Locoformer(
+        embedder = MLP(dim_state, 64, bias = False),
+        unembedder = MLP(64, num_actions, bias = False),
+        value_network = MLP(64, 1, bias = False),
+        transformer = dict(
+            dim = 64,
+            dim_head = 32,
+            heads = 4,
+            depth = 4,
+            window_size = 16
+        )
+    ).to(device)
+
+    optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate)
+    optim_critic = Adam([*locoformer.transformer.parameters(), *locoformer.critic_parameters()], lr = learning_rate)
+
+    timesteps_learn = 0
+
+    # loop
+
+    for _ in tqdm(range(num_episode)):
+        state, *_ = env.reset()
+
+        timestep = 0
+
+        stateful_forward = locoformer.get_stateful_forward(has_batch_dim = False, has_time_dim = False, inference_mode = True)
+
+        while True:
+            torch_state = from_numpy(state).to(device)
+
+            # predict next action
+
+            action_logits, value = stateful_forward(torch_state, return_values = True)
+
+            action = gumbel_sample(action_logits)
+
+            # pass to environment
+
+            next_state, reward, truncated, terminated, *_ = env.step(action.item())
+
+            # append to memory
+
+            done = truncated or terminated
+
+            memories.append((
+                from_numpy(state),
+                action.cpu(),
+                tensor(reward).float(),
+                value.cpu(),
+                tensor(done)
+            ))
+
+            # increment counters
+
+            timestep += 1
+            timesteps_learn += 1
+
+            # learn if hit the number of learn timesteps
+
+            if timesteps_learn >= num_timestep_before_learn:
+                # todo - carry out learning
+
+                timesteps_learn = 0
+                memories.clear()
+
+            # break if done or exceed max timestep
+
+            if done or timestep >= max_timestep:
+                break
+
+            state = next_state
+
+# main
+
+if __name__ == '__main__':
+    Fire(main)
