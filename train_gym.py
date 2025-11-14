@@ -108,34 +108,38 @@ def main(
 
     timesteps_learn = 0
 
+    # able to wrap the env for all values to torch tensors and back
+    # all environments should follow usual MDP interface, domain randomization should be given at instantiation
+
+    env_reset, env_step = locoformer.wrap_env_functions(env)
+
     # loop
 
     for _ in tqdm(range(num_episode)):
-        state, *_ = env.reset()
+        state, *_ = env_reset()
 
         timestep = 0
 
         stateful_forward = locoformer.get_stateful_forward(has_batch_dim = False, has_time_dim = False, inference_mode = True)
 
         while True:
-            torch_state = from_numpy(state).to(device)
 
             # predict next action
 
-            action_logits, value = stateful_forward(torch_state, return_values = True)
+            action_logits, value = stateful_forward(state, return_values = True)
 
             action = gumbel_sample(action_logits)
 
             # pass to environment
 
-            next_state, reward, truncated, terminated, *_ = env.step(action.item())
+            next_state, reward, truncated, terminated, *_ = env_step(action)
 
             # append to memory
 
             done = truncated or terminated
 
             memories.append((
-                from_numpy(state),
+                state,
                 action.cpu(),
                 tensor(reward).float(),
                 value.cpu(),
