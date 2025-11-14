@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
 
+from einops import rearrange
+
 from locoformer.locoformer import Locoformer
 from x_mlps_pytorch import MLP
 
@@ -138,9 +140,15 @@ def main(
 
             done = truncated or terminated
 
+            # get log prob of action
+
+            action_log_prob = action_logits.gather(-1, rearrange(action, '-> 1'))
+            action_log_prob = rearrange(action_log_prob, '1 ->')
+
             memories.append((
                 state,
                 action.cpu(),
+                action_log_prob.cpu(),
                 reward,
                 value.cpu(),
                 done

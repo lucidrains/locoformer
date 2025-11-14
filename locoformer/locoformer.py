@@ -392,6 +392,9 @@ class Locoformer(Module):
         return self.unembedder.parameters()
 
     def critic_parameters(self):
+        if not exists(self.value_network):
+            return []
+
         return self.value_network.parameters()
 
     def wrap_env_functions(self, env):
