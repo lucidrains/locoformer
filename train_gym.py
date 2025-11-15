@@ -158,7 +158,7 @@ def main(
                 action_log_prob = action_logits.gather(-1, rearrange(action, '-> 1'))
                 action_log_prob = rearrange(action_log_prob, '1 ->')
 
-                replay.store(
+                memory = replay.store(
                     state = state,
                     action = action,
                     action_log_prob = action_log_prob,

@@ -3,6 +3,7 @@ from functools import partial
 
 from pathlib import Path
 from contextlib import contextmanager
+from collections import namedtuple
 
 import numpy as np
 from numpy import ndarray
@@ -299,6 +300,8 @@ class ReplayBuffer:
             self.shapes[field_name] = shape
             self.dtypes[field_name] = dtype
 
+        self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
+
     def advance_episode(self):
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0
@@ -352,6 +355,8 @@ class ReplayBuffer:
             self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
 
         self.timestep_index += 1
+
+        return self.memory_namedtuple(**data)
 
     def dataset(self) -> Dataset:
         self.flush()
