@@ -26,7 +26,7 @@ from torch.optim import Adam
 
 from einops import rearrange
 
-from locoformer.locoformer import Locoformer
+from locoformer.locoformer import Locoformer, ReplayBuffer
 from x_mlps_pytorch import MLP
 
 # helper functions
@@ -51,8 +51,8 @@ def gumbel_sample(logits, temperature = 1., eps = 1e-6):
 
 def main(
     env_name = 'LunarLander-v3',
-    num_episode = 50_000,
-    max_timestep = 500,
+    num_episodes = 50_000,
+    max_timesteps = 500,
     num_timestep_before_learn = 5000,
     clear_video = True,
     video_folder = 'recordings',
@@ -88,7 +88,19 @@ def main(
 
     # memory
 
-    memories = deque([])
+    replay = ReplayBuffer(
+        'replay',
+        num_episodes,
+        max_timesteps,
+        fields = dict(
+            state = ('float', (dim_state,)),
+            action = 'int',
+            action_log_prob = 'float',
+            reward = 'float',
+            value = 'float',
+            done = 'bool'
+        )
+    )
 
     # networks
 
@@ -117,62 +129,63 @@ def main(
 
     # loop
 
-    for _ in tqdm(range(num_episode)):
+    for _ in tqdm(range(num_episodes)):
         state, *_ = env_reset()
 
         timestep = 0
 
         stateful_forward = locoformer.get_stateful_forward(has_batch_dim = False, has_time_dim = False, inference_mode = True)
 
-        while True:
+        with replay.one_episode():
+            while True:
 
-            # predict next action
+                # predict next action
 
-            action_logits, value = stateful_forward(state, return_values = True)
+                action_logits, value = stateful_forward(state, return_values = True)
 
-            action = gumbel_sample(action_logits)
+                action = gumbel_sample(action_logits)
 
-            # pass to environment
+                # pass to environment
 
-            next_state, reward, truncated, terminated, *_ = env_step(action)
+                next_state, reward, truncated, terminated, *_ = env_step(action)
 
-            # append to memory
+                # append to memory
 
-            done = truncated or terminated
+                done = truncated or terminated
 
-            # get log prob of action
+                # get log prob of action
 
-            action_log_prob = action_logits.gather(-1, rearrange(action, '-> 1'))
-            action_log_prob = rearrange(action_log_prob, '1 ->')
+                action_log_prob = action_logits.gather(-1, rearrange(action, '-> 1'))
+                action_log_prob = rearrange(action_log_prob, '1 ->')
 
-            memories.append((
-                state,
-                action.cpu(),
-                action_log_prob.cpu(),
-                reward,
-                value.cpu(),
-                done
-            ))
+                replay.store(
+                    state = state,
+                    action = action,
+                    action_log_prob = action_log_prob,
+                    reward = reward,
+                    value = value,
+                    done = done
+                )
 
-            # increment counters
+                # increment counters
 
-            timestep += 1
-            timesteps_learn += 1
+                timestep += 1
+                timesteps_learn += 1
 
-            # learn if hit the number of learn timesteps
+                # learn if hit the number of learn timesteps
 
-            if timesteps_learn >= num_timestep_before_learn:
-                # todo - carry out learning
+                if timesteps_learn >= num_timestep_before_learn:
+                    # todo - carry out learning
 
-                timesteps_learn = 0
-                memories.clear()
+                    timesteps_learn = 0
+                    memories.clear()
 
-            # break if done or exceed max timestep
+                # break if done or exceed max timestep
 
-            if done or timestep >= max_timestep:
-                break
+                if done or timestep >= max_timesteps:
+                    break
 
-            state = next_state
+                state = next_state
 
 # main
 
