@@ -1,13 +1,22 @@
 from __future__ import annotations
 from functools import partial
 
+from pathlib import Path
+from contextlib import contextmanager
+
+import numpy as np
 from numpy import ndarray
+from numpy.lib.format import open_memmap
+
+from beartype import beartype
+from beartype.door import is_bearable
 
 import torch
 from torch import nn, cat, stack, arange, Tensor, tensor, is_tensor, from_numpy
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map
+from torch.utils.data import Dataset, DataLoader
 
 import einx
 from einops import rearrange, einsum
@@ -38,15 +47,6 @@ def tree_map_tensor(x, fn):
 
 def detach_all(x):
     return tree_map_tensor(x, lambda t: t.detach())
-
-def combine_kv_cache(cache1, cache2):
-    combined_cache = []
-
-    for layer_cache1, layer_cache2 in zip(cache1, cache2):
-        next_cache = cat((layer_cache1, layer_cache2), dim = -2)
-        combined_cache.append(next_cache)
-
-    return combined_cache
 
 # generalized advantage estimate
 
@@ -147,6 +147,180 @@ def create_sliding_mask(
 
     create_kwargs = dict(device = device) if exists(device) else dict()
     return create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True, **create_kwargs)
+
+# data
+
+class ReplayDataset(Dataset):
+    def __init__(
+        self,
+        folder: str | Path,
+        fields: tuple[str, ...] | None = None
+    ):
+        if isinstance(folder, str):
+            folder = Path(folder)
+
+        episode_lens = folder / 'episode_lens.npy'
+        self.episode_lens = open_memmap(str(episode_lens), mode = 'r')
+
+        # get indices of non-zero lengthed episodes
+
+        nonzero_episodes = self.episode_lens > 0
+        self.indices = np.arange(self.episode_lens.shape[-1])[nonzero_episodes]
+
+        # get all data files
+
+        filepaths = [*folder.glob('*.data.npy')]
+        assert len(filepaths) > 0
+
+        fieldname_to_filepath = {path.name.split('.')[0]: path for path in filepaths}
+
+        fieldnames_from_files = set(fieldname_to_filepath.keys())
+
+        fields = default(fields, fieldnames_from_files)
+
+        self.memmaps = dict()
+
+        for field in fields:
+            assert field in fieldnames_from_files, f'invalid field {field} - must be one of {fieldnames_from_files}'
+
+            path = fieldname_to_filepath[field]
+
+            self.memmaps[field] = open_memmap(str(path), mode = 'r')
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        episode_index = self.indices[idx]
+
+        episode_len = self.episode_lens[episode_index]
+
+        data = {field: torch.from_numpy(memmap[episode_index, :episode_len]) for field, memmap in self.memmaps.items()}
+
+        data['_lens'] = tensor(episode_len)
+
+        return data
+
+class ReplayBuffer:
+
+    @beartype
+    def __init__(
+        self,
+        folder: str | Path,
+        max_episodes: int,
+        max_timesteps: int,
+        fields: dict[
+            str,
+            str | tuple[str, int | tuple[int, ...]]
+        ]
+    ):
+
+        # folder for data
+
+        if not isinstance(folder, Path):
+            folder = Path(folder)
+            folder.mkdir(exist_ok = True)
+
+        self.folder = folder
+        assert folder.is_dir()
+
+        # keeping track of episode length
+
+        episode_lens = folder / 'episode_lens.npy'
+
+        self.episode_index = 0
+        self.timestep_index = 0
+
+        self.max_episodes = max_episodes
+        self.max_timesteps= max_timesteps
+
+        self.episode_lens = open_memmap(str(episode_lens), mode = 'w+', dtype = np.int32, shape = (max_episodes,))
+
+        # create the memmap for individual data tracks
+
+        self.shapes = dict()
+        self.dtypes = dict()
+        self.memmaps = dict()
+        self.fieldnames = set(fields.keys())
+
+        for field_name, field_info in fields.items():
+
+            # some flexibility
+
+            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
+
+            dtype_str, shape = field_info
+            assert dtype_str in {'int', 'float', 'bool'}
+
+            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+
+            # memmap file
+
+            filepath = folder / f'{field_name}.data.npy'
+            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
+
+            self.memmaps[field_name] = memmap
+            self.shapes[field_name] = shape
+            self.dtypes[field_name] = dtype
+
+    def advance_episode(self):
+        self.episode_index = (self.episode_index + 1) % self.max_episodes
+        self.timestep_index = 0
+
+    def flush(self):
+        for memmap in self.memmaps.values():
+            memmap.flush()
+
+        self.episode_lens.flush()
+
+    @contextmanager
+    def one_episode(self):
+
+        yield
+
+        self.episode_lens[self.episode_index] = self.timestep_index
+
+        self.flush()
+        self.advance_episode()
+
+    @beartype
+    def store_datapoint(
+        self,
+        episode_index: int,
+        timestep_index: int,
+        name: str,
+        datapoint: Tensor | ndarray
+    ):
+        assert 0 <= episode_index < self.max_episodes
+        assert 0 <= timestep_index < self.max_timesteps
+
+        if is_tensor(datapoint):
+            datapoint = datapoint.detach().cpu().numpy()
+
+        assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+
+        assert datapoint.shape == self.shapes[name], f'invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
+
+        self.memmaps[name][self.episode_index, self.timestep_index] = datapoint
+
+    def store(
+        self,
+        **data
+    ):
+        assert is_bearable(data, dict[str, Tensor | ndarray])
+
+        assert not self.timestep_index >= self.max_timesteps, 'you exceeded the `max_timesteps` set on the replay buffer'
+
+        for name, datapoint in data.items():
+
+            self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
+
+        self.timestep_index += 1
+
+    def dataset(self) -> Dataset:
+        self.flush()
+
+        return ReplayDataset(self.folder)
 
 # transformer-xl with ppo
 
