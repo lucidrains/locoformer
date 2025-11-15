@@ -91,14 +91,15 @@ def main(
     replay = ReplayBuffer(
         'replay',
         num_episodes,
-        max_timesteps,
+        max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
         fields = dict(
             state = ('float', (dim_state,)),
             action = 'int',
             action_log_prob = 'float',
             reward = 'float',
             value = 'float',
-            done = 'bool'
+            done = 'bool',
+            learnable = 'bool'
         )
     )
 
@@ -158,13 +159,14 @@ def main(
                 action_log_prob = action_logits.gather(-1, rearrange(action, '-> 1'))
                 action_log_prob = rearrange(action_log_prob, '1 ->')
 
-                replay.store(
+                memory = replay.store(
                     state = state,
                     action = action,
                     action_log_prob = action_log_prob,
                     reward = reward,
                     value = value,
-                    done = done
+                    done = done,
+                    learnable = tensor(True)
                 )
 
                 # increment counters
