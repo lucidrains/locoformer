@@ -48,6 +48,19 @@ def tree_map_tensor(x, fn):
 def detach_all(x):
     return tree_map_tensor(x, lambda t: t.detach())
 
+def pad_at_dim(
+    t,
+    pad: tuple[int, int],
+    dim = -1,
+    value = 0.
+):
+    if pad == (0, 0):
+        return t
+
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
+
 # generalized advantage estimate
 
 @torch.no_grad()
@@ -149,6 +162,29 @@ def create_sliding_mask(
     return create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True, **create_kwargs)
 
 # data
+
+def collate_var_time(data):
+
+    datum = first(data)
+    keys = datum.keys()
+
+    all_tensors = zip(*[datum.values() for datum in data])
+
+    collated_values = []
+
+    for key, tensors in zip(keys, all_tensors):
+
+        # the episode lens have zero dimension - think of a cleaner way to handle this later
+
+        if key != '_lens':
+
+            times = [t.shape[0] for t in tensors]
+            max_time = max(times)
+            tensors = [pad_at_dim(t, (0, max_time - t.shape[0]), dim = 0) for t in tensors]
+
+        collated_values.append(stack(tensors))
+
+    return dict(zip(keys, collated_values))
 
 class ReplayDataset(Dataset):
     def __init__(
@@ -268,6 +304,8 @@ class ReplayBuffer:
         self.timestep_index = 0
 
     def flush(self):
+        self.episode_lens[self.episode_index] = self.timestep_index
+
         for memmap in self.memmaps.values():
             memmap.flush()
 
@@ -277,8 +315,6 @@ class ReplayBuffer:
     def one_episode(self):
 
         yield
-
-        self.episode_lens[self.episode_index] = self.timestep_index
 
         self.flush()
         self.advance_episode()
@@ -321,6 +357,11 @@ class ReplayBuffer:
         self.flush()
 
         return ReplayDataset(self.folder)
+
+    def dataloader(self, **kwargs) -> DataLoader:
+        self.flush()
+
+        return DataLoader(self.dataset(), collate_fn = collate_var_time, **kwargs)
 
 # transformer-xl with ppo
 

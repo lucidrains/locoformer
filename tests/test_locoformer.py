@@ -80,3 +80,7 @@ def test_replay():
     assert len(dataset) == 3
 
     assert torch.is_tensor(dataset[0]['state'])
+
+    dataloader = replay_buffer.dataloader(batch_size = 3)
+
+    assert next(iter(dataloader))['state'].shape[0] == 3
