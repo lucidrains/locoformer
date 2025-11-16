@@ -302,6 +302,11 @@ class ReplayBuffer:
 
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
 
+    def reset_(self):
+        self.episode_lens[:] = 0
+        self.episode_index = 0
+        self.timestep_index = 0
+
     def advance_episode(self):
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0

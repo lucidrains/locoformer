@@ -3,7 +3,7 @@
 #     "accelerate",
 #     "fire",
 #     "gymnasium[box2d]>=1.0.0",
-#     "locoformer",
+#     "locoformer>=0.0.12",
 #     "moviepy",
 #     "tqdm"
 # ]
@@ -47,6 +47,18 @@ def gumbel_sample(logits, temperature = 1., eps = 1e-6):
     noise = gumbel_noise(logits)
     return ((logits / max(temperature, eps)) + noise).argmax(dim = -1)
 
+# learn
+
+def learn(
+    model,
+    actor_optim,
+    critic_optim,
+    discount_factor = 0.99,
+    batch_size = 16,
+    epochs = 2
+):
+    pass
+
 # main function
 
 def main(
@@ -57,8 +69,8 @@ def main(
     clear_video = True,
     video_folder = 'recordings',
     record_every_episode = 250,
-    discount_factor = 0.99,
     learning_rate = 1e-4,
+    discount_factor = 0.99,
     batch_size = 16,
     epochs = 2
 ):
@@ -169,6 +181,16 @@ def main(
                     learnable = tensor(True)
                 )
 
+                # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
+                # only if terminated signal not detected
+
+                if not terminated:
+                    _, next_value = stateful_forward(next_state, return_values = True)
+
+                    memory._replace(value = next_value, learnable = False)
+
+                    replay.store(**memory._asdict())
+
                 # increment counters
 
                 timestep += 1
@@ -177,10 +199,17 @@ def main(
                 # learn if hit the number of learn timesteps
 
                 if timesteps_learn >= num_timestep_before_learn:
-                    # todo - carry out learning
+
+                    learn(
+                        locoformer,
+                        optim_actor,
+                        optim_critic,
+                        discount_factor,
+                        batch_size,
+                        epochs
+                    )
 
                     timesteps_learn = 0
-                    memories.clear()
 
                 # break if done or exceed max timestep
 
