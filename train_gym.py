@@ -13,17 +13,19 @@ from fire import Fire
 from shutil import rmtree
 from tqdm import tqdm
 from collections import deque
+from types import SimpleNamespace
 
 from accelerate import Accelerator
 
 import gymnasium as gym
 
 import torch
-from torch import from_numpy, randint, tensor, stack
+from torch import from_numpy, randint, tensor, stack, arange
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
 
+import einx
 from einops import rearrange
 
 from locoformer.locoformer import Locoformer, ReplayBuffer
@@ -53,11 +55,38 @@ def learn(
     model,
     actor_optim,
     critic_optim,
-    discount_factor = 0.99,
+    accelerator,
+    replay,
     batch_size = 16,
-    epochs = 2
+    epochs = 2,
 ):
-    pass
+    device = accelerator.device
+
+    dl = replay.dataloader(batch_size = batch_size, shuffle = True)
+    model, dl, actor_optim, critic_optim = accelerator.prepare(model, dl, actor_optim, critic_optim)
+
+    for _ in range(epochs):
+        for data in dl:
+
+            data = SimpleNamespace(**data)
+
+            seq_len = data.state.shape[1]
+
+            value_mask = einx.less('j, i -> i j', arange(seq_len, device = device), data._lens)
+            value = torch.where(value_mask, data.value, 0.)
+
+            actor_loss, critic_loss = model.ppo(
+                state = data.state,
+                action = data.action,
+                old_action_log_prob = data.action_log_prob,
+                reward = data.reward,
+                old_value = value,
+                mask = data.learnable,
+                actor_optim = actor_optim,
+                critic_optim = critic_optim
+            )
+
+            accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
 
 # main function
 
@@ -65,20 +94,24 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_timestep_before_learn = 5000,
+    num_timesteps_before_learn = 10_000,
     clear_video = True,
     video_folder = 'recordings',
     record_every_episode = 250,
-    learning_rate = 1e-4,
+    learning_rate = 8e-4,
     discount_factor = 0.99,
+    betas = (0.9, 0.99),
+    gae_lam = 0.95,
+    ppo_eps_clip = 0.2,
+    ppo_entropy_weight = .01,
     batch_size = 16,
     epochs = 2
 ):
 
     # accelerate
 
-    accelerate = Accelerator()
-    device = accelerate.device
+    accelerator = Accelerator()
+    device = accelerator.device
 
     # environment
 
@@ -127,11 +160,15 @@ def main(
             heads = 4,
             depth = 4,
             window_size = 16
-        )
+        ),
+        discount_factor = discount_factor,
+        gae_lam = gae_lam,
+        ppo_eps_clip = ppo_eps_clip,
+        ppo_entropy_weight = ppo_entropy_weight,
     ).to(device)
 
-    optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate)
-    optim_critic = Adam([*locoformer.transformer.parameters(), *locoformer.critic_parameters()], lr = learning_rate)
+    optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate, betas = betas)
+    optim_critic = Adam([*locoformer.transformer.parameters(), *locoformer.critic_parameters()], lr = learning_rate, betas = betas)
 
     timesteps_learn = 0
 
@@ -198,15 +235,16 @@ def main(
 
                 # learn if hit the number of learn timesteps
 
-                if timesteps_learn >= num_timestep_before_learn:
+                if timesteps_learn >= num_timesteps_before_learn:
 
                     learn(
                         locoformer,
                         optim_actor,
                         optim_critic,
-                        discount_factor,
+                        accelerator,
+                        replay,
                         batch_size,
-                        epochs
+                        epochs,
                     )
 
                     timesteps_learn = 0

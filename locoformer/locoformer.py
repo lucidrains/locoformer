@@ -43,6 +43,11 @@ def first(arr):
 def divisible_by(num, den):
     return (num % den) == 0
 
+# tensor helpers
+
+def log(t, eps = 1e-20):
+    return t.clamp_min(eps).log()
+
 def tree_map_tensor(x, fn):
     return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
 
@@ -62,13 +67,17 @@ def pad_at_dim(
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
+def calc_entropy(logits):
+    prob = logits.softmax(dim = -1)
+    return -(prob * log(prob)).sum(dim = -1)
+
 # generalized advantage estimate
 
 @torch.no_grad()
 def calc_gae(
     rewards,
     values,
-    masks,
+    masks = None,
     gamma = 0.99,
     lam = 0.95,
     use_accelerated = None
@@ -78,6 +87,9 @@ def calc_gae(
 
     values = F.pad(values, (0, 1), value = 0.)
     values, values_next = values[..., :-1], values[..., 1:]
+
+    if not exists(masks):
+        masks = torch.ones_like(values)
 
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
@@ -130,8 +142,8 @@ def create_xl_mask(
         # handle intra-episodic attention if needed
 
         if exists(episode_ids):
-            q_episode = episodes[b, q + offset]
-            k_episode = episodes[b, k]
+            q_episode = episode_ids[b, q + offset]
+            k_episode = episode_ids[b, k]
 
             intra_episode_mask = q_episode == k_episode
             mask = mask & intra_episode_mask
@@ -232,7 +244,7 @@ class ReplayDataset(Dataset):
 
         episode_len = self.episode_lens[episode_index]
 
-        data = {field: torch.from_numpy(memmap[episode_index, :episode_len]) for field, memmap in self.memmaps.items()}
+        data = {field: from_numpy(memmap[episode_index, :episode_len].copy()) for field, memmap in self.memmaps.items()}
 
         data['_lens'] = tensor(episode_len)
 
@@ -368,10 +380,10 @@ class ReplayBuffer:
 
         return ReplayDataset(self.folder)
 
-    def dataloader(self, **kwargs) -> DataLoader:
+    def dataloader(self, batch_size, **kwargs) -> DataLoader:
         self.flush()
 
-        return DataLoader(self.dataset(), collate_fn = collate_var_time, **kwargs)
+        return DataLoader(self.dataset(), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
 
 # transformer-xl with ppo
 
@@ -431,7 +443,6 @@ class Attention(Module):
         return_kv_cache = False,
     ):
         seq_len = tokens.shape[-2]
-        assert seq_len <= self.window_size
 
         device = tokens.device
 
@@ -592,7 +603,13 @@ class Locoformer(Module):
         embedder: Module,
         unembedder: Module,
         transformer: dict | TransformerXL,
-        value_network: Module | None = None
+        value_network: Module | None = None,
+        discount_factor = 0.999,
+        gae_lam = 0.95,
+        ppo_eps_clip = 0.2,
+        ppo_entropy_weight = 0.01,
+        ppo_value_clip = 0.4,
+        value_loss_weight = 0.5
     ):
         super().__init__()
 
@@ -609,6 +626,15 @@ class Locoformer(Module):
         self.fixed_window_size = transformer.fixed_window_size
         self.window_size = transformer.window_size
 
+        # ppo related
+
+        self.discount_factor = discount_factor
+        self.gae_lam = gae_lam
+        self.ppo_eps_clip = ppo_eps_clip
+        self.ppo_entropy_weight = ppo_entropy_weight
+        self.ppo_value_clip = ppo_value_clip
+        self.value_loss_weight = value_loss_weight
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -621,6 +647,65 @@ class Locoformer(Module):
             return []
 
         return self.value_network.parameters()
+
+    def ppo(
+        self,
+        state,
+        action,
+        old_action_log_prob,
+        reward,
+        old_value,
+        mask,
+        actor_optim,
+        critic_optim
+    ):
+
+        (action_logits, value), _ = self.forward(state, return_values = True)
+        entropy = calc_entropy(action_logits)
+
+        action = rearrange(action, 'b t -> b t 1')
+        log_prob = action_logits.gather(-1, action)
+        log_prob = rearrange(log_prob, 'b t 1 -> b t')
+
+        # update actor, classic clipped surrogate loss
+
+        eps_clip = self.ppo_eps_clip
+        ratio = (log_prob - old_action_log_prob).exp()
+
+        returns = calc_gae(reward, old_value, lam = self.gae_lam, gamma = self.discount_factor)
+        advantage = returns - old_value
+
+        actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
+
+        actor_loss = actor_loss - self.ppo_entropy_weight * entropy
+
+        mean_actor_loss = actor_loss[mask].mean()
+        mean_actor_loss.backward(retain_graph = True)
+
+        # update critic
+
+        value_loss = F.mse_loss(returns, value, reduction = 'none')
+
+        value_clip = self.ppo_value_clip
+        clipped_value = old_value + (value - old_value).clamp(-value_clip, value_clip)
+        clipped_value_loss = F.mse_loss(returns, clipped_value, reduction = 'none')
+
+        critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
+
+        mean_critic_loss = critic_loss[mask].mean()
+        mean_critic_loss.backward()
+
+        # optimizer update
+
+        actor_optim.step()
+        actor_optim.zero_grad()
+
+        critic_optim.step()
+        critic_optim.zero_grad()
+
+        # return losses for logging
+
+        return mean_actor_loss.detach(), mean_critic_loss.detach()
 
     def wrap_env_functions(self, env):
 
