@@ -27,6 +27,8 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from assoc_scan import AssocScan
 
+# constants
+
 LinearNoBias = partial(Linear, bias = False)
 
 # helper functions
@@ -50,9 +52,6 @@ def log(t, eps = 1e-20):
 
 def tree_map_tensor(x, fn):
     return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
-
-def detach_all(x):
-    return tree_map_tensor(x, lambda t: t.detach())
 
 def pad_at_dim(
     t,
@@ -100,7 +99,7 @@ def calc_gae(
 
     returns = gae + values
 
-    return returns
+    return gae, returns
 
 # transformer-xl mask w/ flex attn
 
@@ -609,7 +608,8 @@ class Locoformer(Module):
         ppo_eps_clip = 0.2,
         ppo_entropy_weight = 0.01,
         ppo_value_clip = 0.4,
-        value_loss_weight = 0.5
+        value_loss_weight = 0.5,
+        calc_gae_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -635,6 +635,12 @@ class Locoformer(Module):
         self.ppo_value_clip = ppo_value_clip
         self.value_loss_weight = value_loss_weight
 
+        self.calc_gae_kwargs = calc_gae_kwargs
+
+        # loss related
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -659,49 +665,83 @@ class Locoformer(Module):
         actor_optim,
         critic_optim
     ):
+        window_size = self.window_size
+        total_learnable_tokens = mask.sum().item()
 
-        (action_logits, value), _ = self.forward(state, return_values = True)
-        entropy = calc_entropy(action_logits)
+        windowed_tensors = [
+            t.split(window_size, dim = 1) for t in
+            (
+                state,
+                action,
+                old_action_log_prob,
+                reward,
+                old_value,
+                mask
+            )
+        ]
 
-        action = rearrange(action, 'b t -> b t 1')
-        log_prob = action_logits.gather(-1, action)
-        log_prob = rearrange(log_prob, 'b t 1 -> b t')
+        mean_actor_loss = self.zero.clone()
+        mean_critic_loss = self.zero.clone()
 
-        # update actor, classic clipped surrogate loss
+        # learn across windows
 
-        eps_clip = self.ppo_eps_clip
-        ratio = (log_prob - old_action_log_prob).exp()
+        cache = None
 
-        returns = calc_gae(reward, old_value, lam = self.gae_lam, gamma = self.discount_factor)
-        advantage = returns - old_value
+        for (
+            state,
+            action,
+            old_action_log_prob,
+            reward,
+            old_value,
+            mask
+        ) in zip(*windowed_tensors):
 
-        actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
+            (action_logits, value), cache = self.forward(state, cache = cache, detach_cache = True, return_values = True)
+            entropy = calc_entropy(action_logits)
 
-        actor_loss = actor_loss - self.ppo_entropy_weight * entropy
+            action = rearrange(action, 'b t -> b t 1')
+            log_prob = action_logits.gather(-1, action)
+            log_prob = rearrange(log_prob, 'b t 1 -> b t')
 
-        mean_actor_loss = actor_loss[mask].mean()
-        mean_actor_loss.backward(retain_graph = True)
+            # update actor, classic clipped surrogate loss
 
-        # update critic
+            eps_clip = self.ppo_eps_clip
+            ratio = (log_prob - old_action_log_prob).exp()
 
-        value_loss = F.mse_loss(returns, value, reduction = 'none')
+            advantage, returns = calc_gae(reward, old_value, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
-        value_clip = self.ppo_value_clip
-        clipped_value = old_value + (value - old_value).clamp(-value_clip, value_clip)
-        clipped_value_loss = F.mse_loss(returns, clipped_value, reduction = 'none')
+            actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
 
-        critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
+            actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
-        mean_critic_loss = critic_loss[mask].mean()
-        mean_critic_loss.backward()
+            windowed_actor_loss = actor_loss[mask].sum() / total_learnable_tokens
+            windowed_actor_loss.backward(retain_graph = True)
 
-        # optimizer update
+            # update critic
 
-        actor_optim.step()
-        actor_optim.zero_grad()
+            value_loss = F.mse_loss(returns, value, reduction = 'none')
 
-        critic_optim.step()
-        critic_optim.zero_grad()
+            value_clip = self.ppo_value_clip
+            clipped_value = old_value + (value - old_value).clamp(-value_clip, value_clip)
+            clipped_value_loss = F.mse_loss(returns, clipped_value, reduction = 'none')
+
+            critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
+
+            windowed_critic_loss = critic_loss[mask].sum() / total_learnable_tokens
+            windowed_critic_loss.backward()
+
+            # optimizer update
+
+            actor_optim.step()
+            actor_optim.zero_grad()
+
+            critic_optim.step()
+            critic_optim.zero_grad()
+
+            # accumulate
+
+            mean_actor_loss.add_(windowed_actor_loss)
+            mean_critic_loss.add_(windowed_critic_loss)
 
         # return losses for logging
 
@@ -818,7 +858,7 @@ class Locoformer(Module):
         # maybe detach cache
 
         if detach_cache:
-            kv_cache = detach_all(kv_cache)
+            kv_cache = kv_cache.detach()
 
         # handle returning of values
 
