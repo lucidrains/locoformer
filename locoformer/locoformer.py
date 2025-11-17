@@ -1,5 +1,6 @@
 from __future__ import annotations
 from functools import partial
+from random import shuffle
 
 from pathlib import Path
 from contextlib import contextmanager
@@ -50,6 +51,9 @@ def divisible_by(num, den):
 
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
+
+def is_empty(t):
+    return t.numel() == 0
 
 def tree_map_tensor(x, fn):
     return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
@@ -254,7 +258,8 @@ class RemappedReplayDataset(Dataset):
     def __init__(
         self,
         dataset: ReplayDataset,
-        episode_mapping: Tensor | list[list[int]]
+        episode_mapping: Tensor | list[list[int]],
+        shuffle_episodes = False
     ):
         assert len(dataset) > 0
         self.dataset = dataset
@@ -264,6 +269,7 @@ class RemappedReplayDataset(Dataset):
             episode_mapping = episode_mapping.tolist()
 
         self.episode_mapping = episode_mapping
+        self.shuffle_episodes = shuffle_episodes
 
     def __len__(self):
         return len(self.episode_mapping)
@@ -275,9 +281,13 @@ class RemappedReplayDataset(Dataset):
         episode_indices = tensor(episode_indices)
         episode_indices = episode_indices[(episode_indices >= 0) & (episode_indices < len(self.dataset))]
 
-        episode_data = [self.dataset[i] for i in episode_indices.tolist()]
+        assert not is_empty(episode_indices)
 
-        assert len(episode_data) > 0
+        if self.shuffle_episodes and episode_indices.numel() > 1:
+            num_episodes = len(episode_indices)
+            episode_indices = episode_indices[torch.randperm(num_episodes)]
+
+        episode_data = [self.dataset[i] for i in episode_indices.tolist()]
 
         episode_lens = stack([data.pop('_lens') for data in episode_data])
 
