@@ -169,7 +169,7 @@ for i in range(NUM_BATCHES):
         prime = prime.to(model.device)
         out = prime
 
-        stateful_forward, logits = model.get_stateful_forward(has_batch_dim = False, initial_states = prime, inference_mode = True)
+        stateful_forward, logits = model.get_stateful_forward(has_batch_dim = False, has_time_dim = True, initial_states = prime, inference_mode = True)
 
         # sample
 
