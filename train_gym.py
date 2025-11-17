@@ -94,7 +94,7 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_timesteps_before_learn = 10_000,
+    num_episodes_before_learn = 32,
     clear_video = True,
     video_folder = 'recordings',
     record_every_episode = 250,
@@ -182,7 +182,8 @@ def main(
 
     # loop
 
-    for _ in tqdm(range(num_episodes)):
+    for episodes_index in tqdm(range(num_episodes)):
+
         state, *_ = env_reset()
 
         timestep = 0
@@ -234,23 +235,6 @@ def main(
                 # increment counters
 
                 timestep += 1
-                timesteps_learn += 1
-
-                # learn if hit the number of learn timesteps
-
-                if timesteps_learn >= num_timesteps_before_learn:
-
-                    learn(
-                        locoformer,
-                        optim_actor,
-                        optim_critic,
-                        accelerator,
-                        replay,
-                        batch_size,
-                        epochs,
-                    )
-
-                    timesteps_learn = 0
 
                 # break if done or exceed max timestep
 
@@ -259,6 +243,19 @@ def main(
 
                 state = next_state
 
+            # learn if hit the number of learn timesteps
+
+            if divisible_by(episodes_index + 1, num_episodes_before_learn):
+
+                learn(
+                    locoformer,
+                    optim_actor,
+                    optim_critic,
+                    accelerator,
+                    replay,
+                    batch_size,
+                    epochs,
+                )
 # main
 
 if __name__ == '__main__':

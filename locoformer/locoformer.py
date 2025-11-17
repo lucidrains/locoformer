@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map
 from torch.utils.data import Dataset, DataLoader
+from torch.optim import Optimizer
 
 import einx
 from einops import rearrange, einsum
@@ -662,8 +663,8 @@ class Locoformer(Module):
         reward,
         old_value,
         mask,
-        actor_optim,
-        critic_optim
+        actor_optim: Optimizer | None = None,
+        critic_optim: Optimizer | None = None
     ):
         window_size = self.window_size
         total_learnable_tokens = mask.sum().item()
@@ -728,20 +729,22 @@ class Locoformer(Module):
             critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
 
             windowed_critic_loss = critic_loss[mask].sum() / total_learnable_tokens
-            windowed_critic_loss.backward()
-
-            # optimizer update
-
-            actor_optim.step()
-            actor_optim.zero_grad()
-
-            critic_optim.step()
-            critic_optim.zero_grad()
+            windowed_critic_loss.backward(retain_graph = True)
 
             # accumulate
 
             mean_actor_loss.add_(windowed_actor_loss)
             mean_critic_loss.add_(windowed_critic_loss)
+
+        # optimizer update
+
+        if exists(actor_optim):
+            actor_optim.step()
+            actor_optim.zero_grad()
+
+        if exists(critic_optim):
+            critic_optim.step()
+            critic_optim.zero_grad()
 
         # return losses for logging
 
