@@ -84,3 +84,18 @@ def test_replay():
     dataloader = replay_buffer.dataloader(batch_size = 3)
 
     assert next(iter(dataloader))['state'].shape[0] == 3
+
+    # we will now consider consecutive pairs of episodes as 2 trials to be used for in-context adaptation
+    # but realistically there will be a function that converts a given ReplayBuffer -> Int[batch, episode_indices]
+
+    from torch import stack, arange
+
+    episode_indices = arange(len(replay_buffer))
+    remapped_episodes = stack((episode_indices[:-1], episode_indices[1:]))
+
+    dataloader = replay_buffer.dataloader(
+        batch_size = 1,
+        episode_mapping = remapped_episodes
+    )
+
+    assert next(iter(dataloader))['_lens'][0] == (3 + 5) # first and second episodes are concatted together timewise

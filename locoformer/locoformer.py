@@ -250,6 +250,51 @@ class ReplayDataset(Dataset):
 
         return data
 
+class RemappedReplayDataset(Dataset):
+    def __init__(
+        self,
+        dataset: ReplayDataset,
+        episode_mapping: Tensor | list[list[int]]
+    ):
+        assert len(dataset) > 0
+        self.dataset = dataset
+
+        if is_tensor(episode_mapping):
+            assert episode_mapping.dtype in (torch.int, torch.long) and episode_mapping.ndim == 2
+            episode_mapping = episode_mapping.tolist()
+
+        self.episode_mapping = episode_mapping
+
+    def __len__(self):
+        return len(self.episode_mapping)
+
+    def __getitem__(self, idx):
+
+        episode_indices = self.episode_mapping[idx]
+
+        episode_indices = tensor(episode_indices)
+        episode_indices = episode_indices[(episode_indices >= 0) & (episode_indices < len(self.dataset))]
+
+        episode_data = [self.dataset[i] for i in episode_indices.tolist()]
+
+        assert len(episode_data) > 0
+
+        episode_lens = stack([data.pop('_lens') for data in episode_data])
+
+        keys = first(episode_data).keys()
+
+        values = [list(data.values()) for data in episode_data]
+
+        values = [cat(field_values) for field_values in zip(*values)] # concat across time
+
+        multi_episode_data = dict(zip(keys, values))
+
+        multi_episode_data['_lens'] = episode_lens.sum()
+
+        multi_episode_data['_episode_indices'] = cat([torch.full((episode_len,), episode_index) for episode_len, episode_index in zip(episode_lens, episode_indices)])
+
+        return multi_episode_data
+
 class ReplayBuffer:
 
     @beartype
@@ -314,6 +359,9 @@ class ReplayBuffer:
 
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
 
+    def __len__(self):
+        return (self.episode_lens > 0).sum().item()
+
     def reset_(self):
         self.episode_lens[:] = 0
         self.episode_index = 0
@@ -375,15 +423,28 @@ class ReplayBuffer:
 
         return self.memory_namedtuple(**data)
 
-    def dataset(self) -> Dataset:
+    def dataset(
+        self,
+        episode_mapping: Tensor | list[list[int]] | None = None,
+    ) -> Dataset:
         self.flush()
 
-        return ReplayDataset(self.folder)
+        dataset = ReplayDataset(self.folder)
 
-    def dataloader(self, batch_size, **kwargs) -> DataLoader:
+        if not exists(episode_mapping):
+            return dataset
+
+        return RemappedReplayDataset(dataset, episode_mapping)
+
+    def dataloader(
+        self,
+        batch_size,
+        episode_mapping: Tensor | list[list[int]] | None = None,
+        **kwargs
+    ) -> DataLoader:
         self.flush()
 
-        return DataLoader(self.dataset(), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
+        return DataLoader(self.dataset(episode_mapping), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
 
 # transformer-xl with ppo
 
