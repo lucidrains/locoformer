@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
 
-import einx
 from einops import rearrange
 
 from locoformer.locoformer import Locoformer, ReplayBuffer
@@ -60,8 +59,6 @@ def learn(
     batch_size = 16,
     epochs = 2,
 ):
-    device = accelerator.device
-
     dl = replay.dataloader(batch_size = batch_size, shuffle = True)
     model, dl, actor_optim, critic_optim = accelerator.prepare(model, dl, actor_optim, critic_optim)
 
@@ -70,18 +67,14 @@ def learn(
 
             data = SimpleNamespace(**data)
 
-            seq_len = data.state.shape[1]
-
-            value_mask = einx.less('j, i -> i j', arange(seq_len, device = device), data._lens)
-            value = torch.where(value_mask, data.value, 0.)
-
             actor_loss, critic_loss = model.ppo(
                 state = data.state,
                 action = data.action,
                 old_action_log_prob = data.action_log_prob,
                 reward = data.reward,
-                old_value = value,
+                old_value = data.value,
                 mask = data.learnable,
+                episode_lens = data._lens,
                 actor_optim = actor_optim,
                 critic_optim = critic_optim
             )
@@ -173,8 +166,6 @@ def main(
     optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate, betas = betas)
     optim_critic = Adam([*locoformer.transformer.parameters(), *locoformer.critic_parameters()], lr = learning_rate, betas = betas)
 
-    timesteps_learn = 0
-
     # able to wrap the env for all values to torch tensors and back
     # all environments should follow usual MDP interface, domain randomization should be given at instantiation
 
@@ -205,7 +196,8 @@ def main(
 
                 # append to memory
 
-                done = truncated or terminated
+                exceeds_max_timesteps = timestep == (max_timesteps - 1)
+                done = truncated or terminated or tensor(exceeds_max_timesteps)
 
                 # get log prob of action
 
@@ -222,23 +214,24 @@ def main(
                     learnable = tensor(True)
                 )
 
-                # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
-                # only if terminated signal not detected
-
-                if not terminated:
-                    _, next_value = stateful_forward(next_state, return_values = True)
-
-                    memory._replace(value = next_value, learnable = False)
-
-                    replay.store(**memory._asdict())
-
                 # increment counters
 
                 timestep += 1
 
                 # break if done or exceed max timestep
 
-                if done or timestep >= max_timesteps:
+                if done:
+
+                    # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
+                    # only if terminated signal not detected
+
+                    if not terminated:
+                        _, next_value = stateful_forward(next_state, return_values = True)
+
+                        memory._replace(value = next_value, learnable = False)
+
+                        replay.store(**memory._asdict())
+
                     break
 
                 state = next_state

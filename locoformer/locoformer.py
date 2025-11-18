@@ -26,6 +26,8 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
+from hl_gauss_pytorch import HLGaussLayer
+
 from assoc_scan import AssocScan
 
 # constants
@@ -680,7 +682,7 @@ class Locoformer(Module):
         ppo_entropy_weight = 0.01,
         ppo_value_clip = 0.4,
         value_loss_weight = 0.5,
-        calc_gae_kwargs: dict = dict()
+        calc_gae_kwargs: dict = dict(),
     ):
         super().__init__()
 
@@ -733,11 +735,15 @@ class Locoformer(Module):
         reward,
         old_value,
         mask,
+        episode_lens,
         actor_optim: Optimizer | None = None,
         critic_optim: Optimizer | None = None
     ):
         window_size = self.window_size
         total_learnable_tokens = mask.sum().item()
+
+        seq_len = state.shape[1]
+        gae_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
 
         windowed_tensors = [
             t.split(window_size, dim = 1) for t in
@@ -747,7 +753,8 @@ class Locoformer(Module):
                 old_action_log_prob,
                 reward,
                 old_value,
-                mask
+                mask,
+                gae_mask
             )
         ]
 
@@ -764,7 +771,8 @@ class Locoformer(Module):
             old_action_log_prob,
             reward,
             old_value,
-            mask
+            mask,
+            gae_mask
         ) in zip(*windowed_tensors):
 
             (action_logits, value), cache = self.forward(state, cache = cache, detach_cache = True, return_values = True)
@@ -779,7 +787,7 @@ class Locoformer(Module):
             eps_clip = self.ppo_eps_clip
             ratio = (log_prob - old_action_log_prob).exp()
 
-            advantage, returns = calc_gae(reward, old_value, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
+            advantage, returns = calc_gae(reward, old_value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
             actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
 

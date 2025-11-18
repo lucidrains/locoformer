@@ -30,6 +30,7 @@ dependencies = [
     "beartype",
     "einx>=0.3.0",
     "einops>=0.8.0",
+    "hl-gauss-pytorch>=0.2.0",
     "rotary-embedding-torch",
     "torch>=2.4",
     "x-mlps-pytorch",
