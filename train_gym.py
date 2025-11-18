@@ -87,7 +87,7 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 32,
+    num_episodes_before_learn = 64,
     clear_video = True,
     video_folder = 'recordings',
     record_every_episode = 250,
@@ -98,7 +98,8 @@ def main(
     ppo_eps_clip = 0.2,
     ppo_entropy_weight = .01,
     batch_size = 16,
-    epochs = 2
+    epochs = 3,
+    reward_range = (-100., 100.)
 ):
 
     # accelerate
@@ -146,7 +147,6 @@ def main(
     locoformer = Locoformer(
         embedder = MLP(dim_state, 64, bias = False),
         unembedder = MLP(64, num_actions, bias = False),
-        value_network = MLP(64, 1, bias = False),
         transformer = dict(
             dim = 64,
             dim_head = 32,
@@ -158,6 +158,10 @@ def main(
         gae_lam = gae_lam,
         ppo_eps_clip = ppo_eps_clip,
         ppo_entropy_weight = ppo_entropy_weight,
+        value_network = MLP(64, 64),
+        dim_value_input = 64,
+        reward_range = reward_range,
+        hl_gauss_loss_kwargs = dict(),
         calc_gae_kwargs = dict(
             use_accelerated = False
         )

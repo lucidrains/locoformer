@@ -26,7 +26,7 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from hl_gauss_pytorch import HLGaussLayer
+from hl_gauss_pytorch import HLGaussLoss
 
 from assoc_scan import AssocScan
 
@@ -675,12 +675,16 @@ class Locoformer(Module):
         embedder: Module,
         unembedder: Module,
         transformer: dict | TransformerXL,
-        value_network: Module | None = None,
         discount_factor = 0.999,
         gae_lam = 0.95,
         ppo_eps_clip = 0.2,
         ppo_entropy_weight = 0.01,
         ppo_value_clip = 0.4,
+        dim_value_input = None, # needs to be set for value network to be available
+        value_network: Module = nn.Identity(),
+        reward_range: tuple[float, float] | None = None,
+        num_reward_bins = 32,
+        hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
         calc_gae_kwargs: dict = dict(),
     ):
@@ -694,10 +698,29 @@ class Locoformer(Module):
         self.embedder = embedder
         self.unembedder = unembedder
 
-        self.value_network = value_network
-
         self.fixed_window_size = transformer.fixed_window_size
         self.window_size = transformer.window_size
+
+        # determine value network, using HL Gauss Layer
+
+        self.to_value_pred = None
+
+        if exists(dim_value_input):
+            assert exists(reward_range)
+
+            self.to_value_pred = nn.Sequential(
+                value_network,
+                LinearNoBias(dim_value_input, num_reward_bins)
+            )
+
+            reward_min, reward_max = reward_range
+
+            self.hl_gauss_loss = HLGaussLoss(
+                min_value = reward_min,
+                max_value = reward_max,
+                num_bins = num_reward_bins,
+                **hl_gauss_loss_kwargs
+            )
 
         # ppo related
 
@@ -722,10 +745,10 @@ class Locoformer(Module):
         return self.unembedder.parameters()
 
     def critic_parameters(self):
-        if not exists(self.value_network):
+        if not exists(self.to_value_pred):
             return []
 
-        return self.value_network.parameters()
+        return self.to_value_pred.parameters()
 
     def ppo(
         self,
@@ -798,11 +821,11 @@ class Locoformer(Module):
 
             # update critic
 
-            value_loss = F.mse_loss(returns, value, reduction = 'none')
+            value_loss = self.hl_gauss_loss(returns, value, reduction = 'none')
 
             value_clip = self.ppo_value_clip
             clipped_value = old_value + (value - old_value).clamp(-value_clip, value_clip)
-            clipped_value_loss = F.mse_loss(returns, clipped_value, reduction = 'none')
+            clipped_value_loss = self.hl_gauss_loss(returns, clipped_value, reduction = 'none')
 
             critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
 
@@ -944,13 +967,11 @@ class Locoformer(Module):
         # handle returning of values
 
         if return_values:
-            assert exists(self.value_network)
+            assert exists(self.to_value_pred)
 
-            values = self.value_network(embed)
+            values = self.to_value_pred(embed)
 
-            if values.ndim == 3:
-                assert values.shape[-1] == 1
-                values = rearrange(values, '... 1 -> ...')
+            values = self.hl_gauss_loss(values)
 
             out = (out, values)
 
