@@ -775,6 +775,8 @@ class Locoformer(Module):
         seq_len = state.shape[1]
         gae_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
 
+        advantage, returns = calc_gae(reward, old_value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
+
         windowed_tensors = [
             t.split(window_size, dim = 1) for t in
             (
@@ -784,7 +786,8 @@ class Locoformer(Module):
                 reward,
                 old_value,
                 mask,
-                gae_mask
+                advantage,
+                returns
             )
         ]
 
@@ -802,7 +805,8 @@ class Locoformer(Module):
             reward,
             old_value,
             mask,
-            gae_mask
+            advantage,
+            returns
         ) in zip(*windowed_tensors):
 
             (action_logits, value_logits), cache = self.forward(state, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
@@ -816,8 +820,6 @@ class Locoformer(Module):
 
             eps_clip = self.ppo_eps_clip
             ratio = (log_prob - old_action_log_prob).exp()
-
-            advantage, returns = calc_gae(reward, old_value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
             actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
 
