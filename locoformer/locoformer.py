@@ -798,7 +798,7 @@ class Locoformer(Module):
             gae_mask
         ) in zip(*windowed_tensors):
 
-            (action_logits, value), cache = self.forward(state, cache = cache, detach_cache = True, return_values = True)
+            (action_logits, value_logits), cache = self.forward(state, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
             entropy = calc_entropy(action_logits)
 
             action = rearrange(action, 'b t -> b t 1')
@@ -821,11 +821,13 @@ class Locoformer(Module):
 
             # update critic
 
-            value_loss = self.hl_gauss_loss(returns, value, reduction = 'none')
+            value_loss = self.hl_gauss_loss(value_logits, returns, reduction = 'none')
 
             value_clip = self.ppo_value_clip
+            value = self.hl_gauss_loss(value_logits)
+
             clipped_value = old_value + (value - old_value).clamp(-value_clip, value_clip)
-            clipped_value_loss = self.hl_gauss_loss(returns, clipped_value, reduction = 'none')
+            clipped_value_loss = self.hl_gauss_loss(clipped_value, returns, reduction = 'none')
 
             critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
 
@@ -944,7 +946,8 @@ class Locoformer(Module):
         state: Tensor,
         cache: Tensor | None = None,
         detach_cache = False,
-        return_values = False
+        return_values = False,
+        return_raw_value_logits = False
     ):
 
         state = state.to(self.device)
@@ -971,7 +974,8 @@ class Locoformer(Module):
 
             values = self.to_value_pred(embed)
 
-            values = self.hl_gauss_loss(values)
+            if not return_raw_value_logits:
+                values = self.hl_gauss_loss(values) # converts the value logits to scalar values
 
             out = (out, values)
 
