@@ -2,13 +2,14 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
+from torch import nn
 from x_mlps_pytorch import MLP
 
 from einops import rearrange
 
+from locoformer.locoformer import Locoformer
+
 def test_locoformer():
-    from locoformer.locoformer import Locoformer
-    from torch import nn
     
     model = Locoformer(
         embedder = nn.Embedding(256, 128),
@@ -101,3 +102,42 @@ def test_replay():
     )
 
     assert next(iter(dataloader))['_lens'][0] == (3 + 5) # first and second episodes are concatted together timewise
+
+def test_reward_shaping():
+
+    model = Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256, bias = False),
+        value_network = MLP(128, 64, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        reward_shaping_fns = [
+            lambda state: (state[3] - 2.5).pow(2).mean(),
+            lambda state: state[4:6].norm(dim = -1)
+        ],
+        transformer = dict(
+            dim = 128,
+            depth = 1,
+            window_size = 512
+        )
+    )
+
+    import numpy as np
+
+    class MockEnv:
+        def reset(self):
+            return np.random.normal(size = (10,))
+
+        def step(self, *args, **kwargs):
+            return np.random.normal(size = (10,))
+
+
+    env = MockEnv()
+
+    reset_fn, step_fn = model.wrap_env_functions(env)
+
+    reset_fn()
+
+    _, rewards = step_fn(3)
+
+    assert len(rewards) == 2

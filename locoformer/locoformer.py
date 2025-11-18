@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Callable
 from functools import partial
 
 from pathlib import Path
@@ -683,6 +684,7 @@ class Locoformer(Module):
         dim_value_input = None, # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
         reward_range: tuple[float, float] | None = None,
+        reward_shaping_fns: list[Callable[[Tensor], float | Tensor]] | None = None,
         num_reward_bins = 32,
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
@@ -732,6 +734,11 @@ class Locoformer(Module):
         self.value_loss_weight = value_loss_weight
 
         self.calc_gae_kwargs = calc_gae_kwargs
+
+        # reward shaping function
+
+        self.has_reward_shaping = exists(reward_shaping_fns)
+        self.reward_shaping_fns = reward_shaping_fns
 
         # loss related
 
@@ -853,28 +860,48 @@ class Locoformer(Module):
 
         return mean_actor_loss.detach(), mean_critic_loss.detach()
 
+    def state_to_rewards(
+        self,
+        state
+    ) -> Tensor:
+
+        assert self.has_reward_shaping
+
+        rewards = [fn(state) for fn in self.reward_shaping_fns]
+
+        rewards = [tensor(reward) if not is_tensor(reward) else reward for reward in rewards]
+        return stack(rewards)
+
     def wrap_env_functions(self, env):
 
+        def transform_output(el):
+            if isinstance(el, ndarray):
+                return from_numpy(el)
+            elif isinstance(el, (int, bool, float)):
+                return tensor(el)
+            else:
+                return el
+
         def wrapped_reset(*args, **kwargs):
-            state, _ =  env.reset(*args, **kwargs)
+            env_reset_out =  env.reset(*args, **kwargs)
 
-            if isinstance(state, ndarray):
-                state = from_numpy(state)
-
-            return state, _
+            return tree_map(transform_output, env_reset_out)
 
         def wrapped_step(action, *args, **kwargs):
-            out = env.step(action.item(), *args, **kwargs)
 
-            def transform_output(el):
-                if isinstance(el, ndarray):
-                    return from_numpy(el)
-                elif isinstance(el, (int, bool, float)):
-                    return tensor(el)
-                else:
-                    return el
+            if is_tensor(action):
+                action = action.item()
 
-            return tree_map(transform_output, out)
+            env_step_out = env.step(action, *args, **kwargs)
+
+            env_step_out_torch = tree_map(transform_output, env_step_out)
+
+            if not self.has_reward_shaping:
+                return env_step_out_torch
+
+            shaped_rewards = self.state_to_rewards(env_step_out_torch)
+
+            return env_step_out_torch, shaped_rewards
 
         return wrapped_reset, wrapped_step
 
