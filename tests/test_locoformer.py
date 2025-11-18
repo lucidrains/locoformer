@@ -13,7 +13,9 @@ def test_locoformer():
     model = Locoformer(
         embedder = nn.Embedding(256, 128),
         unembedder = nn.Linear(128, 256, bias = False),
-        value_network = MLP(128, 32, 1),
+        value_network = MLP(128, 64, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
         transformer = dict(
             dim = 128,
             depth = 1,
