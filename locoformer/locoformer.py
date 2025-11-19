@@ -35,6 +35,8 @@ from assoc_scan import AssocScan
 
 LinearNoBias = partial(Linear, bias = False)
 
+Cache = namedtuple('Cache', ('curr_timestep', 'kv_cache')) # (int, Tensor)
+
 # helper functions
 
 def exists(v):
@@ -692,6 +694,7 @@ class Locoformer(Module):
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
         calc_gae_kwargs: dict = dict(),
+        recurrent_kv_cache = True,
         use_spo = False # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
     ):
         super().__init__()
@@ -742,6 +745,10 @@ class Locoformer(Module):
         # maybe use spo
 
         self.use_spo = use_spo
+
+        # maybe recurrent kv cache (todo: find and cite this paper from ages ago)
+
+        self.recurrent_kv_cache = recurrent_kv_cache
 
         # reward shaping function
 
@@ -926,6 +933,7 @@ class Locoformer(Module):
         inference_mode = False,
         has_batch_dim = False,
         has_time_dim = False,
+        state_time_dim = 1,
         **kwargs
     ):
         window_size = self.window_size
@@ -941,27 +949,16 @@ class Locoformer(Module):
                 state = rearrange(state, '... -> 1 ...')
 
             if not has_time_dim:
-                state = rearrange(state, '... d -> ... 1 d')
-
-            # precautionary - make sure time is always either window size (for training) or one timestep for inference - the only exception is handling a prompt for language (irrelevant)
-
-            assert state.shape[-2] in {1, window_size}
+                state = state.unsqueeze(state_time_dim)
 
             # forwards
 
             out, cache = self.forward(state, cache = cache, **{**kwargs, **override_kwargs})
 
-            # handle cache
-
-            cache_len = cache.shape[-2]
-
-            if self.fixed_window_size or divisible_by(cache_len, window_size * 2):
-                cache = cache[..., -window_size:, :]
-
             # maybe remove batch or time
 
             if not has_time_dim:
-                out = tree_map_tensor(out, lambda t: rearrange(t, '... 1 d -> ... d'))
+                out = tree_map_tensor(out, lambda t: t.squeeze(state_time_dim))
 
             if not has_batch_dim:
                 out = tree_map_tensor(out, lambda t: rearrange(t, '1 ... -> ...'))
@@ -990,7 +987,7 @@ class Locoformer(Module):
     def forward(
         self,
         state: Tensor,
-        cache: Tensor | None = None,
+        cache: Cache | None = None,
         detach_cache = False,
         return_values = False,
         return_raw_value_logits = False
@@ -1000,7 +997,25 @@ class Locoformer(Module):
 
         tokens = self.embedder(state)
 
-        embed, kv_cache = self.transformer(tokens, cache = cache, return_kv_cache = True)
+        # time
+
+        time = tokens.shape[-2]
+
+        # destruct the cache for the current timestep and the cache
+
+        prev_kv_cache = None
+        timestep_start = 0
+
+        if exists(cache):
+            timestep_start, prev_kv_cache = cache
+
+        # an assert - make sure during training or inference, forward never gets anything that crosses the window segment boundary, to open up some possibilities with extending memory
+
+        assert ((timestep_start % self.window_size) + time) <= self.window_size
+
+        # attention
+
+        embed, kv_cache = self.transformer(tokens, cache = prev_kv_cache, return_kv_cache = True)
 
         # unembed to actions - in language models this would be the next state
 
@@ -1027,4 +1042,18 @@ class Locoformer(Module):
 
         # output and cache
 
-        return out, kv_cache
+        next_timestep = time + timestep_start
+
+        # handle curtailing kv cache at the right intervals
+
+        window_size = self.window_size
+
+        if self.fixed_window_size or divisible_by(next_timestep, window_size * 2):
+            kv_cache = kv_cache[..., -window_size:, :]
+
+        # maybe recurrent cache - shift the kv cache from one layer above to the one below, for extending on receptive field of past
+
+        if self.recurrent_kv_cache and divisible_by(next_timestep, window_size):
+            kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
+
+        return out, (next_timestep, kv_cache)

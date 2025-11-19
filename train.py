@@ -160,7 +160,7 @@ for i in range(NUM_BATCHES):
         optim.step()
         optim.zero_grad()
 
-    if divisible_by(i + 1, GENERATE_EVERY):
+    if divisible_by(i, GENERATE_EVERY):
         model.eval()
 
         val_seq = next(val_loader_iter)

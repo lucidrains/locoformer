@@ -9,7 +9,10 @@ from einops import rearrange
 
 from locoformer.locoformer import Locoformer
 
-def test_locoformer():
+@param('recurrent_kv_cache', (False, True))
+def test_locoformer(
+    recurrent_kv_cache
+):
     
     model = Locoformer(
         embedder = nn.Embedding(256, 128),
@@ -17,6 +20,7 @@ def test_locoformer():
         value_network = MLP(128, 64, 32),
         dim_value_input = 32,
         reward_range = (-100., 100.),
+        recurrent_kv_cache = recurrent_kv_cache,
         transformer = dict(
             dim = 128,
             depth = 1,
