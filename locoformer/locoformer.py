@@ -73,6 +73,9 @@ def pad_at_dim(
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
+def normalize(t, eps = 1e-5):
+    return (t - t.mean()) / t.std().clamp_min(eps)
+
 def calc_entropy(logits):
     prob = logits.softmax(dim = -1)
     return -(prob * log(prob)).sum(dim = -1)
@@ -776,6 +779,8 @@ class Locoformer(Module):
         gae_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
 
         advantage, returns = calc_gae(reward, old_value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
+
+        advantage = normalize(advantage)
 
         windowed_tensors = [
             t.split(window_size, dim = 1) for t in
