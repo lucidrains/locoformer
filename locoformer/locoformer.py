@@ -943,6 +943,10 @@ class Locoformer(Module):
             if not has_time_dim:
                 state = rearrange(state, '... d -> ... 1 d')
 
+            # precautionary - make sure time is always either window size (for training) or one timestep for inference - the only exception is handling a prompt for language (irrelevant)
+
+            assert state.shape[-2] in {1, window_size}
+
             # forwards
 
             out, cache = self.forward(state, cache = cache, **{**kwargs, **override_kwargs})
