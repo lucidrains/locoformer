@@ -158,13 +158,14 @@ def main(
         gae_lam = gae_lam,
         ppo_eps_clip = ppo_eps_clip,
         ppo_entropy_weight = ppo_entropy_weight,
+        use_spo = True,
         value_network = MLP(64, 64),
         dim_value_input = 64,
         reward_range = reward_range,
         hl_gauss_loss_kwargs = dict(),
         calc_gae_kwargs = dict(
             use_accelerated = False
-        )
+        ),
     ).to(device)
 
     optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate, betas = betas)

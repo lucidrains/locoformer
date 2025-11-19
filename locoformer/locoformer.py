@@ -692,6 +692,7 @@ class Locoformer(Module):
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
         calc_gae_kwargs: dict = dict(),
+        use_spo = False # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
     ):
         super().__init__()
 
@@ -737,6 +738,10 @@ class Locoformer(Module):
         self.value_loss_weight = value_loss_weight
 
         self.calc_gae_kwargs = calc_gae_kwargs
+
+        # maybe use spo
+
+        self.use_spo = use_spo
 
         # reward shaping function
 
@@ -826,7 +831,10 @@ class Locoformer(Module):
             eps_clip = self.ppo_eps_clip
             ratio = (log_prob - old_action_log_prob).exp()
 
-            actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
+            if self.use_spo:
+                actor_loss = -(ratio * advantage - (advantage.abs() * (ratio - 1.).square()) / (2 * eps_clip))
+            else:
+                actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
 
             actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
