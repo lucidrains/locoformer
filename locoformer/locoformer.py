@@ -746,7 +746,7 @@ class Locoformer(Module):
 
         self.use_spo = use_spo
 
-        # maybe recurrent kv cache (todo: find and cite this paper from ages ago)
+        # maybe recurrent kv cache, from Ding et al. https://arxiv.org/abs/2012.15688
 
         self.recurrent_kv_cache = recurrent_kv_cache
 
