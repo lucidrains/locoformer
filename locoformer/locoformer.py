@@ -17,7 +17,7 @@ import torch
 from torch import nn, cat, stack, arange, Tensor, tensor, is_tensor, from_numpy
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
 
@@ -47,6 +47,9 @@ def default(v, d):
 
 def first(arr):
     return arr[0]
+
+def xnor(x, y):
+    return not (x ^ y)
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -463,6 +466,69 @@ class ReplayBuffer:
 
         return DataLoader(self.dataset(episode_mapping), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
 
+# normalization + conditioning (needed for the commands to the robot)
+
+class MaybeAdaRMSNormWrapper(Module):
+    def __init__(
+        self,
+        fn: Module,
+        dim,
+        dim_cond = None
+    ):
+        super().__init__()
+        condition = exists(dim_cond)
+
+        self.fn = fn
+        self.norm = nn.RMSNorm(dim, elementwise_affine = not condition)
+
+        self.accept_condition = condition
+
+        if condition:
+            self.to_gamma = LinearNoBias(dim_cond, dim)
+            self.to_ada_norm_zero = nn.Linear(dim_cond, dim)
+
+            nn.init.zeros_(self.to_gamma.weight, 0.)
+            nn.init.zeros_(self.to_ada_norm_zero.weight, 0.)
+            nn.init.constant_(self.to_ada_norm_zero.bias, -5.)
+
+    def forward(
+        self,
+        x,
+        cond = None,
+        **kwargs
+    ):
+
+        need_cond = self.accept_condition
+        assert xnor(exists(cond), need_cond)
+
+        prenormed = self.norm(x)
+
+        if need_cond:
+            if cond.ndim == 2:
+                cond = rearrange(cond, 'b d -> b 1 d')
+
+            scale_in = self.to_gamma(cond)
+            prenormed = prenormed * (scale_in + 1.)
+
+        all_fn_out = self.fn(prenormed, **kwargs)
+
+        if not need_cond:
+            return all_fn_out
+
+        # function may return multiple args
+
+        (out, *rest), tree_spec = tree_flatten(all_fn_out)
+
+        if need_cond:
+            scale_out = self.to_ada_norm_zero(cond).sigmoid()
+            out = out * scale_out
+
+        # restore
+
+        all_fn_out = tree_unflatten((out, *rest), tree_spec)
+
+        return all_fn_out
+
 # transformer-xl with ppo
 
 class Attention(Module):
@@ -472,14 +538,11 @@ class Attention(Module):
         window_size,
         dim_head = 64,
         heads = 8,
-        pre_rmsnorm = True,
         fixed_window_size = False,
         accept_value_residual = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
-
-        self.norm = RMSNorm(dim) if pre_rmsnorm else Identity()
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -523,8 +586,6 @@ class Attention(Module):
         seq_len = tokens.shape[-2]
 
         device = tokens.device
-
-        tokens = self.norm(tokens)
 
         q, k, v = (self.to_q(tokens), *self.to_kv(tokens).chunk(2, dim = -1))
 
@@ -614,19 +675,24 @@ class TransformerXL(Module):
         dim_head = 64,
         heads = 8,
         expansion_factor = 4.,
+        dim_cond = None,
         final_norm = True,
         fixed_window_size = False,
     ):
         super().__init__()
+
+        condition = exists(dim_cond)
+
+        norm_fn = partial(MaybeAdaRMSNormWrapper, dim = dim, dim_cond = dim_cond)
 
         layers = ModuleList([])
 
         for i in range(depth):
             is_first = i == 0
 
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first)
+            attn = norm_fn(Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first))
 
-            ff = FeedForward(dim = dim, expansion_factor = expansion_factor)
+            ff = norm_fn(FeedForward(dim = dim, expansion_factor = expansion_factor))
 
             layers.append(ModuleList([
                 attn, ff
