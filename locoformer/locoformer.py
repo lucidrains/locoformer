@@ -6,6 +6,8 @@ from pathlib import Path
 from contextlib import contextmanager
 from collections import namedtuple
 
+from inspect import signature
+
 import numpy as np
 from numpy import ndarray
 from numpy.lib.format import open_memmap
@@ -55,6 +57,9 @@ def xnor(x, y):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def num_parameters_on_function(fn):
+    return len(signature(fn).parameters)
 
 # tensor helpers
 
@@ -758,6 +763,9 @@ class TransformerXL(Module):
 
 # class
 
+StateToReward = Callable[[Tensor], float | Tensor]
+StateCommandToReward = Callable[[Tensor, Tensor], float | Tensor]
+
 class Locoformer(Module):
     def __init__(
         self,
@@ -772,7 +780,7 @@ class Locoformer(Module):
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
         reward_range: tuple[float, float] | None = None,
-        reward_shaping_fns: list[Callable[[Tensor], float | Tensor]] | None = None,
+        reward_shaping_fns: list[StateToReward | StateCommandToReward] | None = None,
         num_reward_bins = 32,
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
@@ -965,16 +973,32 @@ class Locoformer(Module):
 
         return mean_actor_loss.detach(), mean_critic_loss.detach()
 
-    def state_to_rewards(
+    def state_and_command_to_rewards(
         self,
-        state
+        state,
+        commands = None
     ) -> Tensor:
 
         assert self.has_reward_shaping
 
-        rewards = [fn(state) for fn in self.reward_shaping_fns]
+        rewards = []
+
+        for fn in self.reward_shaping_fns:
+            fn_num_params = num_parameters_on_function(fn)
+
+            if fn_num_params == 1: # only state
+                reward = fn(state)
+            elif fn_num_params == 2: # state and command
+                reward = fn(state, commands)
+            else:
+                raise ValueError('invalid number of arguments for reward shaping function')
+
+            rewards.append(reward)
+
+        # cast to Tensor if returns a float, just make it flexible for researcher
 
         rewards = [tensor(reward) if not is_tensor(reward) else reward for reward in rewards]
+
         return stack(rewards)
 
     def wrap_env_functions(self, env):
@@ -1004,7 +1028,7 @@ class Locoformer(Module):
             if not self.has_reward_shaping:
                 return env_step_out_torch
 
-            shaped_rewards = self.state_to_rewards(env_step_out_torch)
+            shaped_rewards = self.state_and_command_to_rewards(env_step_out_torch)
 
             return env_step_out_torch, shaped_rewards
 

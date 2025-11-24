@@ -126,7 +126,7 @@ def test_reward_shaping():
         reward_range = (-100., 100.),
         reward_shaping_fns = [
             lambda state: (state[3] - 2.5).pow(2).mean(),
-            lambda state: state[4:6].norm(dim = -1)
+            lambda state, command: state[4:6].norm(dim = -1)
         ],
         transformer = dict(
             dim = 128,
