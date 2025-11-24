@@ -36,6 +36,8 @@ from assoc_scan import AssocScan
 
 from x_mlps_pytorch import MLP
 
+from x_evolution import EvoStrategy
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -882,6 +884,14 @@ class Locoformer(Module):
             return []
 
         return self.to_value_pred.parameters()
+
+    def evolve(
+        self,
+        environment,
+        **kwargs
+    ):
+        evo_strat = EvoStrategy(self, environment = environment, **kwargs)
+        evo_strat()
 
     def ppo(
         self,

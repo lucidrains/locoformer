@@ -163,3 +163,20 @@ def test_tensor_to_dict():
 
     state_dict = tensor_to_dict(state, config)
     assert hasattr(state_dict, 'xyz') and state_dict.xyz.shape == (1, 3, 3)
+
+def test_evo():
+
+    model = Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256, bias = False),
+        value_network = MLP(128, 64, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        transformer = dict(
+            dim = 128,
+            depth = 1,
+            window_size = 512,
+        )
+    )
+
+    model.evolve(lambda model: 1., num_generations = 1)
