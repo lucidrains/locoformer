@@ -10,8 +10,10 @@ from einops import rearrange
 from locoformer.locoformer import Locoformer
 
 @param('recurrent_kv_cache', (False, True))
+@param('has_commands', (False, True))
 def test_locoformer(
-    recurrent_kv_cache
+    recurrent_kv_cache,
+    has_commands
 ):
     
     model = Locoformer(
@@ -24,24 +26,31 @@ def test_locoformer(
         transformer = dict(
             dim = 128,
             depth = 1,
-            window_size = 512
+            window_size = 512,
+            dim_cond = 2 if has_commands else None
         )
     )
 
     seq = torch.randint(0, 256, (3, 512))
 
-    (logits, values), cache = model(seq, return_values = True)
-    (logits, values), cache = model(seq, return_values = True, cache = cache)
-    (logits, values), cache = model(seq, return_values = True, cache = cache)
+    commands = None
+    if has_commands:
+        commands = torch.randn(3, 512, 2)
+
+    (logits, values), cache = model(seq, condition = commands, return_values = True)
+    (logits, values), cache = model(seq, condition = commands, return_values = True, cache = cache)
+    (logits, values), cache = model(seq, condition = commands, return_values = True, cache = cache)
 
     assert logits.shape == (3, 512, 256)
 
     stateful_forward = model.get_stateful_forward(has_batch_dim = True, has_time_dim = True, return_values = True, inference_mode = True)
 
+    inference_command = torch.randn(1, 1, 2) if has_commands else None
+
     for state in seq.unbind(dim = -1):
         state = rearrange(state, 'b -> b 1')
 
-        logits, values = stateful_forward(state)
+        logits, values = stateful_forward(state, condition = inference_command)
         assert logits.shape == (3, 1, 256)
 
 def test_replay():

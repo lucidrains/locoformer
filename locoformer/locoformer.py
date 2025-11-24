@@ -31,6 +31,8 @@ from hl_gauss_pytorch import HLGaussLoss
 
 from assoc_scan import AssocScan
 
+from x_mlps_pytorch import MLP
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -487,8 +489,8 @@ class MaybeAdaRMSNormWrapper(Module):
             self.to_gamma = LinearNoBias(dim_cond, dim)
             self.to_ada_norm_zero = nn.Linear(dim_cond, dim)
 
-            nn.init.zeros_(self.to_gamma.weight, 0.)
-            nn.init.zeros_(self.to_ada_norm_zero.weight, 0.)
+            nn.init.zeros_(self.to_gamma.weight)
+            nn.init.zeros_(self.to_ada_norm_zero.weight)
             nn.init.constant_(self.to_ada_norm_zero.bias, -5.)
 
     def forward(
@@ -499,6 +501,7 @@ class MaybeAdaRMSNormWrapper(Module):
     ):
 
         need_cond = self.accept_condition
+
         assert xnor(exists(cond), need_cond)
 
         prenormed = self.norm(x)
@@ -683,7 +686,9 @@ class TransformerXL(Module):
 
         condition = exists(dim_cond)
 
-        norm_fn = partial(MaybeAdaRMSNormWrapper, dim = dim, dim_cond = dim_cond)
+        self.to_cond_tokens = MLP(dim_cond, dim * 2, activate_last = True) if exists(dim_cond) else None
+
+        norm_fn = partial(MaybeAdaRMSNormWrapper, dim = dim, dim_cond = (dim * 2) if condition else None) 
 
         layers = ModuleList([])
 
@@ -710,20 +715,32 @@ class TransformerXL(Module):
         self,
         x,
         cache = None,
-        return_kv_cache = False
+        return_kv_cache = False,
+        condition: Tensor | None = None
     ):
+
+        # cache and residuals
 
         cache = default(cache, (None,) * len(self.layers))
 
         next_kv_caches = []
         value_residual = None
 
+        # handle condition
+
+        cond_tokens = None
+        if exists(condition):
+            assert exists(self.to_cond_tokens)
+            cond_tokens = self.to_cond_tokens(condition)
+
+        # layers
+
         for (attn, ff), kv_cache in zip(self.layers, cache):
 
-            attn_out, (next_kv_cache, values) = attn(x, value_residual = value_residual, kv_cache = kv_cache, return_kv_cache = True)
+            attn_out, (next_kv_cache, values) = attn(x, cond = cond_tokens, value_residual = value_residual, kv_cache = kv_cache, return_kv_cache = True)
 
             x = attn_out + x
-            x = ff(x) + x
+            x = ff(x, cond = cond_tokens) + x
 
             next_kv_caches.append(next_kv_cache)
             value_residual = default(value_residual, values)
@@ -752,7 +769,7 @@ class Locoformer(Module):
         ppo_eps_clip = 0.2,
         ppo_entropy_weight = 0.01,
         ppo_value_clip = 0.4,
-        dim_value_input = None, # needs to be set for value network to be available
+        dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
         reward_range: tuple[float, float] | None = None,
         reward_shaping_fns: list[Callable[[Tensor], float | Tensor]] | None = None,
@@ -1006,7 +1023,11 @@ class Locoformer(Module):
 
         cache = None
 
-        def stateful_forward(state: Tensor, **override_kwargs):
+        def stateful_forward(
+            state: Tensor,
+            condition: Tensor | None = None,
+            **override_kwargs
+        ):
             nonlocal cache
 
             # handle no batch or time, for easier time rolling out against envs
@@ -1014,12 +1035,18 @@ class Locoformer(Module):
             if not has_batch_dim:
                 state = rearrange(state, '... -> 1 ...')
 
+                if exists(command):
+                    condition = rearrange(condition, '... -> 1 ...')
+
             if not has_time_dim:
                 state = state.unsqueeze(state_time_dim)
 
+                if exists(command):
+                    condition = rearrange(condition, '... d -> ... 1 d')
+
             # forwards
 
-            out, cache = self.forward(state, cache = cache, **{**kwargs, **override_kwargs})
+            out, cache = self.forward(state, condition = condition, cache = cache, **{**kwargs, **override_kwargs})
 
             # maybe remove batch or time
 
@@ -1054,6 +1081,7 @@ class Locoformer(Module):
         self,
         state: Tensor,
         cache: Cache | None = None,
+        condition: Tensor | None = None,
         detach_cache = False,
         return_values = False,
         return_raw_value_logits = False
@@ -1081,7 +1109,7 @@ class Locoformer(Module):
 
         # attention
 
-        embed, kv_cache = self.transformer(tokens, cache = prev_kv_cache, return_kv_cache = True)
+        embed, kv_cache = self.transformer(tokens, condition = condition, cache = prev_kv_cache, return_kv_cache = True)
 
         # unembed to actions - in language models this would be the next state
 
