@@ -61,8 +61,9 @@ def xnor(x, y):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def num_parameters_on_function(fn):
-    return len(signature(fn).parameters)
+def get_param_names(fn):
+    parameters = signature(fn).parameters
+    return list(parameters.keys())
 
 # tensor helpers
 
@@ -113,6 +114,28 @@ def tensor_to_dict(
 def calc_entropy(logits):
     prob = logits.softmax(dim = -1)
     return -(prob * log(prob)).sum(dim = -1)
+
+# reward functions
+
+def linear_velocity_command_tracking(
+    state,
+    command,
+    s1 = -1.
+):
+    if not (hasattr(state, 'v_xy') and hasattr(command, 'v_xy')):
+        return 0.
+
+    return (state.v_xy - command.v_xy).norm().mul(s1).exp()
+
+def angular_velocity_command_tracking(
+    state,
+    command,
+    s2 = -1.
+):
+    if not (hasattr(state, 'w_z') and hasattr(command, 'w_z')):
+        return 0.
+
+    return (state.w_z - command.w_z).norm().mul(s2).exp()
 
 # generalized advantage estimate
 
@@ -1014,12 +1037,13 @@ class Locoformer(Module):
         rewards = []
 
         for fn in self.reward_shaping_fns:
-            fn_num_params = num_parameters_on_function(fn)
+            param_names = get_param_names(fn)
+            param_names = set(param_names) & {'state', 'command'}
 
-            if fn_num_params == 1: # only state
-                reward = fn(state)
-            elif fn_num_params == 2: # state and command
-                reward = fn(state, commands)
+            if param_names == {'state'}: # only state
+                reward = fn(state = state)
+            elif param_names == {'state', 'command'}: # state and command
+                reward = fn(state = state, command = commands)
             else:
                 raise ValueError('invalid number of arguments for reward shaping function')
 
