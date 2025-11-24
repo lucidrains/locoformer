@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Callable
+from types import SimpleNamespace
 from functools import partial
 
 from pathlib import Path
@@ -87,6 +88,25 @@ def pad_at_dim(
 
 def normalize(t, eps = 1e-5):
     return (t - t.mean()) / t.std().clamp_min(eps)
+
+def tensor_to_dict(
+    t: Tensor,
+    config: tuple[tuple[str, int] | str],
+    dim = -1,
+    return_dottable = True
+):
+    config = tuple((c, 1) if isinstance(c, str) else c for c in config)
+
+    names, sizes = zip(*config)
+    assert sum(sizes) == t.shape[dim]
+
+    t = t.split(sizes, dim = dim)
+    tensor_dict = dict(zip(names, t))
+
+    if not return_dottable:
+        return tensor_dict
+
+    return SimpleNamespace(**tensor_dict)
 
 def calc_entropy(logits):
     prob = logits.softmax(dim = -1)

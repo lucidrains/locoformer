@@ -154,3 +154,12 @@ def test_reward_shaping():
     _, rewards = step_fn(3)
 
     assert len(rewards) == 2
+
+def test_tensor_to_dict():
+    state = torch.randn(1, 3, 5)
+    config = (('xyz', 3), 'vx', 'vy')
+
+    from locoformer.locoformer import tensor_to_dict
+
+    state_dict = tensor_to_dict(state, config)
+    assert hasattr(state_dict, 'xyz') and state_dict.xyz.shape == (1, 3, 3)
