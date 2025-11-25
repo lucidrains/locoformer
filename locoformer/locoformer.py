@@ -115,9 +115,9 @@ def calc_entropy(logits):
     prob = logits.softmax(dim = -1)
     return -(prob * log(prob)).sum(dim = -1)
 
-# reward functions
+# reward functions - A.2
 
-def linear_velocity_command_tracking(
+def reward_linear_velocity_command_tracking(
     state,
     command,
     s1 = 1.
@@ -125,10 +125,10 @@ def linear_velocity_command_tracking(
     if not (hasattr(state, 'v_xy') and hasattr(command, 'v_xy')):
         return 0.
 
-    error = (state.v_xy - command.v_xy).square().sum(dim = -1)
+    error = (state.v_xy - command.v_xy).norm(dim = -1).pow(2)
     return torch.exp(-error / s1)
 
-def angular_velocity_command_tracking(
+def reward_angular_velocity_command_tracking(
     state,
     command,
     s2 = 1.
@@ -136,8 +136,54 @@ def angular_velocity_command_tracking(
     if not (hasattr(state, 'w_z') and hasattr(command, 'w_z')):
         return 0.
 
-    error = (state.w_z - command.w_z).square().sum(dim = -1)
+    error = (state.w_z - command.w_z).norm(dim = -1).pow(2)
     return torch.exp(-error / s2)
+
+def reward_base_linear_velocity_penalty(
+    state
+):
+    if not hasattr(state, 'v_z'):
+        return 0.
+
+    return -state.v_z.norm(dim = -1).pow(2)
+
+def reward_base_angular_velocity_penalty(
+    state
+):
+    if not hasattr(state, 'w_xy'):
+        return 0.
+
+    return -state.w_xy.norm(dim = -1).pow(2)
+
+def reward_base_height_penalty(
+    state,
+    x_z_nominal = 0.27
+):
+    if not hasattr(state, 'x_z'):
+        return 0.
+
+    return -(state.x_z - x_z_nominal).norm(dim = -1).pow(2)
+
+def reward_joint_acceleration_penalty(
+    state
+):
+    if not hasattr(state, 'joint_q'):
+        return 0.
+
+    return -state.joint_q.norm(dim = -1).pow(2)
+
+def reward_torque_penalty(
+    state
+):
+    if not hasattr(state, 'tau'):
+        return 0.
+
+    return -state.tau.norm(dim = -1).pow(2)
+
+def reward_alive(
+    state
+):
+    return 1.
 
 # generalized advantage estimate
 
@@ -810,9 +856,6 @@ class TransformerXL(Module):
 
 # class
 
-StateToReward = Callable[[Tensor], float | Tensor]
-StateCommandToReward = Callable[[Tensor, Tensor], float | Tensor]
-
 class Locoformer(Module):
     def __init__(
         self,
@@ -827,7 +870,7 @@ class Locoformer(Module):
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
         reward_range: tuple[float, float] | None = None,
-        reward_shaping_fns: list[StateToReward | StateCommandToReward] | None = None,
+        reward_shaping_fns: list[Callable[..., float | Tensor]] | None = None,
         num_reward_bins = 32,
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
