@@ -68,7 +68,7 @@ def get_param_names(fn):
 def check_has_param_attr(
     param_name,
     param_attr,
-    default_value = 0.
+    default_value = None
 ):
     def decorator(fn):
         sig = signature(fn)
