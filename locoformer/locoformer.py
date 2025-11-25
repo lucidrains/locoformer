@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Callable
 from types import SimpleNamespace
-from functools import partial
+from functools import partial, wraps
 
 from pathlib import Path
 from contextlib import contextmanager
@@ -65,6 +65,30 @@ def get_param_names(fn):
     parameters = signature(fn).parameters
     return list(parameters.keys())
 
+def check_has_param_attr(
+    param_name,
+    param_attr,
+    default_value = 0.
+):
+    def decorator(fn):
+        sig = signature(fn)
+
+        @wraps(fn)
+        def inner(*args, **kwargs):
+
+            bound_args = sig.bind(*args, **kwargs).arguments
+
+            if not (
+                param_name in bound_args and
+                hasattr(bound_args[param_name], param_attr)
+            ):
+                return default_value
+
+            return fn(*args, **kwargs)
+
+        return inner
+    return decorator
+
 # tensor helpers
 
 def log(t, eps = 1e-20):
@@ -117,67 +141,55 @@ def calc_entropy(logits):
 
 # reward functions - A.2
 
+@check_has_param_attr('state', 'v_xy')
+@check_has_param_attr('command', 'v_xy')
 def reward_linear_velocity_command_tracking(
     state,
     command,
     s1 = 1.
 ):
-    if not (hasattr(state, 'v_xy') and hasattr(command, 'v_xy')):
-        return 0.
-
     error = (state.v_xy - command.v_xy).norm(dim = -1).pow(2)
     return torch.exp(-error / s1)
 
+@check_has_param_attr('state', 'w_z')
+@check_has_param_attr('command', 'w_z')
 def reward_angular_velocity_command_tracking(
     state,
     command,
     s2 = 1.
 ):
-    if not (hasattr(state, 'w_z') and hasattr(command, 'w_z')):
-        return 0.
-
     error = (state.w_z - command.w_z).norm(dim = -1).pow(2)
     return torch.exp(-error / s2)
 
+@check_has_param_attr('state', 'v_z')
 def reward_base_linear_velocity_penalty(
     state
 ):
-    if not hasattr(state, 'v_z'):
-        return 0.
-
     return -state.v_z.norm(dim = -1).pow(2)
 
+@check_has_param_attr('state', 'w_xy')
 def reward_base_angular_velocity_penalty(
     state
 ):
-    if not hasattr(state, 'w_xy'):
-        return 0.
-
     return -state.w_xy.norm(dim = -1).pow(2)
 
+@check_has_param_attr('state', 'x_z')
 def reward_base_height_penalty(
     state,
     x_z_nominal = 0.27
 ):
-    if not hasattr(state, 'x_z'):
-        return 0.
-
     return -(state.x_z - x_z_nominal).norm(dim = -1).pow(2)
 
+@check_has_param_attr('state', 'joint_q')
 def reward_joint_acceleration_penalty(
     state
 ):
-    if not hasattr(state, 'joint_q'):
-        return 0.
-
     return -state.joint_q.norm(dim = -1).pow(2)
 
+@check_has_param_attr('state', 'tau')
 def reward_torque_penalty(
     state
 ):
-    if not hasattr(state, 'tau'):
-        return 0.
-
     return -state.tau.norm(dim = -1).pow(2)
 
 def reward_alive(
