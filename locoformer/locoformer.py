@@ -995,6 +995,7 @@ class Locoformer(Module):
         mask,
         episode_lens,
         condition: Tensor | None = None,
+        state_type: int | None = None,
         actor_optim: Optimizer | None = None,
         critic_optim: Optimizer | None = None
     ):
@@ -1051,7 +1052,7 @@ class Locoformer(Module):
             if has_condition:
                 condition, = rest
 
-            (action_logits, value_logits), cache = self.forward(state, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
+            (action_logits, value_logits), cache = self.forward(state, condition = condition, state_type = state_type, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
             entropy = calc_entropy(action_logits)
 
             action = rearrange(action, 'b t -> b t 1')
@@ -1185,6 +1186,7 @@ class Locoformer(Module):
         def stateful_forward(
             state: Tensor,
             condition: Tensor | None = None,
+            state_type: int | None = None,
             **override_kwargs
         ):
             nonlocal cache
@@ -1210,7 +1212,7 @@ class Locoformer(Module):
 
             # forwards
 
-            out, cache = self.forward(state, condition = condition, cache = cache, **{**kwargs, **override_kwargs})
+            out, cache = self.forward(state, condition = condition, state_type = state_type, cache = cache, **{**kwargs, **override_kwargs})
 
             # maybe remove batch or time
 
