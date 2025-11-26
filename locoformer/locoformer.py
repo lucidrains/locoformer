@@ -483,6 +483,10 @@ class ReplayBuffer:
             # memmap file
 
             filepath = folder / f'{field_name}.data.npy'
+
+            if isinstance(shape, int):
+                shape = (shape,)
+
             memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
 
             self.memmaps[field_name] = memmap
@@ -982,6 +986,7 @@ class Locoformer(Module):
         old_value,
         mask,
         episode_lens,
+        condition: Tensor | None = None,
         actor_optim: Optimizer | None = None,
         critic_optim: Optimizer | None = None
     ):
@@ -995,18 +1000,25 @@ class Locoformer(Module):
 
         advantage = normalize(advantage)
 
+        data_tensors = (
+            state,
+            action,
+            old_action_log_prob,
+            reward,
+            old_value,
+            mask,
+            advantage,
+            returns
+        )
+
+        has_condition = exists(condition)
+
+        if exists(condition):
+            data_tensors = (*data_tensors, condition)
+
         windowed_tensors = [
             t.split(window_size, dim = 1) for t in
-            (
-                state,
-                action,
-                old_action_log_prob,
-                reward,
-                old_value,
-                mask,
-                advantage,
-                returns
-            )
+            data_tensors
         ]
 
         mean_actor_loss = self.zero.clone()
@@ -1024,10 +1036,14 @@ class Locoformer(Module):
             old_value,
             mask,
             advantage,
-            returns
+            returns,
+            *rest
         ) in zip(*windowed_tensors):
 
-            (action_logits, value_logits), cache = self.forward(state, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
+            if has_condition:
+                condition, = rest
+
+            (action_logits, value_logits), cache = self.forward(state, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
             entropy = calc_entropy(action_logits)
 
             action = rearrange(action, 'b t -> b t 1')
@@ -1165,18 +1181,23 @@ class Locoformer(Module):
         ):
             nonlocal cache
 
+            state = state.to(self.device)
+
+            if exists(condition):
+                condition = condition.to(self.device)
+
             # handle no batch or time, for easier time rolling out against envs
 
             if not has_batch_dim:
                 state = rearrange(state, '... -> 1 ...')
 
-                if exists(command):
+                if exists(condition):
                     condition = rearrange(condition, '... -> 1 ...')
 
             if not has_time_dim:
                 state = state.unsqueeze(state_time_dim)
 
-                if exists(command):
+                if exists(condition):
                     condition = rearrange(condition, '... d -> ... 1 d')
 
             # forwards

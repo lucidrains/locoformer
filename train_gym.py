@@ -74,6 +74,7 @@ def learn(
                 reward = data.reward,
                 old_value = data.value,
                 mask = data.learnable,
+                condition = data.condition,
                 episode_lens = data._lens,
                 actor_optim = actor_optim,
                 critic_optim = critic_optim
@@ -138,7 +139,8 @@ def main(
             reward = 'float',
             value = 'float',
             done = 'bool',
-            learnable = 'bool'
+            learnable = 'bool',
+            condition = ('float', 2)
         )
     )
 
@@ -152,7 +154,8 @@ def main(
             dim_head = 32,
             heads = 4,
             depth = 4,
-            window_size = 16
+            window_size = 16,
+            dim_cond = 2
         ),
         discount_factor = discount_factor,
         gae_lam = gae_lam,
@@ -190,9 +193,11 @@ def main(
         with replay.one_episode():
             while True:
 
+                rand_command = torch.randn(2)
+
                 # predict next action
 
-                action_logits, value = stateful_forward(state, return_values = True)
+                action_logits, value = stateful_forward(state, condition = rand_command, return_values = True)
 
                 action = gumbel_sample(action_logits)
 
@@ -217,7 +222,8 @@ def main(
                     reward = reward,
                     value = value,
                     done = done,
-                    learnable = tensor(True)
+                    learnable = tensor(True),
+                    condition = rand_command
                 )
 
                 # increment counters
@@ -232,7 +238,7 @@ def main(
                     # only if terminated signal not detected
 
                     if not terminated:
-                        _, next_value = stateful_forward(next_state, return_values = True)
+                        _, next_value = stateful_forward(next_state, condition = rand_command, return_values = True)
 
                         memory._replace(value = next_value, learnable = False)
 
