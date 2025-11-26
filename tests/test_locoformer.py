@@ -180,3 +180,30 @@ def test_evo():
     )
 
     model.evolve(lambda model: 1., num_generations = 1)
+
+def test_unified_state():
+    from locoformer.locoformer import Locoformer
+
+    model = Locoformer(
+        embedder = [
+            nn.Embedding(256, 128),
+            nn.Linear(2, 128)
+        ],
+        unembedder = nn.Linear(128, 256, bias = False),
+        value_network = MLP(128, 64, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        recurrent_kv_cache = False,
+        transformer = dict(
+            dim = 128,
+            depth = 1,
+            window_size = 512,
+        )
+    )
+
+    state1 = torch.randint(0, 256, (3, 512))
+    state2 = torch.randn((3, 512, 2))
+
+    logits, cache = model(state1, state_type = 0)
+    logits, cache = model(state2, state_type = 1, cache = cache)
+    logits, cache = model(state1, state_type = 0, cache = cache)

@@ -875,7 +875,7 @@ class TransformerXL(Module):
 class Locoformer(Module):
     def __init__(
         self,
-        embedder: Module,
+        embedder: Module | ModuleList | list[Module],
         unembedder: Module,
         transformer: dict | TransformerXL,
         discount_factor = 0.999,
@@ -901,7 +901,15 @@ class Locoformer(Module):
 
         self.transformer = transformer
 
+        # handle state embedder
+
+        if isinstance(embedder, list):
+            embedder = ModuleList(embedder)
+
         self.embedder = embedder
+
+        # unembed state to actions or ssl predictions
+
         self.unembedder = unembedder
 
         self.fixed_window_size = transformer.fixed_window_size
@@ -1238,6 +1246,7 @@ class Locoformer(Module):
         state: Tensor,
         cache: Cache | None = None,
         condition: Tensor | None = None,
+        state_type: int | None = None,
         detach_cache = False,
         return_values = False,
         return_raw_value_logits = False
@@ -1245,7 +1254,16 @@ class Locoformer(Module):
 
         state = state.to(self.device)
 
-        tokens = self.embedder(state)
+        # determine which function to invoke for state to token for transformer
+
+        state_to_token = self.embedder
+
+        if exists(state_type):
+            state_to_token = self.embedder[state_type]
+
+        # embed
+
+        tokens = state_to_token(state)
 
         # time
 
