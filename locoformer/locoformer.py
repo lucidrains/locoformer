@@ -381,7 +381,8 @@ class RemappedReplayDataset(Dataset):
         self,
         dataset: ReplayDataset,
         episode_mapping: Tensor | list[list[int]],
-        shuffle_episodes = False
+        shuffle_episodes = False,
+        num_trials_select = None
     ):
         assert len(dataset) > 0
         self.dataset = dataset
@@ -392,6 +393,10 @@ class RemappedReplayDataset(Dataset):
 
         self.episode_mapping = episode_mapping
         self.shuffle_episodes = shuffle_episodes
+
+        assert not (exists(num_trials_select) and num_trials_select >= 1)
+        self.sub_select_trials = exists(num_trials_select)
+        self.num_trials_select = num_trials_select
 
     def __len__(self):
         return len(self.episode_mapping)
@@ -405,9 +410,21 @@ class RemappedReplayDataset(Dataset):
 
         assert not is_empty(episode_indices)
 
-        if self.shuffle_episodes and episode_indices.numel() > 1:
+        # shuffle the episode indices if either shuffle episodes is turned on, or `num_trial_select` passed in (for sub selecting episodes from a set)
+
+        if (
+            episode_indices.numel() > 1 and
+            (self.shuffle_episodes or self.sub_select_trials)
+        ):
             num_episodes = len(episode_indices)
             episode_indices = episode_indices[torch.randperm(num_episodes)]
+
+        # crop out the episodes
+
+        if self.sub_select_trials:
+            episode_indices = episode_indices[:self.num_trials_select]
+
+        # now select out the episode data and merge along time
 
         episode_data = [self.dataset[i] for i in episode_indices.tolist()]
 
