@@ -20,3 +20,14 @@ This open sourced work is sponsored by [Safe Sentinel](https://www.safesentinels
     year    = {2025}
 }
 ```
+
+```bibtex
+@inproceedings{anonymous2025flow,
+    title   = {Flow Policy Gradients for Legged Robots},
+    author  = {Anonymous},
+    booktitle = {Submitted to The Fourteenth International Conference on Learning Representations},
+    year    = {2025},
+    url     = {https://openreview.net/forum?id=BA6n0nmagi},
+    note    = {under review}
+}
+```
