@@ -1388,7 +1388,9 @@ class Locoformer(Module):
 
         if self.recurrent_cache and divisible_by(next_timestep, window_size):
             kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
-            gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
+
+            if exists(gru_cache):
+                gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
         cache = (kv_cache, gru_cache)
 
