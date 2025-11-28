@@ -627,6 +627,7 @@ class MaybeAdaRMSNormWrapper(Module):
     def forward(
         self,
         x,
+        *args,
         cond = None,
         **kwargs
     ):
@@ -644,7 +645,7 @@ class MaybeAdaRMSNormWrapper(Module):
             scale_in = self.to_gamma(cond)
             prenormed = prenormed * (scale_in + 1.)
 
-        all_fn_out = self.fn(prenormed, **kwargs)
+        all_fn_out = self.fn(prenormed, *args, **kwargs)
 
         if not need_cond:
             return all_fn_out
@@ -812,6 +813,7 @@ class TransformerXL(Module):
         dim_cond = None,
         final_norm = True,
         fixed_window_size = False,
+        gru_layers = False
     ):
         super().__init__()
 
@@ -826,16 +828,20 @@ class TransformerXL(Module):
         for i in range(depth):
             is_first = i == 0
 
+            gru = norm_fn(nn.GRU(dim, dim, batch_first = True)) if gru_layers else None
+
             attn = norm_fn(Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first))
 
             ff = norm_fn(FeedForward(dim = dim, expansion_factor = expansion_factor))
 
             layers.append(ModuleList([
-                attn, ff
+                gru, attn, ff
             ]))
 
         self.layers = layers
         self.norm = RMSNorm(dim) if final_norm else Identity()
+
+        self.gru_layers = gru_layers
 
         # fixed window size
 
@@ -852,26 +858,52 @@ class TransformerXL(Module):
 
         # cache and residuals
 
-        cache = default(cache, (None,) * len(self.layers))
+        num_layers = len(self.layers)
+
+        kv_cache = gru_cache = None
+
+        if exists(cache):
+            kv_cache, gru_cache = cache
+
+        kv_cache = default(kv_cache, (None,) * num_layers)
+        gru_cache = default(gru_cache, (None,) * num_layers)
 
         next_kv_caches = []
+        next_gru_hiddens = [] if self.gru_layers else None
+
         value_residual = None
 
         # handle condition
 
         cond_tokens = None
+
         if exists(condition):
             assert exists(self.to_cond_tokens)
             cond_tokens = self.to_cond_tokens(condition)
 
+        cond_kwargs = dict(cond = cond_tokens)
+
         # layers
 
-        for (attn, ff), kv_cache in zip(self.layers, cache):
+        for (maybe_gru, attn, ff), layer_gru_cache, layer_kv_cache in zip(self.layers, gru_cache, kv_cache):
 
-            attn_out, (next_kv_cache, values) = attn(x, cond = cond_tokens, value_residual = value_residual, kv_cache = kv_cache, return_kv_cache = True)
+            # handle maybe rnn
+
+            if exists(maybe_gru):
+                rnn_out, gru_hiddens = maybe_gru(x, layer_gru_cache, **cond_kwargs)
+                x = rnn_out + x
+
+                next_gru_hiddens.append(gru_hiddens)
+
+            # attention
+
+            attn_out, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, return_kv_cache = True)
 
             x = attn_out + x
-            x = ff(x, cond = cond_tokens) + x
+
+            # feedforward
+
+            x = ff(x, **cond_kwargs) + x
 
             next_kv_caches.append(next_kv_cache)
             value_residual = default(value_residual, values)
@@ -885,7 +917,7 @@ class TransformerXL(Module):
 
         next_kv_cache = next_kv_cache[..., -self.window_size:, :]
 
-        return embed, next_kv_cache
+        return embed, (next_kv_cache, next_gru_hiddens)
 
 # class
 
@@ -1311,7 +1343,7 @@ class Locoformer(Module):
 
         # attention
 
-        embed, kv_cache = self.transformer(tokens, condition = condition, cache = prev_kv_cache, return_kv_cache = True)
+        embed, cache = self.transformer(tokens, condition = condition, cache = prev_kv_cache, return_kv_cache = True)
 
         # unembed to actions - in language models this would be the next state
 
@@ -1322,7 +1354,7 @@ class Locoformer(Module):
         # maybe detach cache
 
         if detach_cache:
-            kv_cache = kv_cache.detach()
+            cache = tree_map_tensor(lambda t: t.detach(), cache)
 
         # handle returning of values
 
@@ -1344,6 +1376,8 @@ class Locoformer(Module):
 
         window_size = self.window_size
 
+        kv_cache, gru_cache = cache
+
         if self.fixed_window_size or divisible_by(next_timestep, window_size * 2):
             kv_cache = kv_cache[..., -window_size:, :]
 
@@ -1352,4 +1386,6 @@ class Locoformer(Module):
         if self.recurrent_kv_cache and divisible_by(next_timestep, window_size):
             kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
 
-        return out, (next_timestep, kv_cache)
+        cache = (kv_cache, gru_cache)
+
+        return out, (next_timestep, cache)

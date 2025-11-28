@@ -100,7 +100,7 @@ def main(
     ppo_entropy_weight = .01,
     batch_size = 16,
     epochs = 3,
-    reward_range = (-100., 100.)
+    reward_range = (-300., 300.)
 ):
 
     # accelerate
@@ -155,7 +155,8 @@ def main(
             heads = 4,
             depth = 4,
             window_size = 16,
-            dim_cond = 2
+            dim_cond = 2,
+            gru_layers = True
         ),
         discount_factor = discount_factor,
         gae_lam = gae_lam,

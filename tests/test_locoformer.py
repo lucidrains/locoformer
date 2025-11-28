@@ -9,11 +9,13 @@ from einops import rearrange
 
 from locoformer.locoformer import Locoformer
 
+@param('gru_layers', (False, True))
 @param('recurrent_kv_cache', (False, True))
 @param('has_commands', (False, True))
 def test_locoformer(
+    gru_layers,
     recurrent_kv_cache,
-    has_commands
+    has_commands,
 ):
     
     model = Locoformer(
@@ -27,6 +29,7 @@ def test_locoformer(
             dim = 128,
             depth = 1,
             window_size = 512,
+            gru_layers = gru_layers,
             dim_cond = 2 if has_commands else None
         )
     )
