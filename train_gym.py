@@ -170,6 +170,7 @@ def main(
         calc_gae_kwargs = dict(
             use_accelerated = False
         ),
+        asymmetric_spo = True
     ).to(device)
 
     optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate, betas = betas)

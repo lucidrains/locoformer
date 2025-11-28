@@ -909,7 +909,8 @@ class Locoformer(Module):
         value_loss_weight = 0.5,
         calc_gae_kwargs: dict = dict(),
         recurrent_kv_cache = True,
-        use_spo = False # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
+        use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
+        asymmetric_spo = False  # https://openreview.net/pdf?id=BA6n0nmagi
     ):
         super().__init__()
 
@@ -967,6 +968,8 @@ class Locoformer(Module):
         # maybe use spo
 
         self.use_spo = use_spo
+
+        self.asymmetric_spo = asymmetric_spo
 
         # maybe recurrent kv cache, from Ding et al. https://arxiv.org/abs/2012.15688
 
@@ -1081,10 +1084,16 @@ class Locoformer(Module):
             eps_clip = self.ppo_eps_clip
             ratio = (log_prob - old_action_log_prob).exp()
 
-            if self.use_spo:
-                actor_loss = -(ratio * advantage - (advantage.abs() * (ratio - 1.).square()) / (2 * eps_clip))
+            calc_spo = lambda: -(ratio * advantage - (advantage.abs() * (ratio - 1.).square()) / (2 * eps_clip))
+
+            calc_ppo = lambda: -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
+
+            if self.asymmetric_spo:
+                actor_loss = torch.where(advantage >= 0, calc_ppo(), calc_spo())
+            elif self.use_spo:
+                actor_loss = calc_spo()
             else:
-                actor_loss = -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
+                actor_loss = calc_ppo()
 
             actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
