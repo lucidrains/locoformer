@@ -10,11 +10,11 @@ from einops import rearrange
 from locoformer.locoformer import Locoformer
 
 @param('gru_layers', (False, True))
-@param('recurrent_kv_cache', (False, True))
+@param('recurrent_cache', (False, True))
 @param('has_commands', (False, True))
 def test_locoformer(
     gru_layers,
-    recurrent_kv_cache,
+    recurrent_cache,
     has_commands,
 ):
     
@@ -24,7 +24,7 @@ def test_locoformer(
         value_network = MLP(128, 64, 32),
         dim_value_input = 32,
         reward_range = (-100., 100.),
-        recurrent_kv_cache = recurrent_kv_cache,
+        recurrent_cache = recurrent_cache,
         transformer = dict(
             dim = 128,
             depth = 1,
@@ -196,7 +196,7 @@ def test_unified_state():
         value_network = MLP(128, 64, 32),
         dim_value_input = 32,
         reward_range = (-100., 100.),
-        recurrent_kv_cache = False,
+        recurrent_cache = False,
         transformer = dict(
             dim = 128,
             depth = 1,
