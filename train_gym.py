@@ -167,7 +167,7 @@ def main(
         dim_value_input = 64,
         reward_range = reward_range,
         hl_gauss_loss_kwargs = dict(),
-        recurrent_kv_cache = True,
+        recurrent_cache = True,
         calc_gae_kwargs = dict(
             use_accelerated = False
         ),

@@ -915,6 +915,9 @@ class TransformerXL(Module):
 
         next_kv_cache = stack(next_kv_caches)
 
+        if exists(next_gru_hiddens):
+            next_gru_hiddens = stack(next_gru_hiddens)
+
         next_kv_cache = next_kv_cache[..., -self.window_size:, :]
 
         return embed, (next_kv_cache, next_gru_hiddens)
@@ -940,7 +943,7 @@ class Locoformer(Module):
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
         calc_gae_kwargs: dict = dict(),
-        recurrent_kv_cache = True,
+        recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False  # https://openreview.net/pdf?id=BA6n0nmagi
     ):
@@ -1005,7 +1008,7 @@ class Locoformer(Module):
 
         # maybe recurrent kv cache, from Ding et al. https://arxiv.org/abs/2012.15688
 
-        self.recurrent_kv_cache = recurrent_kv_cache
+        self.recurrent_cache = recurrent_cache
 
         # reward shaping function
 
@@ -1383,8 +1386,9 @@ class Locoformer(Module):
 
         # maybe recurrent cache - shift the kv cache from one layer above to the one below, for extending on receptive field of past
 
-        if self.recurrent_kv_cache and divisible_by(next_timestep, window_size):
+        if self.recurrent_cache and divisible_by(next_timestep, window_size):
             kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
+            gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
         cache = (kv_cache, gru_cache)
 
