@@ -998,7 +998,7 @@ class Locoformer(Module):
 
         if exists(state_pred_head):
             for param in state_pred_head.parameters():
-                param.zero_()
+                param.data.zero_()
 
         self.has_state_pred_loss = state_pred_loss_weight > 0.
         self.state_pred_loss_weight = state_pred_loss_weight

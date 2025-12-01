@@ -20,12 +20,14 @@ from accelerate import Accelerator
 import gymnasium as gym
 
 import torch
+from torch import nn
 from torch import from_numpy, randint, tensor, stack, arange
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
 
 from einops import rearrange
+from einops.layers.torch import Rearrange, Reduce
 
 from locoformer.locoformer import Locoformer, ReplayBuffer
 from x_mlps_pytorch import MLP
@@ -47,6 +49,14 @@ def gumbel_noise(t):
 def gumbel_sample(logits, temperature = 1., eps = 1e-6):
     noise = gumbel_noise(logits)
     return ((logits / max(temperature, eps)) + noise).argmax(dim = -1)
+
+# get rgb snapshot from env
+
+def get_snapshot(env, shape):
+    vision_state = from_numpy(env.render())
+    vision_state = rearrange(vision_state, 'h w c -> 1 c h w')
+    reshaped = F.interpolate(vision_state, shape, mode = 'bilinear')
+    return rearrange(reshaped / 255., '1 c h w -> c h w')
 
 # learn
 
@@ -88,7 +98,9 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 64,
+    num_episodes_before_learn = 4,
+    use_vision = True,
+    vision_height_width_dim = 64,
     clear_video = True,
     video_folder = 'recordings',
     record_every_episode = 250,
@@ -124,8 +136,16 @@ def main(
         disable_logger = True
     )
 
-    dim_state = env.observation_space.shape[0]
     num_actions = env.action_space.n
+
+    # determine state
+
+    if use_vision:
+        dim_state = env.observation_space.shape[0]
+        state_shape = (3, vision_height_width_dim, vision_height_width_dim)
+    else:
+        dim_state = env.observation_space.shape[0]
+        state_shape = (dim_state,)
 
     # memory
 
@@ -134,7 +154,7 @@ def main(
         num_episodes,
         max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
         fields = dict(
-            state = ('float', (dim_state,)),
+            state = ('float', state_shape),
             action = 'int',
             action_log_prob = 'float',
             reward = 'float',
@@ -145,12 +165,33 @@ def main(
         )
     )
 
+    # if using vision
+
+    if use_vision:
+        dim_hidden = vision_height_width_dim * 2
+
+        state_embedder = nn.Sequential(
+            Rearrange('b t c h w -> b c t h w'),
+            nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
+            nn.ReLU(),
+            nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+            nn.ReLU(),
+            nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+            Reduce('b c t h w -> b t c', 'mean'),
+            nn.Linear(dim_hidden, 64)
+        )
+
+        state_pred_head = None
+    else:
+        state_embedder = MLP(dim_state, 64, bias = False)
+        state_pred_head = MLP(64, dim_state * 2, bias = False)
+
     # networks
 
     locoformer = Locoformer(
-        embedder = MLP(dim_state, 64, bias = False),
+        embedder = state_embedder,
         unembedder = MLP(64, num_actions, bias = False),
-        state_pred_head = MLP(64, dim_state * 2, bias = False),
+        state_pred_head = state_pred_head,
         transformer = dict(
             dim = 64,
             dim_head = 32,
@@ -190,6 +231,9 @@ def main(
 
         state, *_ = env_reset()
 
+        if use_vision:
+            state = get_snapshot(env, state_shape[1:])
+
         timestep = 0
 
         stateful_forward = locoformer.get_stateful_forward(has_batch_dim = False, has_time_dim = False, inference_mode = True)
@@ -209,9 +253,12 @@ def main(
 
                 next_state, reward, truncated, terminated, *_ = env_step(action)
 
+                if use_vision:
+                    next_state = get_snapshot(env, state_shape[1:])
+
                 # maybe state entropy bonus
 
-                if state_entropy_bonus_weight > 0.:
+                if state_entropy_bonus_weight > 0. and exists(state_pred):
                     _, log_var = state_pred.chunk(2, dim = -1)
 
                     state_entropy = (log_var * state_entropy_bonus_weight).sum()
