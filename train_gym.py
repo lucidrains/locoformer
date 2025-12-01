@@ -98,6 +98,7 @@ def main(
     gae_lam = 0.95,
     ppo_eps_clip = 0.2,
     ppo_entropy_weight = .01,
+    state_entropy_bonus_weight = .05,
     batch_size = 16,
     epochs = 3,
     reward_range = (-300., 300.)
@@ -149,6 +150,7 @@ def main(
     locoformer = Locoformer(
         embedder = MLP(dim_state, 64, bias = False),
         unembedder = MLP(64, num_actions, bias = False),
+        state_pred_head = MLP(64, dim_state * 2, bias = False),
         transformer = dict(
             dim = 64,
             dim_head = 32,
@@ -199,13 +201,22 @@ def main(
 
                 # predict next action
 
-                action_logits, value = stateful_forward(state, condition = rand_command, return_values = True)
+                (action_logits, state_pred), value = stateful_forward(state, condition = rand_command, return_values = True, return_state_pred = True)
 
                 action = gumbel_sample(action_logits)
 
                 # pass to environment
 
                 next_state, reward, truncated, terminated, *_ = env_step(action)
+
+                # maybe state entropy bonus
+
+                if state_entropy_bonus_weight > 0.:
+                    _, log_var = state_pred.chunk(2, dim = -1)
+
+                    state_entropy = (log_var * state_entropy_bonus_weight).sum()
+
+                    reward = reward + state_entropy.item() # the entropy is directly related to log variance
 
                 # append to memory
 
@@ -240,7 +251,7 @@ def main(
                     # only if terminated signal not detected
 
                     if not terminated:
-                        _, next_value = stateful_forward(next_state, condition = rand_command, return_values = True)
+                        _, next_value = stateful_forward(next_state, condition = rand_command, return_values = True, )
 
                         memory._replace(value = next_value, learnable = False)
 

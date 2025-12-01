@@ -930,6 +930,7 @@ class Locoformer(Module):
         embedder: Module | ModuleList | list[Module],
         unembedder: Module,
         transformer: dict | TransformerXL,
+        *,
         discount_factor = 0.999,
         gae_lam = 0.95,
         ppo_eps_clip = 0.2,
@@ -937,6 +938,8 @@ class Locoformer(Module):
         ppo_value_clip = 0.4,
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
+        state_pred_head: Module | None = None,
+        state_pred_loss_weight = 0.1,
         reward_range: tuple[float, float] | None = None,
         reward_shaping_fns: list[Callable[..., float | Tensor]] | None = None,
         num_reward_bins = 32,
@@ -988,6 +991,17 @@ class Locoformer(Module):
                 num_bins = num_reward_bins,
                 **hl_gauss_loss_kwargs
             )
+
+        # state prediction related
+
+        self.state_pred_head = state_pred_head
+
+        if exists(state_pred_head):
+            for param in state_pred_head.parameters():
+                param.zero_()
+
+        self.has_state_pred_loss = state_pred_loss_weight > 0.
+        self.state_pred_loss_weight = state_pred_loss_weight
 
         # ppo related
 
@@ -1104,10 +1118,13 @@ class Locoformer(Module):
             *rest
         ) in zip(*windowed_tensors):
 
+            batch = state.shape[0]
+
             if has_condition:
                 condition, = rest
 
-            (action_logits, value_logits), cache = self.forward(state, condition = condition, state_type = state_type, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, condition = condition, state_type = state_type, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+
             entropy = calc_entropy(action_logits)
 
             action = rearrange(action, 'b t -> b t 1')
@@ -1133,6 +1150,31 @@ class Locoformer(Module):
             actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
             windowed_actor_loss = actor_loss[mask].sum() / total_learnable_tokens
+
+            # maybe add state prediction
+
+            if exists(maybe_state_pred) and self.has_state_pred_loss:
+                state_pred = maybe_state_pred[:, :-1]
+                state_labels = state[:, 1:]
+
+                mean, log_var = state_pred.chunk(2, dim = -1)
+
+                state_pred_loss = F.gaussian_nll_loss(
+                    mean,
+                    state_labels,
+                    var = log_var.exp(),
+                    reduction = 'none'
+                )
+
+                windowed_state_pred_loss = state_pred_loss[mask[:, :-1]].mean() / total_learnable_tokens # todo - calculate denom correctly
+
+                windowed_actor_loss = (
+                    windowed_actor_loss +
+                    windowed_state_pred_loss * self.state_pred_loss_weight
+                )
+
+            # windowed loss
+
             windowed_actor_loss.backward(retain_graph = True)
 
             # update critic
@@ -1312,6 +1354,7 @@ class Locoformer(Module):
         state_type: int | None = None,
         detach_cache = False,
         return_values = False,
+        return_state_pred = False,
         return_raw_value_logits = False
     ):
 
@@ -1353,6 +1396,12 @@ class Locoformer(Module):
         action_logits = self.unembedder(embed)
 
         out = action_logits
+
+        # maybe return state prediction
+
+        if return_state_pred:
+            state_pred = self.state_pred_head(embed) if exists(self.state_pred_head) else None
+            out = (out, state_pred)
 
         # maybe detach cache
 
