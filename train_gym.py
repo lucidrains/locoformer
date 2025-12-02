@@ -66,9 +66,11 @@ def learn(
     critic_optim,
     accelerator,
     replay,
+    state_embed_kwargs: dict,
     batch_size = 16,
     epochs = 2,
-    use_vision = False
+    use_vision = False,
+    compute_state_pred_loss = False
 ):
     state_field = 'state_image' if use_vision else 'state'
 
@@ -94,7 +96,9 @@ def learn(
                 condition = data.condition,
                 episode_lens = data._lens,
                 actor_optim = actor_optim,
-                critic_optim = critic_optim
+                critic_optim = critic_optim,
+                state_embed_kwargs = state_embed_kwargs,
+                compute_state_pred_loss = compute_state_pred_loss
             )
 
             accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
@@ -166,33 +170,57 @@ def main(
         )
     )
 
-    # if using vision
+    class StateEmbedder(nn.Module):
+        def __init__(
+            self,
+            dim,
+            dim_state,
+            image_height_width,
+        ):
+            super().__init__()
+            dim_hidden = dim * 2
+
+            self.image_to_token = nn.Sequential(
+                Rearrange('b t c h w -> b c t h w'),
+                nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
+                nn.ReLU(),
+                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+                nn.ReLU(),
+                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+                Reduce('b c t h w -> b t c', 'mean'),
+                nn.Linear(dim_hidden, dim)
+            )
+
+            self.state_to_token = MLP(dim_state, 64, bias = False)
+
+        def forward(
+            self,
+            state,
+            state_type
+        ):
+
+            if state_type == 'image':
+                return self.image_to_token(state)
+            elif state_type == 'raw':
+                return self.state_to_token(state)
+            else:
+                raise ValueError('invalid state type')
+
+    # state embed kwargs
 
     if use_vision:
-        dim_hidden = vision_height_width_dim * 2
-
-        state_embedder = nn.Sequential(
-            Rearrange('b t c h w -> b c t h w'),
-            nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
-            nn.ReLU(),
-            nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
-            nn.ReLU(),
-            nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
-            Reduce('b c t h w -> b t c', 'mean'),
-            nn.Linear(dim_hidden, 64)
-        )
-
-        state_pred_head = None
+        state_embed_kwargs = dict(state_type = 'image')
+        compute_state_pred_loss = False
     else:
-        state_embedder = MLP(dim_state, 64, bias = False)
-        state_pred_head = MLP(64, dim_state * 2, bias = False)
+        state_embed_kwargs = dict(state_type = 'raw')
+        compute_state_pred_loss = True
 
     # networks
 
     locoformer = Locoformer(
-        embedder = state_embedder,
+        embedder = StateEmbedder(64, dim_state, vision_height_width_dim),
         unembedder = MLP(64, num_actions, bias = False),
-        state_pred_head = state_pred_head,
+        state_pred_head = MLP(64, dim_state * 2, bias = False),
         transformer = dict(
             dim = 64,
             dim_head = 32,
@@ -232,8 +260,7 @@ def main(
 
         state, *_ = env_reset()
 
-        if use_vision:
-            state_image = get_snapshot(env, dim_state_image_shape[1:])
+        state_image = get_snapshot(env, dim_state_image_shape[1:])
 
         timestep = 0
 
@@ -248,7 +275,7 @@ def main(
 
                 state_for_model = state_image if use_vision else state
 
-                (action_logits, state_pred), value = stateful_forward(state_for_model, condition = rand_command, return_values = True, return_state_pred = True)
+                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
 
                 action = gumbel_sample(action_logits)
 
@@ -256,8 +283,7 @@ def main(
 
                 next_state, reward, truncated, terminated, *_ = env_step(action)
 
-                if use_vision:
-                    next_state_image = get_snapshot(env, dim_state_image_shape[1:])
+                next_state_image = get_snapshot(env, dim_state_image_shape[1:])
 
                 # maybe state entropy bonus
 
@@ -304,7 +330,7 @@ def main(
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, )
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs)
 
                         memory._replace(value = next_value, learnable = False)
 
@@ -325,9 +351,11 @@ def main(
                     optim_critic,
                     accelerator,
                     replay,
+                    state_embed_kwargs,
                     batch_size,
                     epochs,
-                    use_vision
+                    use_vision,
+                    compute_state_pred_loss
                 )
 # main
 

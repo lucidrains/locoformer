@@ -1066,9 +1066,10 @@ class Locoformer(Module):
         mask,
         episode_lens,
         condition: Tensor | None = None,
-        state_type: int | None = None,
         actor_optim: Optimizer | None = None,
-        critic_optim: Optimizer | None = None
+        critic_optim: Optimizer | None = None,
+        state_embed_kwargs: dict = dict(),
+        compute_state_pred_loss = True
     ):
         window_size = self.window_size
         total_learnable_tokens = mask.sum().item()
@@ -1125,7 +1126,7 @@ class Locoformer(Module):
             if has_condition:
                 condition, = rest
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, condition = condition, state_type = state_type, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             entropy = calc_entropy(action_logits)
 
@@ -1155,7 +1156,11 @@ class Locoformer(Module):
 
             # maybe add state prediction
 
-            if exists(maybe_state_pred) and self.has_state_pred_loss:
+            if (
+                exists(maybe_state_pred) and
+                self.has_state_pred_loss and
+                compute_state_pred_loss
+            ):
                 state_pred = maybe_state_pred[:, :-1]
                 state_labels = state[:, 1:]
 
@@ -1291,7 +1296,6 @@ class Locoformer(Module):
         def stateful_forward(
             state: Tensor,
             condition: Tensor | None = None,
-            state_type: int | None = None,
             **override_kwargs
         ):
             nonlocal cache
@@ -1317,7 +1321,7 @@ class Locoformer(Module):
 
             # forwards
 
-            out, cache = self.forward(state, condition = condition, state_type = state_type, cache = cache, **{**kwargs, **override_kwargs})
+            out, cache = self.forward(state, condition = condition, cache = cache, **{**kwargs, **override_kwargs})
 
             # maybe remove batch or time
 
@@ -1353,7 +1357,7 @@ class Locoformer(Module):
         state: Tensor,
         cache: Cache | None = None,
         condition: Tensor | None = None,
-        state_type: int | None = None,
+        state_embed_kwargs: dict = dict(),
         detach_cache = False,
         return_values = False,
         return_state_pred = False,
@@ -1366,12 +1370,9 @@ class Locoformer(Module):
 
         state_to_token = self.embedder
 
-        if exists(state_type):
-            state_to_token = self.embedder[state_type]
-
         # embed
 
-        tokens = state_to_token(state)
+        tokens = state_to_token(state, **state_embed_kwargs)
 
         # time
 
