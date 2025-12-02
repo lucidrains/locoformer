@@ -185,13 +185,22 @@ def test_evo():
     model.evolve(lambda model: 1., num_generations = 1)
 
 def test_unified_state():
+    from torch.nn import Module, ModuleList
     from locoformer.locoformer import Locoformer
 
+    class StateEmbed(Module):
+        def __init__(self):
+            super().__init__()
+            self.embedders = ModuleList([
+                nn.Embedding(256, 128),
+                nn.Linear(2, 128)
+            ])
+
+        def forward(self, state, state_type):
+            return self.embedders[state_type](state)
+
     model = Locoformer(
-        embedder = [
-            nn.Embedding(256, 128),
-            nn.Linear(2, 128)
-        ],
+        embedder = StateEmbed(),
         unembedder = nn.Linear(128, 256, bias = False),
         value_network = MLP(128, 64, 32),
         dim_value_input = 32,
@@ -207,6 +216,6 @@ def test_unified_state():
     state1 = torch.randint(0, 256, (3, 512))
     state2 = torch.randn((3, 512, 2))
 
-    logits, cache = model(state1, state_type = 0)
-    logits, cache = model(state2, state_type = 1, cache = cache)
-    logits, cache = model(state1, state_type = 0, cache = cache)
+    logits, cache = model(state1, state_embed_kwargs = dict(state_type = 0))
+    logits, cache = model(state2, state_embed_kwargs = dict(state_type = 1), cache = cache)
+    logits, cache = model(state1, state_embed_kwargs = dict(state_type = 0), cache = cache)
