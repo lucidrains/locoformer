@@ -579,10 +579,11 @@ class ReplayBuffer:
     def dataset(
         self,
         episode_mapping: Tensor | list[list[int]] | None = None,
+        fields: tuple[str, ...] | None = None
     ) -> Dataset:
         self.flush()
 
-        dataset = ReplayDataset(self.folder)
+        dataset = ReplayDataset(self.folder, fields)
 
         if not exists(episode_mapping):
             return dataset
@@ -593,11 +594,12 @@ class ReplayBuffer:
         self,
         batch_size,
         episode_mapping: Tensor | list[list[int]] | None = None,
+        fields: tuple[str, ...] | None = None,
         **kwargs
     ) -> DataLoader:
         self.flush()
 
-        return DataLoader(self.dataset(episode_mapping), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
+        return DataLoader(self.dataset(episode_mapping, fields), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
 
 # normalization + conditioning (needed for the commands to the robot)
 

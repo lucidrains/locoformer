@@ -68,8 +68,15 @@ def learn(
     replay,
     batch_size = 16,
     epochs = 2,
+    use_vision = False
 ):
-    dl = replay.dataloader(batch_size = batch_size, shuffle = True)
+    state_field = 'state_image' if use_vision else 'state'
+
+    dl = replay.dataloader(
+        batch_size = batch_size,
+        shuffle = True
+    )
+
     model, dl, actor_optim, critic_optim = accelerator.prepare(model, dl, actor_optim, critic_optim)
 
     for _ in range(epochs):
@@ -78,7 +85,7 @@ def learn(
             data = SimpleNamespace(**data)
 
             actor_loss, critic_loss = model.ppo(
-                state = data.state,
+                state = getattr(data, state_field),
                 action = data.action,
                 old_action_log_prob = data.action_log_prob,
                 reward = data.reward,
@@ -98,10 +105,10 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 4,
+    num_episodes_before_learn = 32,
     use_vision = True,
     vision_height_width_dim = 64,
-    clear_video = True,
+    clear_video = False,
     video_folder = 'recordings',
     record_every_episode = 250,
     learning_rate = 8e-4,
@@ -137,15 +144,8 @@ def main(
     )
 
     num_actions = env.action_space.n
-
-    # determine state
-
-    if use_vision:
-        dim_state = env.observation_space.shape[0]
-        state_shape = (3, vision_height_width_dim, vision_height_width_dim)
-    else:
-        dim_state = env.observation_space.shape[0]
-        state_shape = (dim_state,)
+    dim_state = env.observation_space.shape[0]
+    dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
 
     # memory
 
@@ -154,14 +154,15 @@ def main(
         num_episodes,
         max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
         fields = dict(
-            state = ('float', state_shape),
-            action = 'int',
+            state       = ('float', dim_state),
+            state_image = ('float', dim_state_image_shape),
+            action      = 'int',
             action_log_prob = 'float',
-            reward = 'float',
-            value = 'float',
-            done = 'bool',
-            learnable = 'bool',
-            condition = ('float', 2)
+            reward      = 'float',
+            value       = 'float',
+            done        = 'bool',
+            learnable   = 'bool',
+            condition   = ('float', 2)
         )
     )
 
@@ -232,7 +233,7 @@ def main(
         state, *_ = env_reset()
 
         if use_vision:
-            state = get_snapshot(env, state_shape[1:])
+            state_image = get_snapshot(env, dim_state_image_shape[1:])
 
         timestep = 0
 
@@ -245,7 +246,9 @@ def main(
 
                 # predict next action
 
-                (action_logits, state_pred), value = stateful_forward(state, condition = rand_command, return_values = True, return_state_pred = True)
+                state_for_model = state_image if use_vision else state
+
+                (action_logits, state_pred), value = stateful_forward(state_for_model, condition = rand_command, return_values = True, return_state_pred = True)
 
                 action = gumbel_sample(action_logits)
 
@@ -254,7 +257,7 @@ def main(
                 next_state, reward, truncated, terminated, *_ = env_step(action)
 
                 if use_vision:
-                    next_state = get_snapshot(env, state_shape[1:])
+                    next_state_image = get_snapshot(env, dim_state_image_shape[1:])
 
                 # maybe state entropy bonus
 
@@ -277,6 +280,7 @@ def main(
 
                 memory = replay.store(
                     state = state,
+                    state_image = state_image,
                     action = action,
                     action_log_prob = action_log_prob,
                     reward = reward,
@@ -298,7 +302,9 @@ def main(
                     # only if terminated signal not detected
 
                     if not terminated:
-                        _, next_value = stateful_forward(next_state, condition = rand_command, return_values = True, )
+                        next_state_for_model = next_state_image if use_vision else next_state
+
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, )
 
                         memory._replace(value = next_value, learnable = False)
 
@@ -307,6 +313,7 @@ def main(
                     break
 
                 state = next_state
+                state_image = next_state_image
 
             # learn if hit the number of learn timesteps
 
@@ -320,6 +327,7 @@ def main(
                     replay,
                     batch_size,
                     epochs,
+                    use_vision
                 )
 # main
 
