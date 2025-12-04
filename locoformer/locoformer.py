@@ -1069,6 +1069,7 @@ class Locoformer(Module):
         actor_optim: Optimizer | None = None,
         critic_optim: Optimizer | None = None,
         state_embed_kwargs: dict = dict(),
+        action_unembed_kwargs: dict = dict(),
         compute_state_pred_loss = True
     ):
         window_size = self.window_size
@@ -1126,7 +1127,7 @@ class Locoformer(Module):
             if has_condition:
                 condition, = rest
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             entropy = calc_entropy(action_logits)
 
@@ -1358,6 +1359,7 @@ class Locoformer(Module):
         cache: Cache | None = None,
         condition: Tensor | None = None,
         state_embed_kwargs: dict = dict(),
+        action_unembed_kwargs: dict = dict(),
         detach_cache = False,
         return_values = False,
         return_state_pred = False,
@@ -1396,7 +1398,7 @@ class Locoformer(Module):
 
         # unembed to actions - in language models this would be the next state
 
-        action_logits = self.unembedder(embed)
+        action_logits = self.unembedder(embed, **action_unembed_kwargs)
 
         out = action_logits
 

@@ -21,7 +21,8 @@ import gymnasium as gym
 
 import torch
 from torch import nn
-from torch import from_numpy, randint, tensor, stack, arange
+from torch.nn import Module
+from torch import from_numpy, randint, tensor, is_tensor, stack, arange
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
@@ -36,6 +37,9 @@ from x_mlps_pytorch import MLP
 
 def exists(v):
     return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -67,6 +71,7 @@ def learn(
     accelerator,
     replay,
     state_embed_kwargs: dict,
+    action_unembed_kwargs: dict,
     batch_size = 16,
     epochs = 2,
     use_vision = False,
@@ -98,6 +103,7 @@ def learn(
                 actor_optim = actor_optim,
                 critic_optim = critic_optim,
                 state_embed_kwargs = state_embed_kwargs,
+                action_unembed_kwargs = action_unembed_kwargs,
                 compute_state_pred_loss = compute_state_pred_loss
             )
 
@@ -110,6 +116,8 @@ def main(
     num_episodes = 50_000,
     max_timesteps = 500,
     num_episodes_before_learn = 32,
+    max_discrete_actions = 4,
+    continuous = False,
     use_vision = True,
     vision_height_width_dim = 64,
     clear_video = False,
@@ -126,6 +134,7 @@ def main(
     epochs = 3,
     reward_range = (-300., 300.)
 ):
+    assert not continuous
 
     # accelerate
 
@@ -147,7 +156,15 @@ def main(
         disable_logger = True
     )
 
-    num_actions = env.action_space.n
+    if not continuous:
+        num_discrete_actions = env.action_space.n
+    else:
+        num_continuous_actions = env.action_space.shape[0]
+
+    assert num_discrete_actions <= max_discrete_actions
+
+    discrete_action_types = torch.arange(num_discrete_actions)
+
     dim_state = env.observation_space.shape[0]
     dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
 
@@ -175,7 +192,6 @@ def main(
             self,
             dim,
             dim_state,
-            image_height_width,
         ):
             super().__init__()
             dim_hidden = dim * 2
@@ -206,6 +222,39 @@ def main(
             else:
                 raise ValueError('invalid state type')
 
+    class ActionUnembedder(Module):
+        def __init__(
+            self,
+            dim,
+            num_discrete_actions
+        ):
+            super().__init__()
+            self.num_discrete_actions = num_discrete_actions
+            self.action_unembeds = nn.Embedding(num_discrete_actions, dim)
+
+            self.register_buffer('default_discrete_action_types', torch.arange(num_discrete_actions), persistent = False)
+            self.register_buffer('dummy', tensor(0), persistent = False)
+
+        @property
+        def device(self):
+            return self.dummy.device
+
+        def forward(
+            self,
+            embed,
+            discrete_action_types = None
+        ):
+            discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
+
+            if not is_tensor(discrete_action_types):
+                discrete_action_types = tensor(discrete_action_types)
+
+            discrete_action_types = discrete_action_types.to(self.device)
+
+            action_unembed = self.action_unembeds(discrete_action_types)
+
+            return embed @ action_unembed.t()
+
     # state embed kwargs
 
     if use_vision:
@@ -215,11 +264,13 @@ def main(
         state_embed_kwargs = dict(state_type = 'raw')
         compute_state_pred_loss = True
 
+    action_unembed_kwargs = dict(discrete_action_types = discrete_action_types)
+
     # networks
 
     locoformer = Locoformer(
-        embedder = StateEmbedder(64, dim_state, vision_height_width_dim),
-        unembedder = MLP(64, num_actions, bias = False),
+        embedder = StateEmbedder(64, dim_state),
+        unembedder = ActionUnembedder(64, num_discrete_actions = max_discrete_actions),
         state_pred_head = MLP(64, dim_state * 2, bias = False),
         transformer = dict(
             dim = 64,
@@ -275,7 +326,7 @@ def main(
 
                 state_for_model = state_image if use_vision else state
 
-                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
+                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
 
                 action = gumbel_sample(action_logits)
 
@@ -330,7 +381,7 @@ def main(
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs)
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs)
 
                         memory._replace(value = next_value, learnable = False)
 
@@ -352,6 +403,7 @@ def main(
                     accelerator,
                     replay,
                     state_embed_kwargs,
+                    action_unembed_kwargs,
                     batch_size,
                     epochs,
                     use_vision,
