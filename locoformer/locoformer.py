@@ -1133,10 +1133,6 @@ class Locoformer(Module):
 
             ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
-
-            if action.ndim == 2:
-                action = rearrange(action, 'b t -> b t 1')
-
             if continuous:
                 mean, log_var = action_logits.unbind(dim = -1)
                 std = (0.5 * log_var).exp()
@@ -1146,6 +1142,8 @@ class Locoformer(Module):
                 entropy = dist.entropy()
 
             else:
+                action = rearrange(action, 'b t -> b t 1')
+
                 log_prob = action_logits.log_softmax(dim = -1).gather(-1, action)
                 log_prob = rearrange(log_prob, 'b t 1 -> b t 1')
 
@@ -1177,7 +1175,8 @@ class Locoformer(Module):
             if (
                 exists(maybe_state_pred) and
                 self.has_state_pred_loss and
-                compute_state_pred_loss
+                compute_state_pred_loss and
+                mask[:, :-1].any()
             ):
                 state_pred = maybe_state_pred[:, :-1]
                 state_labels = state[:, 1:]

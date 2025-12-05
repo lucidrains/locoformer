@@ -126,7 +126,7 @@ def main(
     max_discrete_actions = 4,
     max_continuous_actions = 3,
     continuous = False,
-    use_vision = True,
+    use_vision = False,
     vision_height_width_dim = 64,
     clear_video = False,
     video_folder = 'recordings',
