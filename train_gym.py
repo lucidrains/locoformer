@@ -26,8 +26,9 @@ from torch import from_numpy, randint, tensor, is_tensor, stack, arange
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
+from torch.distributions import Normal
 
-from einops import rearrange
+from einops import rearrange, einsum
 from einops.layers.torch import Rearrange, Reduce
 
 from locoformer.locoformer import Locoformer, ReplayBuffer
@@ -54,6 +55,10 @@ def gumbel_sample(logits, temperature = 1., eps = 1e-6):
     noise = gumbel_noise(logits)
     return ((logits / max(temperature, eps)) + noise).argmax(dim = -1)
 
+def gaussian_sample(logits):
+    mean, log_var = logits.unbind(dim = -1)
+    return mean + (0.5 * log_var).exp() * torch.randn_like(mean)
+
 # get rgb snapshot from env
 
 def get_snapshot(env, shape):
@@ -75,7 +80,8 @@ def learn(
     batch_size = 16,
     epochs = 2,
     use_vision = False,
-    compute_state_pred_loss = False
+    compute_state_pred_loss = False,
+    continuous = False
 ):
     state_field = 'state_image' if use_vision else 'state'
 
@@ -104,7 +110,8 @@ def learn(
                 critic_optim = critic_optim,
                 state_embed_kwargs = state_embed_kwargs,
                 action_unembed_kwargs = action_unembed_kwargs,
-                compute_state_pred_loss = compute_state_pred_loss
+                compute_state_pred_loss = compute_state_pred_loss,
+                continuous = continuous
             )
 
             accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
@@ -117,6 +124,7 @@ def main(
     max_timesteps = 500,
     num_episodes_before_learn = 32,
     max_discrete_actions = 4,
+    max_continuous_actions = 3,
     continuous = False,
     use_vision = True,
     vision_height_width_dim = 64,
@@ -134,7 +142,6 @@ def main(
     epochs = 3,
     reward_range = (-300., 300.)
 ):
-    assert not continuous
 
     # accelerate
 
@@ -143,7 +150,7 @@ def main(
 
     # environment
 
-    env = gym.make(env_name, render_mode = 'rgb_array')
+    env = gym.make(env_name, continuous = continuous, render_mode = 'rgb_array')
 
     if clear_video:
         rmtree(video_folder, ignore_errors = True)
@@ -158,12 +165,12 @@ def main(
 
     if not continuous:
         num_discrete_actions = env.action_space.n
+        assert num_discrete_actions <= max_discrete_actions
+        discrete_action_types = torch.arange(num_discrete_actions)
     else:
         num_continuous_actions = env.action_space.shape[0]
-
-    assert num_discrete_actions <= max_discrete_actions
-
-    discrete_action_types = torch.arange(num_discrete_actions)
+        assert num_continuous_actions <= max_continuous_actions
+        continuous_action_types = torch.arange(num_continuous_actions)
 
     dim_state = env.observation_space.shape[0]
     dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
@@ -177,8 +184,8 @@ def main(
         fields = dict(
             state       = ('float', dim_state),
             state_image = ('float', dim_state_image_shape),
-            action      = 'int',
-            action_log_prob = 'float',
+            action      = 'int' if not continuous else ('float', num_continuous_actions),
+            action_log_prob = ('float', 1) if not continuous else ('float', num_continuous_actions),
             reward      = 'float',
             value       = 'float',
             done        = 'bool',
@@ -226,13 +233,23 @@ def main(
         def __init__(
             self,
             dim,
-            num_discrete_actions
+            num_discrete_actions = 0,
+            num_continuous_actions = 0,
         ):
             super().__init__()
+            assert (num_discrete_actions > 0) ^ (num_continuous_actions > 0)
+
             self.num_discrete_actions = num_discrete_actions
-            self.action_unembeds = nn.Embedding(num_discrete_actions, dim)
+            self.num_continuous_actions = num_continuous_actions
+
+            self.discrete_action_unembeds = nn.Embedding(num_discrete_actions, dim)
+            self.continuous_action_unembeds = nn.Embedding(num_continuous_actions, dim * 2)
+
+            nn.init.zeros_(self.continuous_action_unembeds.weight)
 
             self.register_buffer('default_discrete_action_types', torch.arange(num_discrete_actions), persistent = False)
+            self.register_buffer('default_continuous_action_types', torch.arange(num_continuous_actions), persistent = False)
+
             self.register_buffer('dummy', tensor(0), persistent = False)
 
         @property
@@ -242,18 +259,32 @@ def main(
         def forward(
             self,
             embed,
-            discrete_action_types = None
+            discrete_action_types = None,
+            continuous_action_types = None
         ):
             discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
+            continuous_action_types = default(continuous_action_types, self.default_continuous_action_types)
 
             if not is_tensor(discrete_action_types):
                 discrete_action_types = tensor(discrete_action_types)
 
+            if not is_tensor(continuous_action_types):
+                continuous_action_types = tensor(continuous_action_types)
+
             discrete_action_types = discrete_action_types.to(self.device)
+            continuous_action_types = continuous_action_types.to(self.device)
 
-            action_unembed = self.action_unembeds(discrete_action_types)
+            is_continuous = self.num_continuous_actions > 0
 
-            return embed @ action_unembed.t()
+            if is_continuous:
+                action_unembed = self.continuous_action_unembeds(continuous_action_types)
+                action_unembed = rearrange(action_unembed, '... (d two) -> ... d two', two = 2)
+                dist = einsum(embed, action_unembed, '... d, n d mu_sigma -> ... n mu_sigma')
+            else:
+                action_unembed = self.discrete_action_unembeds(discrete_action_types)
+                dist = einsum(embed, action_unembed, '... d, n d -> ... n')
+
+            return dist
 
     # state embed kwargs
 
@@ -264,13 +295,20 @@ def main(
         state_embed_kwargs = dict(state_type = 'raw')
         compute_state_pred_loss = True
 
-    action_unembed_kwargs = dict(discrete_action_types = discrete_action_types)
+    if continuous:
+        action_unembed_kwargs = dict(continuous_action_types = continuous_action_types)
+    else:
+        action_unembed_kwargs = dict(discrete_action_types = discrete_action_types)
 
     # networks
 
     locoformer = Locoformer(
         embedder = StateEmbedder(64, dim_state),
-        unembedder = ActionUnembedder(64, num_discrete_actions = max_discrete_actions),
+        unembedder = ActionUnembedder(
+            64,
+            num_discrete_actions = max_discrete_actions if not continuous else 0,
+            num_continuous_actions = max_continuous_actions if continuous else 0
+        ),
         state_pred_head = MLP(64, dim_state * 2, bias = False),
         transformer = dict(
             dim = 64,
@@ -328,7 +366,10 @@ def main(
 
                 (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
 
-                action = gumbel_sample(action_logits)
+                if continuous:
+                    action = gaussian_sample(action_logits)
+                else:
+                    action = gumbel_sample(action_logits)
 
                 # pass to environment
 
@@ -352,8 +393,13 @@ def main(
 
                 # get log prob of action
 
-                action_log_prob = action_logits.gather(-1, rearrange(action, '-> 1'))
-                action_log_prob = rearrange(action_log_prob, '1 ->')
+                if continuous:
+                    mean, log_var = action_logits.unbind(dim = -1)
+                    std = (0.5 * log_var).exp()
+                    dist = Normal(mean, std)
+                    action_log_prob = dist.log_prob(action)
+                else:
+                    action_log_prob = action_logits.log_softmax(dim = -1).gather(-1, rearrange(action, '-> 1'))
 
                 memory = replay.store(
                     state = state,
@@ -407,7 +453,8 @@ def main(
                     batch_size,
                     epochs,
                     use_vision,
-                    compute_state_pred_loss
+                    compute_state_pred_loss,
+                    continuous
                 )
 # main
 

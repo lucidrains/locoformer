@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 from torch.utils.data import Dataset, DataLoader
+from torch.distributions import Normal
 from torch.optim import Optimizer
 
 import einx
@@ -1070,7 +1071,8 @@ class Locoformer(Module):
         critic_optim: Optimizer | None = None,
         state_embed_kwargs: dict = dict(),
         action_unembed_kwargs: dict = dict(),
-        compute_state_pred_loss = True
+        compute_state_pred_loss = True,
+        continuous = False
     ):
         window_size = self.window_size
         total_learnable_tokens = mask.sum().item()
@@ -1081,6 +1083,8 @@ class Locoformer(Module):
         advantage, returns = calc_gae(reward, old_value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
         advantage = normalize(advantage)
+
+        advantage = rearrange(advantage, '... -> ... 1')
 
         data_tensors = (
             state,
@@ -1129,11 +1133,24 @@ class Locoformer(Module):
 
             ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
-            entropy = calc_entropy(action_logits)
 
-            action = rearrange(action, 'b t -> b t 1')
-            log_prob = action_logits.gather(-1, action)
-            log_prob = rearrange(log_prob, 'b t 1 -> b t')
+            if action.ndim == 2:
+                action = rearrange(action, 'b t -> b t 1')
+
+            if continuous:
+                mean, log_var = action_logits.unbind(dim = -1)
+                std = (0.5 * log_var).exp()
+                dist = Normal(mean, std)
+                log_prob = dist.log_prob(action)
+
+                entropy = dist.entropy()
+
+            else:
+                log_prob = action_logits.log_softmax(dim = -1).gather(-1, action)
+                log_prob = rearrange(log_prob, 'b t 1 -> b t 1')
+
+                entropy = calc_entropy(action_logits)
+                entropy = rearrange(entropy, '... -> ... 1')
 
             # update actor, classic clipped surrogate loss
 
@@ -1266,7 +1283,10 @@ class Locoformer(Module):
         def wrapped_step(action, *args, **kwargs):
 
             if is_tensor(action):
-                action = action.item()
+                if action.numel() == 1:
+                    action = action.item()
+                else:
+                    action = action.tolist()
 
             env_step_out = env.step(action, *args, **kwargs)
 
@@ -1290,7 +1310,6 @@ class Locoformer(Module):
         state_time_dim = 1,
         **kwargs
     ):
-        window_size = self.window_size
 
         cache = None
 
