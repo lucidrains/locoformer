@@ -71,8 +71,7 @@ def get_snapshot(env, shape):
 
 def learn(
     model,
-    actor_optim,
-    critic_optim,
+    optims,
     accelerator,
     replay,
     state_embed_kwargs: dict,
@@ -90,7 +89,7 @@ def learn(
         shuffle = True
     )
 
-    model, dl, actor_optim, critic_optim = accelerator.prepare(model, dl, actor_optim, critic_optim)
+    model, dl, *optims = accelerator.prepare(model, dl, *optims)
 
     for _ in range(epochs):
         for data in dl:
@@ -106,12 +105,12 @@ def learn(
                 mask = data.learnable,
                 condition = data.condition,
                 episode_lens = data._lens,
-                actor_optim = actor_optim,
-                critic_optim = critic_optim,
+                optims = optims,
                 state_embed_kwargs = state_embed_kwargs,
                 action_unembed_kwargs = action_unembed_kwargs,
                 compute_state_pred_loss = compute_state_pred_loss,
-                continuous = continuous
+                continuous = continuous,
+                accelerator = accelerator
             )
 
             accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
@@ -335,8 +334,11 @@ def main(
         asymmetric_spo = True
     ).to(device)
 
-    optim_actor = Adam([*locoformer.transformer.parameters(), *locoformer.actor_parameters()], lr = learning_rate, betas = betas)
-    optim_critic = Adam([*locoformer.transformer.parameters(), *locoformer.critic_parameters()], lr = learning_rate, betas = betas)
+    optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
+    optim_actor = Adam(locoformer.actor_parameters(), lr = learning_rate, betas = betas)
+    optim_critic = Adam(locoformer.critic_parameters(), lr = learning_rate, betas = betas)
+
+    optims = [optim_base, optim_actor, optim_critic]
 
     # able to wrap the env for all values to torch tensors and back
     # all environments should follow usual MDP interface, domain randomization should be given at instantiation
@@ -444,8 +446,7 @@ def main(
 
                 learn(
                     locoformer,
-                    optim_actor,
-                    optim_critic,
+                    optims,
                     accelerator,
                     replay,
                     state_embed_kwargs,

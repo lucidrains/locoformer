@@ -1067,12 +1067,13 @@ class Locoformer(Module):
         mask,
         episode_lens,
         condition: Tensor | None = None,
-        actor_optim: Optimizer | None = None,
-        critic_optim: Optimizer | None = None,
+        optims: list[Optimizer] | None = None,
         state_embed_kwargs: dict = dict(),
         action_unembed_kwargs: dict = dict(),
         compute_state_pred_loss = True,
-        continuous = False
+        continuous = False,
+        accelerator = None,
+        max_grad_norm = 0.5
     ):
         window_size = self.window_size
         total_learnable_tokens = mask.sum().item()
@@ -1223,13 +1224,16 @@ class Locoformer(Module):
 
         # optimizer update
 
-        if exists(actor_optim):
-            actor_optim.step()
-            actor_optim.zero_grad()
+        if exists(optims):
 
-        if exists(critic_optim):
-            critic_optim.step()
-            critic_optim.zero_grad()
+            if exists(accelerator):
+                accelerator.clip_grad_norm_(self.parameters(), max_grad_norm)
+            else:
+                nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+
+            for optim in optims:
+                optim.step()
+                optim.zero_grad()
 
         # return losses for logging
 
