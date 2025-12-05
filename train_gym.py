@@ -12,7 +12,7 @@
 from fire import Fire
 from shutil import rmtree
 from tqdm import tqdm
-from collections import deque
+
 from types import SimpleNamespace
 
 from accelerate import Accelerator
@@ -375,7 +375,7 @@ def main(
 
                 # pass to environment
 
-                next_state, reward, truncated, terminated, *_ = env_step(action)
+                next_state, reward, terminated, truncated, *_ = env_step(action)
 
                 next_state_image = get_snapshot(env, dim_state_image_shape[1:])
 
@@ -431,7 +431,7 @@ def main(
 
                         _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs)
 
-                        memory._replace(value = next_value, learnable = False)
+                        memory = memory._replace(value = next_value, learnable = False)
 
                         replay.store(**memory._asdict())
 
