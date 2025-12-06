@@ -31,7 +31,7 @@ from torch.distributions import Normal
 from einops import rearrange, einsum
 from einops.layers.torch import Rearrange, Reduce
 
-from locoformer.locoformer import Locoformer, ReplayBuffer
+from locoformer.locoformer import Locoformer, ReplayBuffer, calc_entropy
 from x_mlps_pytorch import MLP
 
 # helper functions
@@ -252,8 +252,57 @@ def main(
             self.register_buffer('dummy', tensor(0), persistent = False)
 
         @property
+        def is_continuous(self):
+            return self.num_continuous_actions > 0
+
+        @property
         def device(self):
             return self.dummy.device
+
+        def sample_action(
+            self,
+            dist
+        ):
+            if continuous:
+                action = gaussian_sample(dist)
+            else:
+                action = gumbel_sample(dist)
+
+            return action
+
+        def log_prob(
+            self,
+            dist,
+            value
+        ):
+            if self.is_continuous:
+                mean, log_var = action_logits.unbind(dim = -1)
+                std = (0.5 * log_var).exp()
+                dist = Normal(mean, std)
+                log_prob = dist.log_prob(value)
+            else:
+                if value.ndim == (dist.ndim - 1):
+                    value = rearrange(value, '... -> ... 1')
+
+                log_prob = dist.log_softmax(dim = -1).gather(-1, value)
+
+            return log_prob
+
+        def entropy(
+            self,
+            dist
+        ):
+            if self.is_continuous:
+                mean, log_var = action_logits.unbind(dim = -1)
+                std = (0.5 * log_var).exp()
+                dist = Normal(mean, std)
+
+                entropy = dist.entropy()
+            else:
+                entropy = calc_entropy(action_logits)
+                entropy = rearrange(entropy, '... -> ... 1')
+
+            return entropy
 
         def forward(
             self,
@@ -273,9 +322,7 @@ def main(
             discrete_action_types = discrete_action_types.to(self.device)
             continuous_action_types = continuous_action_types.to(self.device)
 
-            is_continuous = self.num_continuous_actions > 0
-
-            if is_continuous:
+            if self.is_continuous:
                 action_unembed = self.continuous_action_unembeds(continuous_action_types)
                 action_unembed = rearrange(action_unembed, '... (d two) -> ... d two', two = 2)
                 dist = einsum(embed, action_unembed, '... d, n d mu_sigma -> ... n mu_sigma')
@@ -368,10 +415,7 @@ def main(
 
                 (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
 
-                if continuous:
-                    action = gaussian_sample(action_logits)
-                else:
-                    action = gumbel_sample(action_logits)
+                action = locoformer.unembedder.sample_action(action_logits)
 
                 # pass to environment
 
@@ -395,13 +439,7 @@ def main(
 
                 # get log prob of action
 
-                if continuous:
-                    mean, log_var = action_logits.unbind(dim = -1)
-                    std = (0.5 * log_var).exp()
-                    dist = Normal(mean, std)
-                    action_log_prob = dist.log_prob(action)
-                else:
-                    action_log_prob = action_logits.log_softmax(dim = -1).gather(-1, rearrange(action, '-> 1'))
+                action_log_prob = locoformer.unembedder.log_prob(action_logits, action)
 
                 memory = replay.store(
                     state = state,

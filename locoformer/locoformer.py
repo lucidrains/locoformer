@@ -1134,22 +1134,9 @@ class Locoformer(Module):
 
             ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
-            if continuous:
-                mean, log_var = action_logits.unbind(dim = -1)
-                std = (0.5 * log_var).exp()
-                dist = Normal(mean, std)
-                log_prob = dist.log_prob(action)
+            log_prob = self.unembedder.log_prob(action_logits, action)
 
-                entropy = dist.entropy()
-
-            else:
-                action = rearrange(action, 'b t -> b t 1')
-
-                log_prob = action_logits.log_softmax(dim = -1).gather(-1, action)
-                log_prob = rearrange(log_prob, 'b t 1 -> b t 1')
-
-                entropy = calc_entropy(action_logits)
-                entropy = rearrange(entropy, '... -> ... 1')
+            entropy = self.unembedder.entropy(action_logits)
 
             # update actor, classic clipped surrogate loss
 
