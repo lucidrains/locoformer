@@ -335,7 +335,7 @@ class ReplayDataset(Dataset):
         if isinstance(folder, str):
             folder = Path(folder)
 
-        episode_lens = folder / 'episode_lens.meta.data.npy'
+        episode_lens = folder / 'episode_lens.data.meta.npy'
         self.episode_lens = open_memmap(str(episode_lens), mode = 'r')
 
         # get indices of non-zero lengthed episodes
@@ -374,7 +374,6 @@ class ReplayDataset(Dataset):
         data = {field: from_numpy(memmap[episode_index, :episode_len].copy()) for field, memmap in self.memmaps.items()}
 
         data['_lens'] = tensor(episode_len)
-
         return data
 
 class RemappedReplayDataset(Dataset):
@@ -507,7 +506,7 @@ class ReplayBuffer:
 
             # memmap file
 
-            filepath = folder / f'{field_name}.meta.data.npy'
+            filepath = folder / f'{field_name}.data.meta.npy'
 
             if isinstance(shape, int):
                 shape = (shape,)
