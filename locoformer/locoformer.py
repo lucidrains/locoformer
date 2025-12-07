@@ -456,7 +456,11 @@ class ReplayBuffer:
         fields: dict[
             str,
             str | tuple[str, int | tuple[int, ...]]
-        ]
+        ],
+        meta_fields: dict[
+            str,
+            str | tuple[str, int | tuple[int, ...]]
+        ] = dict()
     ):
 
         # folder for data
@@ -478,7 +482,43 @@ class ReplayBuffer:
         self.max_episodes = max_episodes
         self.max_timesteps= max_timesteps
 
-        self.episode_lens = open_memmap(str(episode_lens), mode = 'w+', dtype = np.int32, shape = (max_episodes,))
+        assert not 'episode_lens' in meta_fields
+        meta_fields.update(episode_lens = 'int')
+
+        # create the memmap for meta data tracks
+
+        self.meta_shapes = dict()
+        self.meta_dtypes = dict()
+        self.meta_memmaps = dict()
+        self.meta_fieldnames = set(meta_fields.keys())
+
+        def parse_field_info(field_info):
+            # some flexibility
+
+            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
+
+            dtype_str, shape = field_info
+            assert dtype_str in {'int', 'float', 'bool'}
+
+            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+            return dtype, shape
+
+        for field_name, field_info in meta_fields.items():
+
+            dtype, shape = parse_field_info(field_info)
+
+            # memmap file
+
+            filepath = folder / f'{field_name}.data.npy'
+
+            if isinstance(shape, int):
+                shape = (shape,)
+
+            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
+
+            self.meta_memmaps[field_name] = memmap
+            self.meta_shapes[field_name] = shape
+            self.meta_dtypes[field_name] = dtype
 
         # create the memmap for individual data tracks
 
@@ -489,14 +529,7 @@ class ReplayBuffer:
 
         for field_name, field_info in fields.items():
 
-            # some flexibility
-
-            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
-
-            dtype_str, shape = field_info
-            assert dtype_str in {'int', 'float', 'bool'}
-
-            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+            dtype, shape = parse_field_info(field_info)
 
             # memmap file
 
@@ -515,6 +548,10 @@ class ReplayBuffer:
 
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
+
+    @property
+    def episode_lens(self):
+        return self.meta_memmaps['episode_lens']
 
     def reset_(self):
         self.episode_lens[:] = 0
@@ -536,7 +573,20 @@ class ReplayBuffer:
     @contextmanager
     def one_episode(self):
 
-        yield
+        # storing data before exiting the context
+
+        final_meta_data_store = dict()
+
+        yield final_meta_data_store
+
+        # store meta data for use in constructing sequences for learning
+
+        for key, value in final_meta_data_store.items():
+            assert key in self.meta_memmaps, f'{key} not defined in `meta_fields` on init'
+
+            self.meta_memmaps[key][self.episode_index] = value
+
+        # flush and advance
 
         self.flush()
         self.advance_episode()

@@ -190,6 +190,9 @@ def main(
             done        = 'bool',
             learnable   = 'bool',
             condition   = ('float', 2)
+        ),
+        meta_fields = dict(
+            cum_rewards = 'float'
         )
     )
 
@@ -404,7 +407,9 @@ def main(
 
         stateful_forward = locoformer.get_stateful_forward(has_batch_dim = False, has_time_dim = False, inference_mode = True)
 
-        with replay.one_episode():
+        cum_rewards = 0.
+
+        with replay.one_episode() as final_meta_data_store_dict:
             while True:
 
                 rand_command = torch.randn(2)
@@ -431,6 +436,10 @@ def main(
                     state_entropy = (log_var * state_entropy_bonus_weight).sum()
 
                     reward = reward + state_entropy.item() # the entropy is directly related to log variance
+
+                # cum rewards
+
+                cum_rewards += reward
 
                 # append to memory
 
@@ -472,6 +481,10 @@ def main(
                         memory = memory._replace(value = next_value, learnable = False)
 
                         replay.store(**memory._asdict())
+
+                    # store the final cumulative reward into meta data
+
+                    final_meta_data_store_dict.update(cum_rewards = cum_rewards)
 
                     break
 
