@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.0.63"
+version = "0.0.64"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -33,7 +33,7 @@ dependencies = [
     "hl-gauss-pytorch>=0.2.0",
     "rotary-embedding-torch",
     "torch>=2.4",
-    "x-evolution",
+    "x-evolution>=0.1.15",
     "x-mlps-pytorch",
 ]
 
