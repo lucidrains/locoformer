@@ -51,9 +51,9 @@ def log(t, eps = 1e-20):
 def gumbel_noise(t):
     return -log(-log(torch.rand_like(t)))
 
-def gumbel_sample(logits, temperature = 1., eps = 1e-6):
+def gumbel_sample(logits, temperature = 1., keepdim = False, eps = 1e-6):
     noise = gumbel_noise(logits)
-    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1)
+    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1, keepdim = keepdim)
 
 def gaussian_sample(logits):
     mean, log_var = logits.unbind(dim = -1)
@@ -183,7 +183,7 @@ def main(
         fields = dict(
             state       = ('float', dim_state),
             state_image = ('float', dim_state_image_shape),
-            action      = 'int' if not continuous else ('float', num_continuous_actions),
+            action      = ('int', 1) if not continuous else ('float', num_continuous_actions),
             action_log_prob = ('float', 1) if not continuous else ('float', num_continuous_actions),
             reward      = 'float',
             value       = 'float',
@@ -269,7 +269,7 @@ def main(
             if continuous:
                 action = gaussian_sample(dist)
             else:
-                action = gumbel_sample(dist)
+                action = gumbel_sample(dist, keepdim = True)
 
             return action
 
