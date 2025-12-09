@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from einops import rearrange
 from accelerate import Accelerator
 
-from locoformer.locoformer import Locoformer
+from locoformer.locoformer import Locoformer, ActionUnembedder
 
 # constants
 
@@ -54,18 +54,6 @@ def decode_token(token):
 def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
 
-# sampling
-
-def log(t, eps = 1e-20):
-    return t.clamp(min = eps).log()
-
-def gumbel_noise(t):
-    return -log(-log(torch.rand_like(t)))
-
-def gumbel_sample(logits, temperature = 1., eps = 1e-6, keepdim = True):
-    noise = gumbel_noise(logits)
-    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1, keepdim = keepdim)
-
 def topk_logits_filter(logits, frac_num_tokens = 0.1):
     num_tokens = logits.shape[-1]
     k = ceil(frac_num_tokens * num_tokens)
@@ -81,7 +69,7 @@ dim_model = 512
 
 model = Locoformer(
     embedder = nn.Embedding(256, dim_model),
-    unembedder = nn.Linear(dim_model, 256, bias = False),
+    unembedder = ActionUnembedder(dim_model, num_discrete_actions = 256),
     transformer = dict(
         dim = dim_model,
         depth = 6,
@@ -176,7 +164,8 @@ for i in range(NUM_BATCHES):
         while out.shape[-1] < GENERATE_LENGTH:
             filtered_logits = topk_logits_filter(logits[-1])
 
-            sampled = gumbel_sample(filtered_logits)
+            sampled = model.unembedder.sample_action(filtered_logits)
+
             out = torch.cat((out, sampled), dim = -1)
 
             logits = stateful_forward(sampled)

@@ -31,7 +31,13 @@ from torch.distributions import Normal
 from einops import rearrange, einsum
 from einops.layers.torch import Rearrange, Reduce
 
-from locoformer.locoformer import Locoformer, ReplayBuffer, calc_entropy
+from locoformer.locoformer import (
+    Locoformer,
+    ReplayBuffer,
+    calc_entropy,
+    ActionUnembedder
+)
+
 from x_mlps_pytorch import MLP
 
 # helper functions
@@ -44,20 +50,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def log(t, eps = 1e-20):
-    return t.clamp(min = eps).log()
-
-def gumbel_noise(t):
-    return -log(-log(torch.rand_like(t)))
-
-def gumbel_sample(logits, temperature = 1., keepdim = False, eps = 1e-6):
-    noise = gumbel_noise(logits)
-    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1, keepdim = keepdim)
-
-def gaussian_sample(logits):
-    mean, log_var = logits.unbind(dim = -1)
-    return mean + (0.5 * log_var).exp() * torch.randn_like(mean)
 
 # get rgb snapshot from env
 
@@ -230,110 +222,6 @@ def main(
                 return self.state_to_token(state)
             else:
                 raise ValueError('invalid state type')
-
-    class ActionUnembedder(Module):
-        def __init__(
-            self,
-            dim,
-            num_discrete_actions = 0,
-            num_continuous_actions = 0,
-        ):
-            super().__init__()
-            assert (num_discrete_actions > 0) ^ (num_continuous_actions > 0)
-
-            self.num_discrete_actions = num_discrete_actions
-            self.num_continuous_actions = num_continuous_actions
-
-            self.discrete_action_unembeds = nn.Embedding(num_discrete_actions, dim)
-            self.continuous_action_unembeds = nn.Embedding(num_continuous_actions, dim * 2)
-
-            nn.init.zeros_(self.continuous_action_unembeds.weight)
-
-            self.register_buffer('default_discrete_action_types', torch.arange(num_discrete_actions), persistent = False)
-            self.register_buffer('default_continuous_action_types', torch.arange(num_continuous_actions), persistent = False)
-
-            self.register_buffer('dummy', tensor(0), persistent = False)
-
-        @property
-        def is_continuous(self):
-            return self.num_continuous_actions > 0
-
-        @property
-        def device(self):
-            return self.dummy.device
-
-        def sample_action(
-            self,
-            dist
-        ):
-            if continuous:
-                action = gaussian_sample(dist)
-            else:
-                action = gumbel_sample(dist, keepdim = True)
-
-            return action
-
-        def log_prob(
-            self,
-            dist,
-            value
-        ):
-            if self.is_continuous:
-                mean, log_var = action_logits.unbind(dim = -1)
-                std = (0.5 * log_var).exp()
-                dist = Normal(mean, std)
-                log_prob = dist.log_prob(value)
-            else:
-                if value.ndim == (dist.ndim - 1):
-                    value = rearrange(value, '... -> ... 1')
-
-                log_prob = dist.log_softmax(dim = -1).gather(-1, value)
-
-            return log_prob
-
-        def entropy(
-            self,
-            dist
-        ):
-            if self.is_continuous:
-                mean, log_var = action_logits.unbind(dim = -1)
-                std = (0.5 * log_var).exp()
-                dist = Normal(mean, std)
-
-                entropy = dist.entropy()
-            else:
-                entropy = calc_entropy(action_logits)
-                entropy = rearrange(entropy, '... -> ... 1')
-
-            return entropy
-
-        def forward(
-            self,
-            embed,
-            discrete_action_types = None,
-            continuous_action_types = None
-        ):
-            discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
-            continuous_action_types = default(continuous_action_types, self.default_continuous_action_types)
-
-            if not is_tensor(discrete_action_types):
-                discrete_action_types = tensor(discrete_action_types)
-
-            if not is_tensor(continuous_action_types):
-                continuous_action_types = tensor(continuous_action_types)
-
-            discrete_action_types = discrete_action_types.to(self.device)
-            continuous_action_types = continuous_action_types.to(self.device)
-
-            if self.is_continuous:
-                action_unembed = self.continuous_action_unembeds(continuous_action_types)
-                action_unembed = rearrange(action_unembed, '... (d two) -> ... d two', two = 2)
-                dist = einsum(embed, action_unembed, '... d, n d mu_sigma -> ... n mu_sigma')
-            else:
-                action_unembed = self.discrete_action_unembeds(discrete_action_types)
-                dist = einsum(embed, action_unembed, '... d, n d -> ... n')
-
-            return dist
 
     # state embed kwargs
 
