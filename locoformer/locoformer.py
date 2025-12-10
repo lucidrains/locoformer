@@ -1044,7 +1044,6 @@ class ActionUnembedder(Module):
         cat_discrete_action_logits = False
     ):
         super().__init__()
-        assert (num_discrete_actions > 0) ^ (num_continuous_actions > 0)
 
         if not isinstance(num_discrete_actions, tuple):
             num_discrete_actions = (num_discrete_actions,)
@@ -1053,6 +1052,7 @@ class ActionUnembedder(Module):
         self.num_continuous_actions = num_continuous_actions
 
         total_discrete_actions = sum(num_discrete_actions)
+        assert (total_discrete_actions > 0) ^ (num_continuous_actions > 0)
 
         self.discrete_action_unembeds = nn.Embedding(total_discrete_actions, dim)
         self.continuous_action_unembeds = nn.Embedding(num_continuous_actions, dim * 2)

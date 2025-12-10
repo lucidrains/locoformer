@@ -116,7 +116,7 @@ def main(
     num_episodes = 50_000,
     max_timesteps = 500,
     num_episodes_before_learn = 32,
-    max_discrete_actions = 4,
+    num_discrete_action_sets = (4, 2),
     max_continuous_actions = 3,
     continuous = False,
     use_vision = False,
@@ -143,7 +143,11 @@ def main(
 
     # environment
 
-    env = gym.make(env_name, continuous = continuous, render_mode = 'rgb_array')
+    env_kwargs = dict()
+    if continuous:
+        env_kwargs = dict(continuous = continuous)
+
+    env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
 
     if clear_video:
         rmtree(video_folder, ignore_errors = True)
@@ -157,9 +161,11 @@ def main(
     )
 
     if not continuous:
-        num_discrete_actions = env.action_space.n
-        assert num_discrete_actions <= max_discrete_actions
-        discrete_action_types = tensor([0])
+        env_discrete_actions = env.action_space.n
+        assert env_discrete_actions in num_discrete_action_sets
+
+        discrete_action_set_id = num_discrete_action_sets.index(env_discrete_actions)
+        discrete_action_set_id = tensor([discrete_action_set_id])
     else:
         num_continuous_actions = env.action_space.shape[0]
         assert num_continuous_actions <= max_continuous_actions
@@ -237,7 +243,7 @@ def main(
     if continuous:
         action_unembed_kwargs = dict(continuous_action_types = continuous_action_types)
     else:
-        action_unembed_kwargs = dict(discrete_action_types = discrete_action_types)
+        action_unembed_kwargs = dict(discrete_action_types = discrete_action_set_id)
 
     # networks
 
@@ -245,7 +251,7 @@ def main(
         embedder = StateEmbedder(64, dim_state),
         unembedder = ActionUnembedder(
             64,
-            num_discrete_actions = max_discrete_actions if not continuous else 0,
+            num_discrete_actions = num_discrete_action_sets if not continuous else 0,
             num_continuous_actions = max_continuous_actions if continuous else 0
         ),
         state_pred_head = MLP(64, dim_state * 2, bias = False),
