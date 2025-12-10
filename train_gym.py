@@ -9,6 +9,9 @@
 # ]
 # ///
 
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+
 from fire import Fire
 from shutil import rmtree
 from tqdm import tqdm
@@ -34,7 +37,6 @@ from einops.layers.torch import Rearrange, Reduce
 from locoformer.locoformer import (
     Locoformer,
     ReplayBuffer,
-    calc_entropy,
     ActionUnembedder
 )
 
@@ -157,7 +159,7 @@ def main(
     if not continuous:
         num_discrete_actions = env.action_space.n
         assert num_discrete_actions <= max_discrete_actions
-        discrete_action_types = torch.arange(num_discrete_actions)
+        discrete_action_types = tensor([0])
     else:
         num_continuous_actions = env.action_space.shape[0]
         assert num_continuous_actions <= max_continuous_actions

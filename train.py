@@ -6,6 +6,9 @@
 # ]
 # ///
 
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+
 import tqdm
 import gzip
 from math import ceil
@@ -69,7 +72,7 @@ dim_model = 512
 
 model = Locoformer(
     embedder = nn.Embedding(256, dim_model),
-    unembedder = ActionUnembedder(dim_model, num_discrete_actions = 256),
+    unembedder = ActionUnembedder(dim_model, num_discrete_actions = 256, cat_discrete_action_logits = True),
     transformer = dict(
         dim = dim_model,
         depth = 6,

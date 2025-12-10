@@ -17,7 +17,7 @@ from beartype import beartype
 from beartype.door import is_bearable
 
 import torch
-from torch import nn, cat, stack, arange, Tensor, tensor, is_tensor, from_numpy
+from torch import nn, cat, stack, arange, Tensor, tensor, is_tensor, from_numpy, nested
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
@@ -101,6 +101,11 @@ def is_empty(t):
 def tree_map_tensor(x, fn):
     return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
 
+def lens_to_mask(lens, max_len):
+    device = lens.device
+    seq = arange(max_len, device = device)
+    return einx.less('j, i -> i j', seq, lens)
+
 def pad_at_dim(
     t,
     pad: tuple[int, int],
@@ -135,10 +140,6 @@ def tensor_to_dict(
         return tensor_dict
 
     return SimpleNamespace(**tensor_dict)
-
-def calc_entropy(logits):
-    prob = logits.softmax(dim = -1)
-    return -(prob * log(prob)).sum(dim = -1)
 
 # reward functions - A.2
 
@@ -974,15 +975,61 @@ class TransformerXL(Module):
 
 # action unembedder
 
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
+
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
 def gumbel_noise(t):
     return -log(-log(torch.rand_like(t)))
 
-def gumbel_sample(logits, temperature = 1., keepdim = False, eps = 1e-6):
-    noise = gumbel_noise(logits)
-    return ((logits / max(temperature, eps)) + noise).argmax(dim = -1, keepdim = keepdim)
+def gumbel_sample(
+    logits,
+    temperature = 1.,
+    eps = 1e-6
+):
+    logits = (logits,) if not isinstance(logits, tuple) else logits
+    lens = [logit.shape[-1] for logit in logits]
+
+    packed_logits = cat(logits, dim = -1)
+    noise = gumbel_noise(packed_logits)
+    noised_logits = (packed_logits / max(temperature, eps)) + noise
+
+    mask_value = max_neg_value(noised_logits)
+
+    noised_logits = noised_logits.split(lens, dim = -1)
+    nested_noised_logits = nested.nested_tensor(noised_logits, layout = torch.jagged)
+
+    return nested_noised_logits.to_padded_tensor(mask_value).argmax(dim = -1)
+
+def calc_log_prob(logits, value):
+    logits = (logits,) if not isinstance(logits, tuple) else logits
+
+    if value.ndim == 2:
+        value = rearrange(value, '... -> ... 1')
+
+    offsets = F.pad(value.new_tensor([l.shape[-1] for l in logits]), (1, -1))
+
+    value = value + offsets
+
+    nested_logits = nested.nested_tensor(logits, layout = torch.jagged)
+    nested_prob = nested_logits.softmax(dim = -1)
+    nested_log_probs = nested_prob * log(nested_prob)
+
+    log_probs = cat(nested_log_probs.unbind(), dim = -1)
+
+    log_prob = log_probs.gather(-1, value)
+    return log_prob
+
+def calc_entropy(logits):
+    logits = (logits,) if not isinstance(logits, tuple) else logits
+
+    nested_logits = nested.nested_tensor(logits, layout = torch.jagged)
+    prob = nested_logits.softmax(dim = -1)
+    entropies = -(prob * log(prob)).sum(dim = -1)
+
+    return cat(entropies.unbind(), dim = -1)
 
 def gaussian_sample(logits):
     mean, log_var = logits.unbind(dim = -1)
@@ -992,23 +1039,45 @@ class ActionUnembedder(Module):
     def __init__(
         self,
         dim,
-        num_discrete_actions = 0,
+        num_discrete_actions: int | tuple[int, ...] = 0,
         num_continuous_actions = 0,
+        cat_discrete_action_logits = False
     ):
         super().__init__()
         assert (num_discrete_actions > 0) ^ (num_continuous_actions > 0)
 
+        if not isinstance(num_discrete_actions, tuple):
+            num_discrete_actions = (num_discrete_actions,)
+
         self.num_discrete_actions = num_discrete_actions
         self.num_continuous_actions = num_continuous_actions
 
-        self.discrete_action_unembeds = nn.Embedding(num_discrete_actions, dim)
+        total_discrete_actions = sum(num_discrete_actions)
+
+        self.discrete_action_unembeds = nn.Embedding(total_discrete_actions, dim)
         self.continuous_action_unembeds = nn.Embedding(num_continuous_actions, dim * 2)
 
         nn.init.normal_(self.discrete_action_unembeds.weight, std = 0.02)
         nn.init.zeros_(self.continuous_action_unembeds.weight)
 
-        self.register_buffer('default_discrete_action_types', torch.arange(num_discrete_actions), persistent = False)
-        self.register_buffer('default_continuous_action_types', torch.arange(num_continuous_actions), persistent = False)
+        if total_discrete_actions > 0:
+            offsets = tensor(num_discrete_actions)
+            offsets_cumsum = F.pad(offsets, (1, 0)).cumsum(dim = -1)
+
+            discrete_embed_mask = (
+                lens_to_mask(offsets_cumsum[1:], total_discrete_actions).long() -
+                lens_to_mask(offsets_cumsum[:-1], total_discrete_actions).long()
+            ).bool()
+
+            self.cat_discrete_action_logits = cat_discrete_action_logits
+
+            self.register_buffer('discrete_embed_mask', discrete_embed_mask, persistent = False)
+            self.register_buffer('discrete_indices', arange(sum(num_discrete_actions)), persistent = False)
+            self.register_buffer('action_lens_per_discrete_action', tensor(num_discrete_actions), persistent = False)
+
+            self.register_buffer('default_discrete_action_types', arange(len(num_discrete_actions)), persistent = False)
+
+        self.register_buffer('default_continuous_action_types', arange(num_continuous_actions), persistent = False)
 
         self.register_buffer('dummy', tensor(0), persistent = False)
 
@@ -1027,13 +1096,13 @@ class ActionUnembedder(Module):
         if self.is_continuous:
             action = gaussian_sample(dist)
         else:
-            action = gumbel_sample(dist, keepdim = True)
+            action = gumbel_sample(dist)
 
         return action
 
     def log_prob(
         self,
-        dist,
+        action_logits,
         value
     ):
         if self.is_continuous:
@@ -1042,16 +1111,13 @@ class ActionUnembedder(Module):
             dist = Normal(mean, std)
             log_prob = dist.log_prob(value)
         else:
-            if value.ndim == (dist.ndim - 1):
-                value = rearrange(value, '... -> ... 1')
-
-            log_prob = dist.log_softmax(dim = -1).gather(-1, value)
+            log_prob = calc_log_prob(action_logits, value)
 
         return log_prob
 
     def entropy(
         self,
-        dist
+        action_logits
     ):
         if self.is_continuous:
             mean, log_var = action_logits.unbind(dim = -1)
@@ -1065,22 +1131,31 @@ class ActionUnembedder(Module):
 
         return entropy
 
+    def get_discrete_embeds(self, discrete_action_types = None):
+        discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
+
+        if not is_tensor(discrete_action_types):
+            discrete_action_types = tensor(discrete_action_types)
+
+        select_indices_mask = (self.discrete_embed_mask[discrete_action_types]).any(dim = 0)
+        discrete_indices = self.discrete_indices[select_indices_mask]
+
+        embeds = self.discrete_action_unembeds(discrete_indices)
+        action_lens = self.action_lens_per_discrete_action[discrete_action_types]
+
+        return embeds, action_lens
+
     def forward(
         self,
         embed,
         discrete_action_types = None,
         continuous_action_types = None
     ):
-        discrete_action_types = default(discrete_action_types, self.default_discrete_action_types)
         continuous_action_types = default(continuous_action_types, self.default_continuous_action_types)
-
-        if not is_tensor(discrete_action_types):
-            discrete_action_types = tensor(discrete_action_types)
 
         if not is_tensor(continuous_action_types):
             continuous_action_types = tensor(continuous_action_types)
 
-        discrete_action_types = discrete_action_types.to(self.device)
         continuous_action_types = continuous_action_types.to(self.device)
 
         if self.is_continuous:
@@ -1088,8 +1163,11 @@ class ActionUnembedder(Module):
             action_unembed = rearrange(action_unembed, '... (d two) -> ... d two', two = 2)
             dist = einsum(embed, action_unembed, '... d, n d mu_sigma -> ... n mu_sigma')
         else:
-            action_unembed = self.discrete_action_unembeds(discrete_action_types)
+            action_unembed, num_discrete_actions = self.get_discrete_embeds(discrete_action_types)
             dist = einsum(embed, action_unembed, '... d, n d -> ... n')
+
+            if not self.cat_discrete_action_logits:
+                dist = dist.split(num_discrete_actions.tolist(), dim = -1)
 
         return dist
 
