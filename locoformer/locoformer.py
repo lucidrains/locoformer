@@ -978,6 +978,10 @@ class TransformerXL(Module):
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
+def exclusive_cumsum(t):
+    padded_t = F.pad(t, (1, 0))
+    return padded_t.cumsum(dim = -1)[:-1]
+
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
@@ -1001,7 +1005,8 @@ def gumbel_sample(
     noised_logits = noised_logits.split(lens, dim = -1)
     nested_noised_logits = nested.nested_tensor(noised_logits, layout = torch.jagged)
 
-    return nested_noised_logits.to_padded_tensor(mask_value).argmax(dim = -1)
+    sampled = nested_noised_logits.to_padded_tensor(mask_value).argmax(dim = -1)
+    return rearrange(sampled, 'na ... -> ... na')
 
 def calc_log_prob(logits, value):
     logits = (logits,) if not isinstance(logits, tuple) else logits
@@ -1009,9 +1014,10 @@ def calc_log_prob(logits, value):
     if value.ndim == 2:
         value = rearrange(value, '... -> ... 1')
 
-    offsets = F.pad(value.new_tensor([l.shape[-1] for l in logits]), (1, -1))
+    offsets = value.new_tensor([l.shape[-1] for l in logits])
+    offsets_cumsum = exclusive_cumsum(offsets)
 
-    value = value + offsets
+    value = value + offsets_cumsum
 
     nested_logits = nested.nested_tensor(logits, layout = torch.jagged)
     nested_prob = nested_logits.softmax(dim = -1)
@@ -1176,7 +1182,7 @@ class ActionUnembedder(Module):
 class Locoformer(Module):
     def __init__(
         self,
-        embedder: Module | ModuleList | list[Module],
+        embedder: Module,
         unembedder: Module,
         transformer: dict | TransformerXL,
         *,
@@ -1207,9 +1213,6 @@ class Locoformer(Module):
         self.transformer = transformer
 
         # handle state embedder
-
-        if isinstance(embedder, list):
-            embedder = ModuleList(embedder)
 
         self.embedder = embedder
 
@@ -1317,7 +1320,6 @@ class Locoformer(Module):
         state_embed_kwargs: dict = dict(),
         action_unembed_kwargs: dict = dict(),
         compute_state_pred_loss = True,
-        continuous = False,
         accelerator = None,
         max_grad_norm = 0.5
     ):

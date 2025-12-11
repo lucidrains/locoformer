@@ -103,7 +103,6 @@ def learn(
                 state_embed_kwargs = state_embed_kwargs,
                 action_unembed_kwargs = action_unembed_kwargs,
                 compute_state_pred_loss = compute_state_pred_loss,
-                continuous = continuous,
                 accelerator = accelerator
             )
 
