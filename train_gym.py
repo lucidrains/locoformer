@@ -373,7 +373,7 @@ def main(
 
                         _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs)
 
-                        memory = memory._replace(value = next_value, learnable = False)
+                        memory = memory._replace(value = next_value, learnable = tensor(False))
 
                         replay.store(**memory._asdict())
 
