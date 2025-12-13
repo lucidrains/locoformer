@@ -39,6 +39,8 @@ from x_mlps_pytorch import MLP
 
 from x_evolution import EvoStrategy
 
+from discrete_continuous_embed_readout import Readout
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
