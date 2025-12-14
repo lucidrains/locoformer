@@ -9,9 +9,6 @@
 # ]
 # ///
 
-import os
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-
 from fire import Fire
 from shutil import rmtree
 from tqdm import tqdm
