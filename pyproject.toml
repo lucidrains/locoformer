@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.0.70"
+version = "0.0.71"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,7 +30,7 @@ dependencies = [
     "beartype",
     "einx>=0.3.0",
     "einops>=0.8.0",
-    "discrete-continuous-embed-readout>=0.0.29",
+    "discrete-continuous-embed-readout>=0.0.34",
     "hl-gauss-pytorch>=0.2.0",
     "rotary-embedding-torch",
     "torch>=2.8",

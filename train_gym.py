@@ -36,8 +36,7 @@ from einops.layers.torch import Rearrange, Reduce
 
 from locoformer.locoformer import (
     Locoformer,
-    ReplayBuffer,
-    ActionUnembedder
+    ReplayBuffer
 )
 
 from x_mlps_pytorch import MLP
@@ -69,7 +68,6 @@ def learn(
     accelerator,
     replay,
     state_embed_kwargs: dict,
-    action_unembed_kwargs: dict,
     batch_size = 16,
     epochs = 2,
     use_vision = False,
@@ -101,7 +99,6 @@ def learn(
                 episode_lens = data._lens,
                 optims = optims,
                 state_embed_kwargs = state_embed_kwargs,
-                action_unembed_kwargs = action_unembed_kwargs,
                 compute_state_pred_loss = compute_state_pred_loss,
                 accelerator = accelerator
             )
@@ -115,8 +112,8 @@ def main(
     num_episodes = 50_000,
     max_timesteps = 500,
     num_episodes_before_learn = 32,
-    num_discrete_action_sets = (4, 2),
-    max_continuous_actions = 3,
+    num_discrete = 4,
+    max_continuous_actions = 1,
     continuous = False,
     use_vision = False,
     vision_height_width_dim = 64,
@@ -159,17 +156,6 @@ def main(
         disable_logger = True
     )
 
-    if not continuous:
-        env_discrete_actions = env.action_space.n
-        assert env_discrete_actions in num_discrete_action_sets
-
-        discrete_action_set_id = num_discrete_action_sets.index(env_discrete_actions)
-        discrete_action_set_id = tensor([discrete_action_set_id])
-    else:
-        num_continuous_actions = env.action_space.shape[0]
-        assert num_continuous_actions <= max_continuous_actions
-        continuous_action_types = torch.arange(num_continuous_actions)
-
     dim_state = env.observation_space.shape[0]
     dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
 
@@ -182,8 +168,8 @@ def main(
         fields = dict(
             state       = ('float', dim_state),
             state_image = ('float', dim_state_image_shape),
-            action      = ('int', 1) if not continuous else ('float', num_continuous_actions),
-            action_log_prob = ('float', 1) if not continuous else ('float', num_continuous_actions),
+            action      = ('int', 1) if not continuous else ('float', max_continuous_actions),
+            action_log_prob = ('float', 1) if not continuous else ('float', max_continuous_actions),
             reward      = 'float',
             value       = 'float',
             done        = 'bool',
@@ -239,19 +225,14 @@ def main(
         state_embed_kwargs = dict(state_type = 'raw')
         compute_state_pred_loss = True
 
-    if continuous:
-        action_unembed_kwargs = dict(continuous_action_types = continuous_action_types)
-    else:
-        action_unembed_kwargs = dict(discrete_action_types = discrete_action_set_id)
-
     # networks
 
     locoformer = Locoformer(
         embedder = StateEmbedder(64, dim_state),
-        unembedder = ActionUnembedder(
-            64,
-            num_discrete_actions = num_discrete_action_sets if not continuous else 0,
-            num_continuous_actions = max_continuous_actions if continuous else 0
+        unembedder = dict(
+            dim = 64,
+            num_discrete = num_discrete if not continuous else 0,
+            num_continuous = max_continuous_actions if continuous else 0,
         ),
         state_pred_head = MLP(64, dim_state * 2, bias = False),
         transformer = dict(
@@ -313,9 +294,9 @@ def main(
 
                 state_for_model = state_image if use_vision else state
 
-                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
+                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
 
-                action = locoformer.unembedder.sample_action(action_logits)
+                action = locoformer.unembedder.sample(action_logits)
 
                 # pass to environment
 
@@ -371,7 +352,7 @@ def main(
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs)
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs)
 
                         memory = memory._replace(value = next_value, learnable = tensor(False))
 
@@ -396,7 +377,6 @@ def main(
                     accelerator,
                     replay,
                     state_embed_kwargs,
-                    action_unembed_kwargs,
                     batch_size,
                     epochs,
                     use_vision,

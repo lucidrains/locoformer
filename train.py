@@ -1,13 +1,11 @@
 # /// script
 # dependencies = [
 #   'accelerate',
+#   'discrete_continuous_embed_readout',
 #   'locoformer',
 #   'tqdm'
 # ]
 # ///
-
-import os
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 import tqdm
 import gzip
@@ -24,7 +22,9 @@ from torch.utils.data import DataLoader, Dataset
 from einops import rearrange
 from accelerate import Accelerator
 
-from locoformer.locoformer import Locoformer, ActionUnembedder
+from discrete_continuous_embed_readout import EmbedAndReadout
+
+from locoformer.locoformer import Locoformer
 
 # constants
 
@@ -70,9 +70,11 @@ def topk_logits_filter(logits, frac_num_tokens = 0.1):
 
 dim_model = 512
 
+embed, readout = EmbedAndReadout(dim_model, num_discrete = 256)
+
 model = Locoformer(
-    embedder = nn.Embedding(256, dim_model),
-    unembedder = ActionUnembedder(dim_model, num_discrete_actions = 256, cat_discrete_action_logits = True),
+    embedder = embed,
+    unembedder = readout,
     transformer = dict(
         dim = dim_model,
         depth = 6,
@@ -167,7 +169,9 @@ for i in range(NUM_BATCHES):
         while out.shape[-1] < GENERATE_LENGTH:
             filtered_logits = topk_logits_filter(logits[-1])
 
-            sampled = model.unembedder.sample_action(filtered_logits)
+            sampled = model.unembedder.sample(filtered_logits)
+
+            sampled = rearrange(sampled, '... -> ... 1')
 
             out = torch.cat((out, sampled), dim = -1)
 
