@@ -607,7 +607,7 @@ class ReplayBuffer:
 
         assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
 
-        assert datapoint.shape == self.shapes[name], f'invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
+        assert datapoint.shape == self.shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
 
         self.memmaps[name][self.episode_index, self.timestep_index] = datapoint
 
@@ -1122,7 +1122,7 @@ class Locoformer(Module):
         condition: Tensor | None = None,
         optims: list[Optimizer] | None = None,
         state_embed_kwargs: dict = dict(),
-        action_unembed_kwargs: dict = dict(),
+        action_select_kwargs: dict = dict(),
         compute_state_pred_loss = True,
         accelerator = None,
         max_grad_norm = 0.5
@@ -1184,11 +1184,11 @@ class Locoformer(Module):
             if has_condition:
                 condition, = rest
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_unembed_kwargs = action_unembed_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
-            log_prob = self.unembedder.log_prob(action_logits, action)
+            log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
-            entropy = self.unembedder.entropy(action_logits)
+            entropy = self.unembedder.entropy(action_logits, **action_select_kwargs)
 
             # update actor, classic clipped surrogate loss
 
@@ -1420,7 +1420,7 @@ class Locoformer(Module):
         cache: Cache | None = None,
         condition: Tensor | None = None,
         state_embed_kwargs: dict = dict(),
-        action_unembed_kwargs: dict = dict(),
+        action_select_kwargs: dict = dict(),
         detach_cache = False,
         return_values = False,
         return_state_pred = False,
@@ -1459,7 +1459,7 @@ class Locoformer(Module):
 
         # unembed to actions - in language models this would be the next state
 
-        action_logits = self.unembedder(embed, **action_unembed_kwargs)
+        action_logits = self.unembedder(embed, **action_select_kwargs)
 
         out = action_logits
 
