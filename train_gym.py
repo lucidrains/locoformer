@@ -69,8 +69,7 @@ def learn(
     batch_size = 16,
     epochs = 2,
     use_vision = False,
-    compute_state_pred_loss = False,
-    continuous = False
+    compute_state_pred_loss = False
 ):
     state_field = 'state_image' if use_vision else 'state'
 
@@ -111,6 +110,7 @@ def main(
     num_episodes_before_learn = 64,
     num_episodes = 50_000,
     max_timesteps = 500,
+    replay_buffer_size = 5_000,
     use_vision = False,
     vision_height_width_dim = 64,
     clear_video = False,
@@ -170,7 +170,7 @@ def main(
 
     replay = ReplayBuffer(
         'replay',
-        num_episodes,
+        replay_buffer_size,
         max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
         fields = dict(
             state       = ('float', dim_state),
@@ -373,7 +373,13 @@ def main(
 
                         _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs)
 
-                        memory = memory._replace(value = next_value, learnable = tensor(False))
+                        memory = memory._replace(
+                            state = next_state,
+                            state_image = next_state_image,
+                            value = next_value,
+                            reward = next_value,
+                            learnable = tensor(False)
+                        )
 
                         replay.store(**memory._asdict())
 
@@ -400,8 +406,7 @@ def main(
                     batch_size,
                     epochs,
                     use_vision,
-                    compute_state_pred_loss,
-                    continuous
+                    compute_state_pred_loss
                 )
 # main
 
