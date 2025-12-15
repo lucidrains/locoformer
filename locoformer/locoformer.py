@@ -869,6 +869,7 @@ class TransformerXL(Module):
         gru_layers = False
     ):
         super().__init__()
+        self.dim = dim
 
         condition = exists(dim_cond)
 
@@ -991,7 +992,7 @@ class Locoformer(Module):
         ppo_value_clip = 0.4,
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
-        state_pred_head: Module | None = None,
+        state_pred_network: Module | None = None,
         state_pred_loss_weight = 0.1,
         reward_range: tuple[float, float] | None = None,
         reward_shaping_fns: list[Callable[..., float | Tensor]] | None = None,
@@ -1050,11 +1051,11 @@ class Locoformer(Module):
 
         # state prediction related
 
-        self.state_pred_head = state_pred_head
+        self.can_pred_state = exists(state_pred_network)
+        self.state_pred_network = state_pred_network
 
-        if exists(state_pred_head):
-            for param in state_pred_head.parameters():
-                param.data.zero_()
+        if exists(state_pred_network):
+            self.state_pred_head = Readout(transformer.dim, num_continuous = 1)
 
         self.has_state_pred_loss = state_pred_loss_weight > 0.
         self.state_pred_loss_weight = state_pred_loss_weight
@@ -1220,15 +1221,9 @@ class Locoformer(Module):
             ):
                 state_pred = maybe_state_pred[:, :-1]
                 state_labels = state[:, 1:]
+                loss_mask = mask[:, :-1]
 
-                mean, log_var = state_pred.chunk(2, dim = -1)
-
-                state_pred_loss = F.gaussian_nll_loss(
-                    mean,
-                    state_labels,
-                    var = log_var.exp(),
-                    reduction = 'none'
-                )
+                state_pred_loss = self.state_pred_head.calculate_loss(state_pred, state_labels, return_unreduced_loss = True)
 
                 windowed_state_pred_loss = state_pred_loss[mask[:, :-1]].mean() / total_learnable_tokens # todo - calculate denom correctly
 
@@ -1466,7 +1461,12 @@ class Locoformer(Module):
         # maybe return state prediction
 
         if return_state_pred:
-            state_pred = self.state_pred_head(embed) if exists(self.state_pred_head) else None
+            state_pred = None
+
+            if self.can_pred_state:
+                state_pred_embed = self.state_pred_network(embed)
+                state_pred = self.state_pred_head(state_pred_embed)
+
             out = (out, state_pred)
 
         # maybe detach cache

@@ -36,7 +36,7 @@ from locoformer.locoformer import (
     ReplayBuffer
 )
 
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch import Feedforwards, MLP
 
 # helper functions
 
@@ -249,7 +249,7 @@ def main(
 
             ]
         ),
-        state_pred_head = MLP(64, dim_state * 2, bias = False),
+        state_pred_network = Feedforwards(dim = 64, depth = 1),
         transformer = dict(
             dim = 64,
             dim_head = 32,
@@ -264,7 +264,7 @@ def main(
         ppo_eps_clip = ppo_eps_clip,
         ppo_entropy_weight = ppo_entropy_weight,
         use_spo = True,
-        value_network = MLP(64, 64),
+        value_network = Feedforwards(dim = 64, depth = 1),
         dim_value_input = 64,
         reward_range = reward_range,
         hl_gauss_loss_kwargs = dict(),
@@ -326,11 +326,12 @@ def main(
                 # maybe state entropy bonus
 
                 if state_entropy_bonus_weight > 0. and exists(state_pred):
-                    _, log_var = state_pred.chunk(2, dim = -1)
 
-                    state_entropy = (log_var * state_entropy_bonus_weight).sum()
+                    entropy = locoformer.state_pred_head.entropy(state_pred)
 
-                    reward = reward + state_entropy.item() # the entropy is directly related to log variance
+                    state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum()
+
+                    reward = reward + state_entropy_bonus.item() # the entropy is directly related to log variance
 
                 # cum rewards
 
