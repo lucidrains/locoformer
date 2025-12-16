@@ -36,6 +36,8 @@ from locoformer.locoformer import (
     ReplayBuffer
 )
 
+from discrete_continuous_embed_readout import Embed
+
 from x_mlps_pytorch import Feedforwards, MLP
 
 # helper functions
@@ -193,6 +195,8 @@ def main(
             self,
             dim,
             dim_state,
+            num_internal_state = None,
+            internal_state_selectors = None
         ):
             super().__init__()
             dim_hidden = dim * 2
@@ -210,18 +214,38 @@ def main(
 
             self.state_to_token = MLP(dim_state, 64, bias = False)
 
+            # internal state embeds for each robot
+
+            self.internal_state_embedder = None
+
+            if exists(num_internal_state) and exists(internal_state_selectors):
+                self.internal_state_embedder = Embed(
+                    dim_state,
+                    num_continuous = num_internal_state,
+                    internal_state_selectors = internal_state_selectors
+                )
+
         def forward(
             self,
             state,
-            state_type
+            state_type,
+            internal_state = None,
+            internal_state_selector_id: int | None = None
         ):
 
             if state_type == 'image':
-                return self.image_to_token(state)
+                token_embeds = self.image_to_token(state)
             elif state_type == 'raw':
-                return self.state_to_token(state)
+                token_embeds = self.state_to_token(state)
             else:
                 raise ValueError('invalid state type')
+
+            if exists(internal_state_selector_id):
+                internal_state_embed = self.internal_state_embedder(internal_state, selector_id = internal_state_selector_id)
+
+                token_embeds = token_embeds + internal_state_embed
+
+            return token_embeds
 
     # state embed kwargs
 
@@ -246,7 +270,6 @@ def main(
                 [[0, 1, 2, 3]],  # lunar lander discrete
                 [0, 1],          # lunar lander continuous
                 [[4, 5]],        # cart pole discrete
-
             ]
         ),
         state_pred_network = Feedforwards(dim = 64, depth = 1),
