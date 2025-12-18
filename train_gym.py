@@ -313,7 +313,9 @@ def main(
 
     # loop
 
-    for episodes_index in tqdm(range(num_episodes)):
+    pbar = tqdm(range(num_episodes))
+
+    for episodes_index in pbar:
 
         state, *_ = env_reset()
 
@@ -422,6 +424,10 @@ def main(
                 state_image = next_state_image
 
                 past_action = action
+
+            # update pbar
+
+            pbar.set_postfix(reward = f'{cum_rewards:.2f}')
 
             # learn if hit the number of learn timesteps
 

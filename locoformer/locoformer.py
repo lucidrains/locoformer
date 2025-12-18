@@ -1021,8 +1021,7 @@ class Locoformer(Module):
         action_embedder = None
         if isinstance(unembedder, dict):
             action_embedder, unembedder = EmbedAndReadout(
-                readout_kwargs = dict(auto_squeeze_single_output = False),
-                embed_kwargs = dict(auto_append_discrete_set_dim = False),
+                explicit_single_action_dim_given = True,
                 **unembedder,
             )
 
