@@ -330,6 +330,9 @@ def main(
         cum_rewards = 0.
 
         with replay.one_episode() as final_meta_data_store_dict:
+
+            past_action = None
+
             while True:
 
                 rand_command = torch.randn(2)
@@ -338,7 +341,7 @@ def main(
 
                 state_for_model = state_image if use_vision else state
 
-                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, condition = rand_command, return_values = True, return_state_pred = True)
+                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, past_action = past_action if embed_past_action else None, condition = rand_command, return_values = True, return_state_pred = True)
 
                 action = locoformer.unembedder.sample(action_logits, **action_select_kwargs)
 
@@ -417,6 +420,8 @@ def main(
 
                 state = next_state
                 state_image = next_state_image
+
+                past_action = action
 
             # learn if hit the number of learn timesteps
 
