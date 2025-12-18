@@ -114,6 +114,7 @@ def main(
     max_timesteps = 500,
     replay_buffer_size = 5_000,
     use_vision = False,
+    embed_past_action = False,
     vision_height_width_dim = 64,
     clear_video = False,
     video_folder = 'recordings',
@@ -273,6 +274,7 @@ def main(
             ]
         ),
         state_pred_network = Feedforwards(dim = 64, depth = 1),
+        embed_past_action = embed_past_action,
         transformer = dict(
             dim = 64,
             dim_head = 32,

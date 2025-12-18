@@ -26,7 +26,7 @@ from torch.distributions import Normal
 from torch.optim import Optimizer
 
 import einx
-from einops import rearrange, einsum
+from einops import rearrange, einsum, reduce
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -39,7 +39,7 @@ from x_mlps_pytorch import MLP
 
 from x_evolution import EvoStrategy
 
-from discrete_continuous_embed_readout import Readout
+from discrete_continuous_embed_readout import EmbedAndReadout, Readout
 
 # constants
 
@@ -993,6 +993,7 @@ class Locoformer(Module):
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
         state_pred_network: Module | None = None,
+        embed_past_action = False,
         state_pred_loss_weight = 0.1,
         reward_range: tuple[float, float] | None = None,
         reward_shaping_fns: list[Callable[..., float | Tensor]] | None = None,
@@ -1017,13 +1018,24 @@ class Locoformer(Module):
 
         # unembed state to actions or ssl predictions
 
+        action_embedder = None
         if isinstance(unembedder, dict):
-            unembedder = Readout(
-                auto_squeeze_single_output = False,
-                **unembedder
+            action_embedder, readout = EmbedAndReadout(
+                readout_kwargs = dict(auto_squeeze_single_output = False),
+                **unembedder,
             )
 
-        self.unembedder = unembedder
+        self.unembedder = readout
+
+        # embedding past actions
+
+        self.past_action_embedder = None
+        self.embed_past_action = embed_past_action
+
+        if embed_past_action and exists(action_embedder):
+            self.past_action_embedder = action_embedder
+
+        # attention window related
 
         self.fixed_window_size = transformer.fixed_window_size
         self.window_size = transformer.window_size
@@ -1140,9 +1152,12 @@ class Locoformer(Module):
 
         advantage = rearrange(advantage, '... -> ... 1')
 
+        past_action = pad_at_dim(action, (1, -1), dim = -2)
+
         data_tensors = (
             state,
             action,
+            past_action,
             old_action_log_prob,
             reward,
             old_value,
@@ -1171,6 +1186,7 @@ class Locoformer(Module):
         for (
             state,
             action,
+            past_action,
             old_action_log_prob,
             reward,
             old_value,
@@ -1180,12 +1196,10 @@ class Locoformer(Module):
             *rest
         ) in zip(*windowed_tensors):
 
-            batch = state.shape[0]
-
             if has_condition:
                 condition, = rest
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, past_action = past_action if self.embed_past_action else None, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
@@ -1225,7 +1239,7 @@ class Locoformer(Module):
 
                 state_pred_loss = self.state_pred_head.calculate_loss(state_pred, state_labels, return_unreduced_loss = True)
 
-                windowed_state_pred_loss = state_pred_loss[mask[:, :-1]].mean() / total_learnable_tokens # todo - calculate denom correctly
+                windowed_state_pred_loss = state_pred_loss[loss_mask].sum() / total_learnable_tokens # todo - calculate denom correctly
 
                 windowed_actor_loss = (
                     windowed_actor_loss +
@@ -1414,6 +1428,7 @@ class Locoformer(Module):
         state: Tensor,
         cache: Cache | None = None,
         condition: Tensor | None = None,
+        past_action: Tensor | None = None,
         state_embed_kwargs: dict = dict(),
         action_select_kwargs: dict = dict(),
         detach_cache = False,
@@ -1424,6 +1439,11 @@ class Locoformer(Module):
 
         state = state.to(self.device)
 
+        # move condition
+
+        if exists(condition):
+            condition = condition.to(self.device)
+
         # determine which function to invoke for state to token for transformer
 
         state_to_token = self.embedder
@@ -1431,6 +1451,19 @@ class Locoformer(Module):
         # embed
 
         tokens = state_to_token(state, **state_embed_kwargs)
+
+        # maybe add past action
+
+        is_first_window = not exists(cache)
+
+        if exists(past_action):
+            assert self.embed_past_action
+            past_action_embed = self.past_action_embedder(past_action, **action_select_kwargs)
+
+            if is_first_window:
+                past_action_embed = pad_at_dim(past_action_embed[..., 1:, :], (1, 0), dim = -2)
+
+            tokens = tokens + past_action_embed
 
         # time
 
