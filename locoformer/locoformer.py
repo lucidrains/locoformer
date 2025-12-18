@@ -1020,12 +1020,12 @@ class Locoformer(Module):
 
         action_embedder = None
         if isinstance(unembedder, dict):
-            action_embedder, readout = EmbedAndReadout(
+            action_embedder, unembedder = EmbedAndReadout(
                 readout_kwargs = dict(auto_squeeze_single_output = False),
                 **unembedder,
             )
 
-        self.unembedder = readout
+        self.unembedder = unembedder
 
         # embedding past actions
 
