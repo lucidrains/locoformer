@@ -57,6 +57,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t, *args, **kwargs):
+    return t
+
 def first(arr):
     return arr[0]
 
@@ -636,7 +639,7 @@ class StateEmbedder(nn.Module):
         def __init__(
             self,
             dim,
-            dim_state,
+            dim_state: tuple[int, ...] | int,
             num_internal_state = None,
             internal_state_selectors = None
         ):
@@ -654,7 +657,9 @@ class StateEmbedder(nn.Module):
                 nn.Linear(dim_hidden, dim)
             )
 
-            self.state_to_token = MLP(dim_state, 64, bias = False)
+            dim_states = (dim_state,) if not isinstance(dim_state, (tuple, list)) else dim_state
+
+            self.state_to_token = ModuleList([MLP(dim_state, 64, bias = False) for dim_state in dim_states])
 
             # internal state embeds for each robot
 
@@ -671,6 +676,7 @@ class StateEmbedder(nn.Module):
             self,
             state,
             state_type,
+            state_id = 0,
             internal_state = None,
             internal_state_selector_id: int | None = None
         ):
@@ -678,7 +684,8 @@ class StateEmbedder(nn.Module):
             if state_type == 'image':
                 token_embeds = self.image_to_token(state)
             elif state_type == 'raw':
-                token_embeds = self.state_to_token(state)
+                state_to_token = self.state_to_token[state_id]
+                token_embeds = state_to_token(state)
             else:
                 raise ValueError('invalid state type')
 
@@ -838,6 +845,7 @@ class Locoformer(Module):
         replay,
         state_embed_kwargs: dict,
         action_select_kwargs: dict,
+        state_id_kwarg: dict = dict(),
         batch_size = 16,
         epochs = 2,
         use_vision = False,
@@ -852,7 +860,7 @@ class Locoformer(Module):
 
         self, dl, *optims = accelerator.prepare(self, dl, *optims)
 
-        for _ in range(epochs):
+        for epoch in range(epochs):
             for data in dl:
 
                 data = SimpleNamespace(**data)
@@ -869,6 +877,7 @@ class Locoformer(Module):
                     optims = optims,
                     state_embed_kwargs = state_embed_kwargs,
                     action_select_kwargs = action_select_kwargs,
+                    state_id_kwarg = state_id_kwarg,
                     compute_state_pred_loss = compute_state_pred_loss,
                     accelerator = accelerator
                 )
@@ -896,6 +905,7 @@ class Locoformer(Module):
         optims: list[Optimizer] | None = None,
         state_embed_kwargs: dict = dict(),
         action_select_kwargs: dict = dict(),
+        state_id_kwarg: dict = dict(),
         compute_state_pred_loss = True,
         accelerator = None,
         max_grad_norm = 0.5
@@ -959,7 +969,7 @@ class Locoformer(Module):
             if has_condition:
                 condition, = rest
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, past_action = past_action if self.embed_past_action else None, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, past_action = past_action if self.embed_past_action else None, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
@@ -1076,7 +1086,7 @@ class Locoformer(Module):
 
         return stack(rewards)
 
-    def wrap_env_functions(self, env):
+    def wrap_env_functions(self, env, transform_step_output = identity):
 
         def transform_output(el):
             if isinstance(el, ndarray):
@@ -1089,7 +1099,8 @@ class Locoformer(Module):
         def wrapped_reset(*args, **kwargs):
             env_reset_out =  env.reset(*args, **kwargs)
 
-            return tree_map(transform_output, env_reset_out)
+            env_reset_out_torch = tree_map(transform_output, env_reset_out)
+            return transform_step_output(env_reset_out_torch, env)
 
         def wrapped_step(action, *args, **kwargs):
 
@@ -1103,10 +1114,13 @@ class Locoformer(Module):
 
             env_step_out_torch = tree_map(transform_output, env_step_out)
 
+            if self.has_reward_shaping:
+                shaped_rewards = self.state_and_command_to_rewards(env_step_out_torch)
+
+            env_step_out_torch = transform_step_output(env_step_out_torch, env)
+
             if not self.has_reward_shaping:
                 return env_step_out_torch
-
-            shaped_rewards = self.state_and_command_to_rewards(env_step_out_torch)
 
             return env_step_out_torch, shaped_rewards
 
@@ -1183,6 +1197,128 @@ class Locoformer(Module):
 
         return stateful_forward, initial_logits
 
+    @beartype
+    def gather_experience_from_env_(
+        self,
+        wrapped_env_functions: tuple[Callable, Callable],
+        replay: ReplayBuffer,
+        embed_past_action = False,
+        max_timesteps = -1,
+        use_vision = False,
+        action_select_kwargs: dict = dict(),
+        state_embed_kwargs: dict = dict(),
+        state_id_kwarg: dict = dict(),
+        state_entropy_bonus_weight = 0.
+    ):
+
+        env_reset, env_step = wrapped_env_functions
+
+        state_image, (state, *_) = env_reset()
+
+        timestep = 0
+
+        stateful_forward = self.get_stateful_forward(
+            has_batch_dim = False,
+            has_time_dim = False,
+            inference_mode = True
+        )
+
+        cum_rewards = 0.
+
+        with replay.one_episode() as final_meta_data_store_dict:
+
+            past_action = None
+
+            while True:
+
+                rand_command = torch.randn(2)
+
+                # predict next action
+
+                state_for_model = state_image if use_vision else state
+
+                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, past_action = past_action if embed_past_action else None, condition = rand_command, return_values = True, return_state_pred = True)
+
+                action = self.unembedder.sample(action_logits, **action_select_kwargs)
+
+                # pass to environment
+
+                next_state_image, (next_state, reward, terminated, truncated, *_) = env_step(action)
+
+                # maybe state entropy bonus
+
+                if state_entropy_bonus_weight > 0. and exists(state_pred):
+
+                    entropy = self.state_pred_head.entropy(state_pred)
+
+                    state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum()
+
+                    reward = reward + state_entropy_bonus.item() # the entropy is directly related to log variance
+
+                # cum rewards
+
+                cum_rewards += reward
+
+                # append to memory
+
+                exceeds_max_timesteps = max_timesteps >= 0 and timestep == (max_timesteps - 1)
+                done = truncated or terminated or tensor(exceeds_max_timesteps)
+
+                # get log prob of action
+
+                action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
+
+                memory = replay.store(
+                    state = state,
+                    state_image = state_image,
+                    action = action,
+                    action_log_prob = action_log_prob,
+                    reward = reward,
+                    value = value,
+                    done = done,
+                    learnable = tensor(True),
+                    condition = rand_command
+                )
+
+                # increment counters
+
+                timestep += 1
+
+                # break if done or exceed max timestep
+
+                if done:
+
+                    # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
+                    # only if terminated signal not detected
+
+                    if not terminated:
+                        next_state_for_model = next_state_image if use_vision else next_state
+
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs)
+
+                        memory = memory._replace(
+                            state = next_state,
+                            state_image = next_state_image,
+                            value = next_value,
+                            reward = next_value,
+                            learnable = tensor(False)
+                        )
+
+                        replay.store(**memory._asdict())
+
+                    # store the final cumulative reward into meta data
+
+                    final_meta_data_store_dict.update(cum_rewards = cum_rewards)
+
+                    break
+
+                state = next_state
+                state_image = next_state_image
+
+                past_action = action
+
+        return cum_rewards
+
     def forward(
         self,
         state: Tensor,
@@ -1191,6 +1327,7 @@ class Locoformer(Module):
         past_action: Tensor | None = None,
         state_embed_kwargs: dict = dict(),
         action_select_kwargs: dict = dict(),
+        state_id_kwarg: dict = dict(),
         detach_cache = False,
         return_values = False,
         return_state_pred = False,
@@ -1210,7 +1347,7 @@ class Locoformer(Module):
 
         # embed
 
-        tokens = state_to_token(state, **state_embed_kwargs)
+        tokens = state_to_token(state, **state_embed_kwargs, **state_id_kwarg)
 
         # maybe add past action
 

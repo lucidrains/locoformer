@@ -56,11 +56,10 @@ def get_snapshot(env, shape):
 # main function
 
 def main(
-    env_index = 0,
+    num_learning_cycles = 1_000,
     num_episodes_before_learn = 64,
-    num_episodes = 50_000,
     max_timesteps = 500,
-    replay_buffer_size = 5_000,
+    replay_buffer_size = 128,
     use_vision = False,
     embed_past_action = False,
     vision_height_width_dim = 64,
@@ -87,75 +86,19 @@ def main(
         ('CartPole-v1', False),
     ]
 
-    env_name, continuous = envs[env_index]
-
     # accelerate
 
     accelerator = Accelerator()
     device = accelerator.device
 
-    # environment
+    # model
 
-    env_kwargs = dict()
-    if continuous:
-        env_kwargs = dict(continuous = continuous)
-
-    env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
-
-    if clear_video:
-        rmtree(video_folder, ignore_errors = True)
-
-    env = gym.wrappers.RecordVideo(
-        env = env,
-        video_folder = video_folder,
-        name_prefix = 'lunar-video',
-        episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
-        disable_logger = True
-    )
-
-    dim_state = env.observation_space.shape[0]
-    dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
-    num_actions = env.action_space.n if not continuous else env.action_space.shape[0]
-
-    # memory
-
-    replay = ReplayBuffer(
-        'replay',
-        replay_buffer_size,
-        max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
-        fields = dict(
-            state       = ('float', dim_state),
-            state_image = ('float', dim_state_image_shape),
-            action      = ('int', 1) if not continuous else ('float', num_actions),
-            action_log_prob = ('float', 1 if not continuous else num_actions),
-            reward      = 'float',
-            value       = 'float',
-            done        = 'bool',
-            learnable   = 'bool',
-            condition   = ('float', 2)
-        ),
-        meta_fields = dict(
-            cum_rewards = 'float'
-        )
-    )
-
-    # state embed kwargs
-
-    if use_vision:
-        state_embed_kwargs = dict(state_type = 'image')
-        compute_state_pred_loss = False
-    else:
-        state_embed_kwargs = dict(state_type = 'raw')
-        compute_state_pred_loss = True
-
-    # networks
-
-    action_select_kwargs = dict(selector_index = env_index)
+    env_index_to_state_id = [0, 0, 1]
 
     locoformer = Locoformer(
         embedder = dict(
             dim = 64,
-            dim_state = dim_state
+            dim_state = [8, 4] # 8 for lunar lander, 4 for cartpole
         ),
         unembedder = dict(
             dim = 64,
@@ -200,144 +143,117 @@ def main(
 
     optims = [optim_base, optim_actor, optim_critic]
 
-    # able to wrap the env for all values to torch tensors and back
-    # all environments should follow usual MDP interface, domain randomization should be given at instantiation
-
-    env_reset, env_step = locoformer.wrap_env_functions(env)
-
     # loop
 
-    pbar = tqdm(range(num_episodes))
+    pbar = tqdm(range(num_learning_cycles), desc = 'learning cycles')
 
-    for episodes_index in pbar:
+    for learn_cycle in pbar:
 
-        state, *_ = env_reset()
+        env_index = learn_cycle % len(envs)
 
-        state_image = get_snapshot(env, dim_state_image_shape[1:])
+        # environment
 
-        timestep = 0
+        env_name, continuous = envs[env_index]
 
-        stateful_forward = locoformer.get_stateful_forward(
-            has_batch_dim = False,
-            has_time_dim = False,
-            inference_mode = True
+        pbar.set_description(f'environment: {env_name} {"continuous" if continuous else "discrete"}')
+
+        env_kwargs = dict()
+        if continuous:
+            env_kwargs = dict(continuous = continuous)
+
+        env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
+
+        if clear_video:
+            rmtree(video_folder, ignore_errors = True)
+
+        env = gym.wrappers.RecordVideo(
+            env = env,
+            video_folder = video_folder,
+            name_prefix = 'lunar-video',
+            episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
+            disable_logger = True
         )
 
-        cum_rewards = 0.
+        dim_state = env.observation_space.shape[0]
+        dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
+        num_actions = env.action_space.n if not continuous else env.action_space.shape[0]
 
-        with replay.one_episode() as final_meta_data_store_dict:
+        # memory
 
-            past_action = None
+        replay = ReplayBuffer(
+            'replay',
+            replay_buffer_size,
+            max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
+            fields = dict(
+                state       = ('float', dim_state),
+                state_image = ('float', dim_state_image_shape),
+                action      = ('int', 1) if not continuous else ('float', num_actions),
+                action_log_prob = ('float', 1 if not continuous else num_actions),
+                reward      = 'float',
+                value       = 'float',
+                done        = 'bool',
+                learnable   = 'bool',
+                condition   = ('float', 2)
+            ),
+            meta_fields = dict(
+                cum_rewards = 'float'
+            )
+        )
 
-            while True:
+        # state embed kwargs
 
-                rand_command = torch.randn(2)
+        if use_vision:
+            state_embed_kwargs = dict(state_type = 'image')
+            compute_state_pred_loss = False
+        else:
+            state_embed_kwargs = dict(state_type = 'raw')
+            compute_state_pred_loss = True
 
-                # predict next action
+        # networks
 
-                state_for_model = state_image if use_vision else state
+        action_select_kwargs = dict(selector_index = env_index)
 
-                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, past_action = past_action if embed_past_action else None, condition = rand_command, return_values = True, return_state_pred = True)
+        state_id_kwarg = dict(state_id = env_index_to_state_id[env_index])
 
-                action = locoformer.unembedder.sample(action_logits, **action_select_kwargs)
+        # able to wrap the env for all values to torch tensors and back
+        # all environments should follow usual MDP interface, domain randomization should be given at instantiation
 
-                # pass to environment
+        def get_snapshot_from_env(step_output, env):
+            snapshot = get_snapshot(env, dim_state_image_shape[1:])
+            return snapshot, step_output
 
-                next_state, reward, terminated, truncated, *_ = env_step(action)
+        wrapped_env_functions = locoformer.wrap_env_functions(env, transform_step_output = get_snapshot_from_env)
 
-                next_state_image = get_snapshot(env, dim_state_image_shape[1:])
+        for _ in tqdm(range(num_episodes_before_learn), leave = False):
 
-                # maybe state entropy bonus
+            cum_reward = locoformer.gather_experience_from_env_(
+                wrapped_env_functions,
+                replay,
+                use_vision = use_vision,
+                action_select_kwargs = action_select_kwargs,
+                state_embed_kwargs = state_embed_kwargs,
+                state_id_kwarg = state_id_kwarg,
+                state_entropy_bonus_weight = state_entropy_bonus_weight,
+                embed_past_action = embed_past_action
+            )
 
-                if state_entropy_bonus_weight > 0. and exists(state_pred):
+            pbar.set_postfix(reward = f'{cum_reward:.2f}')
 
-                    entropy = locoformer.state_pred_head.entropy(state_pred)
+        # learn if hit the number of learn timesteps
 
-                    state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum()
+        locoformer.learn(
+            optims,
+            accelerator,
+            replay,
+            state_embed_kwargs,
+            action_select_kwargs,
+            state_id_kwarg,
+            batch_size,
+            epochs,
+            use_vision,
+            compute_state_pred_loss
+        )
 
-                    reward = reward + state_entropy_bonus.item() # the entropy is directly related to log variance
-
-                # cum rewards
-
-                cum_rewards += reward
-
-                # append to memory
-
-                exceeds_max_timesteps = timestep == (max_timesteps - 1)
-                done = truncated or terminated or tensor(exceeds_max_timesteps)
-
-                # get log prob of action
-
-                action_log_prob = locoformer.unembedder.log_prob(action_logits, action, **action_select_kwargs)
-
-                memory = replay.store(
-                    state = state,
-                    state_image = state_image,
-                    action = action,
-                    action_log_prob = action_log_prob,
-                    reward = reward,
-                    value = value,
-                    done = done,
-                    learnable = tensor(True),
-                    condition = rand_command
-                )
-
-                # increment counters
-
-                timestep += 1
-
-                # break if done or exceed max timestep
-
-                if done:
-
-                    # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
-                    # only if terminated signal not detected
-
-                    if not terminated:
-                        next_state_for_model = next_state_image if use_vision else next_state
-
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs)
-
-                        memory = memory._replace(
-                            state = next_state,
-                            state_image = next_state_image,
-                            value = next_value,
-                            reward = next_value,
-                            learnable = tensor(False)
-                        )
-
-                        replay.store(**memory._asdict())
-
-                    # store the final cumulative reward into meta data
-
-                    final_meta_data_store_dict.update(cum_rewards = cum_rewards)
-
-                    break
-
-                state = next_state
-                state_image = next_state_image
-
-                past_action = action
-
-            # update pbar
-
-            pbar.set_postfix(reward = f'{cum_rewards:.2f}')
-
-            # learn if hit the number of learn timesteps
-
-            if divisible_by(episodes_index + 1, num_episodes_before_learn):
-
-                locoformer.learn(
-                    optims,
-                    accelerator,
-                    replay,
-                    state_embed_kwargs,
-                    action_select_kwargs,
-                    batch_size,
-                    epochs,
-                    use_vision,
-                    compute_state_pred_loss
-                )
 # main
 
 if __name__ == '__main__':

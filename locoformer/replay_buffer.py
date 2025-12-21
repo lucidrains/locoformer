@@ -141,7 +141,7 @@ class RemappedReplayDataset(Dataset):
         self.episode_mapping = episode_mapping
         self.shuffle_episodes = shuffle_episodes
 
-        assert not (exists(num_trials_select) and num_trials_select >= 1)
+        assert not (exists(num_trials_select) and num_trials_select <= 0)
         self.sub_select_trials = exists(num_trials_select)
         self.num_trials_select = num_trials_select
 
@@ -353,7 +353,7 @@ class ReplayBuffer:
 
         assert datapoint.shape == self.shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
 
-        self.memmaps[name][self.episode_index, self.timestep_index] = datapoint
+        self.memmaps[name][episode_index, timestep_index] = datapoint
 
     def store(
         self,
