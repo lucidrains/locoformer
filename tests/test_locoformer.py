@@ -57,7 +57,7 @@ def test_locoformer(
         assert logits.shape == (3, 1, 256)
 
 def test_replay():
-    from locoformer.locoformer import ReplayBuffer
+    from locoformer.replay_buffer import ReplayBuffer
 
     replay_buffer = ReplayBuffer(
         './replay_data',

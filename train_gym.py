@@ -24,19 +24,13 @@ from torch import nn
 from torch.nn import Module
 from torch import from_numpy, randint, tensor, is_tensor, stack, arange
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
-from torch.distributions import Normal
 
 from einops import rearrange, einsum
-from einops.layers.torch import Rearrange, Reduce
 
-from locoformer.locoformer import (
-    Locoformer,
-    ReplayBuffer
-)
+from locoformer.locoformer import Locoformer
 
-from discrete_continuous_embed_readout import Embed
+from locoformer.replay_buffer import ReplayBuffer
 
 from x_mlps_pytorch import Feedforwards, MLP
 
@@ -58,52 +52,6 @@ def get_snapshot(env, shape):
     vision_state = rearrange(vision_state, 'h w c -> 1 c h w')
     reshaped = F.interpolate(vision_state, shape, mode = 'bilinear')
     return rearrange(reshaped / 255., '1 c h w -> c h w')
-
-# learn
-
-def learn(
-    model,
-    optims,
-    accelerator,
-    replay,
-    state_embed_kwargs: dict,
-    action_select_kwargs: dict,
-    batch_size = 16,
-    epochs = 2,
-    use_vision = False,
-    compute_state_pred_loss = False
-):
-    state_field = 'state_image' if use_vision else 'state'
-
-    dl = replay.dataloader(
-        batch_size = batch_size,
-        shuffle = True
-    )
-
-    model, dl, *optims = accelerator.prepare(model, dl, *optims)
-
-    for _ in range(epochs):
-        for data in dl:
-
-            data = SimpleNamespace(**data)
-
-            actor_loss, critic_loss = model.ppo(
-                state = getattr(data, state_field),
-                action = data.action,
-                old_action_log_prob = data.action_log_prob,
-                reward = data.reward,
-                old_value = data.value,
-                mask = data.learnable,
-                condition = data.condition,
-                episode_lens = data._lens,
-                optims = optims,
-                state_embed_kwargs = state_embed_kwargs,
-                action_select_kwargs = action_select_kwargs,
-                compute_state_pred_loss = compute_state_pred_loss,
-                accelerator = accelerator
-            )
-
-            accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
 
 # main function
 
@@ -191,63 +139,6 @@ def main(
         )
     )
 
-    class StateEmbedder(nn.Module):
-        def __init__(
-            self,
-            dim,
-            dim_state,
-            num_internal_state = None,
-            internal_state_selectors = None
-        ):
-            super().__init__()
-            dim_hidden = dim * 2
-
-            self.image_to_token = nn.Sequential(
-                Rearrange('b t c h w -> b c t h w'),
-                nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
-                nn.ReLU(),
-                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
-                nn.ReLU(),
-                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
-                Reduce('b c t h w -> b t c', 'mean'),
-                nn.Linear(dim_hidden, dim)
-            )
-
-            self.state_to_token = MLP(dim_state, 64, bias = False)
-
-            # internal state embeds for each robot
-
-            self.internal_state_embedder = None
-
-            if exists(num_internal_state) and exists(internal_state_selectors):
-                self.internal_state_embedder = Embed(
-                    dim_state,
-                    num_continuous = num_internal_state,
-                    internal_state_selectors = internal_state_selectors
-                )
-
-        def forward(
-            self,
-            state,
-            state_type,
-            internal_state = None,
-            internal_state_selector_id: int | None = None
-        ):
-
-            if state_type == 'image':
-                token_embeds = self.image_to_token(state)
-            elif state_type == 'raw':
-                token_embeds = self.state_to_token(state)
-            else:
-                raise ValueError('invalid state type')
-
-            if exists(internal_state_selector_id):
-                internal_state_embed = self.internal_state_embedder(internal_state, selector_id = internal_state_selector_id)
-
-                token_embeds = token_embeds + internal_state_embed
-
-            return token_embeds
-
     # state embed kwargs
 
     if use_vision:
@@ -262,7 +153,10 @@ def main(
     action_select_kwargs = dict(selector_index = env_index)
 
     locoformer = Locoformer(
-        embedder = StateEmbedder(64, dim_state),
+        embedder = dict(
+            dim = 64,
+            dim_state = dim_state
+        ),
         unembedder = dict(
             dim = 64,
             num_discrete = 6,
@@ -433,8 +327,7 @@ def main(
 
             if divisible_by(episodes_index + 1, num_episodes_before_learn):
 
-                learn(
-                    locoformer,
+                locoformer.learn(
                     optims,
                     accelerator,
                     replay,

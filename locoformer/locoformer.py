@@ -27,7 +27,7 @@ from torch.optim import Optimizer
 
 import einx
 from einops import rearrange, einsum, reduce
-from einops.layers.torch import Rearrange
+from einops.layers.torch import Rearrange, Reduce
 
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -40,6 +40,8 @@ from x_mlps_pytorch import MLP
 from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import EmbedAndReadout, Readout
+
+from .replay_buffer import ReplayBuffer
 
 # constants
 
@@ -303,354 +305,6 @@ def create_sliding_mask(
 
     create_kwargs = dict(device = device) if exists(device) else dict()
     return create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True, **create_kwargs)
-
-# data
-
-def collate_var_time(data):
-
-    datum = first(data)
-    keys = datum.keys()
-
-    all_tensors = zip(*[datum.values() for datum in data])
-
-    collated_values = []
-
-    for key, tensors in zip(keys, all_tensors):
-
-        # the episode lens have zero dimension - think of a cleaner way to handle this later
-
-        if key != '_lens':
-
-            times = [t.shape[0] for t in tensors]
-            max_time = max(times)
-            tensors = [pad_at_dim(t, (0, max_time - t.shape[0]), dim = 0) for t in tensors]
-
-        collated_values.append(stack(tensors))
-
-    return dict(zip(keys, collated_values))
-
-class ReplayDataset(Dataset):
-    def __init__(
-        self,
-        folder: str | Path,
-        fields: tuple[str, ...] | None = None
-    ):
-        if isinstance(folder, str):
-            folder = Path(folder)
-
-        episode_lens = folder / 'episode_lens.data.meta.npy'
-        self.episode_lens = open_memmap(str(episode_lens), mode = 'r')
-
-        # get indices of non-zero lengthed episodes
-
-        nonzero_episodes = self.episode_lens > 0
-        self.indices = np.arange(self.episode_lens.shape[-1])[nonzero_episodes]
-
-        # get all data files
-
-        filepaths = [*folder.glob('*.data.npy')]
-        assert len(filepaths) > 0
-
-        fieldname_to_filepath = {path.name.split('.')[0]: path for path in filepaths}
-
-        fieldnames_from_files = set(fieldname_to_filepath.keys())
-
-        fields = default(fields, fieldnames_from_files)
-
-        self.memmaps = dict()
-
-        for field in fields:
-            assert field in fieldnames_from_files, f'invalid field {field} - must be one of {fieldnames_from_files}'
-
-            path = fieldname_to_filepath[field]
-
-            self.memmaps[field] = open_memmap(str(path), mode = 'r')
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        episode_index = self.indices[idx]
-
-        episode_len = self.episode_lens[episode_index]
-
-        data = {field: from_numpy(memmap[episode_index, :episode_len].copy()) for field, memmap in self.memmaps.items()}
-
-        data['_lens'] = tensor(episode_len)
-        return data
-
-class RemappedReplayDataset(Dataset):
-    def __init__(
-        self,
-        dataset: ReplayDataset,
-        episode_mapping: Tensor | list[list[int]],
-        shuffle_episodes = False,
-        num_trials_select = None
-    ):
-        assert len(dataset) > 0
-        self.dataset = dataset
-
-        if is_tensor(episode_mapping):
-            assert episode_mapping.dtype in (torch.int, torch.long) and episode_mapping.ndim == 2
-            episode_mapping = episode_mapping.tolist()
-
-        self.episode_mapping = episode_mapping
-        self.shuffle_episodes = shuffle_episodes
-
-        assert not (exists(num_trials_select) and num_trials_select >= 1)
-        self.sub_select_trials = exists(num_trials_select)
-        self.num_trials_select = num_trials_select
-
-    def __len__(self):
-        return len(self.episode_mapping)
-
-    def __getitem__(self, idx):
-
-        episode_indices = self.episode_mapping[idx]
-
-        episode_indices = tensor(episode_indices)
-        episode_indices = episode_indices[(episode_indices >= 0) & (episode_indices < len(self.dataset))]
-
-        assert not is_empty(episode_indices)
-
-        # shuffle the episode indices if either shuffle episodes is turned on, or `num_trial_select` passed in (for sub selecting episodes from a set)
-
-        if (
-            episode_indices.numel() > 1 and
-            (self.shuffle_episodes or self.sub_select_trials)
-        ):
-            num_episodes = len(episode_indices)
-            episode_indices = episode_indices[torch.randperm(num_episodes)]
-
-        # crop out the episodes
-
-        if self.sub_select_trials:
-            episode_indices = episode_indices[:self.num_trials_select]
-
-        # now select out the episode data and merge along time
-
-        episode_data = [self.dataset[i] for i in episode_indices.tolist()]
-
-        episode_lens = stack([data.pop('_lens') for data in episode_data])
-
-        keys = first(episode_data).keys()
-
-        values = [list(data.values()) for data in episode_data]
-
-        values = [cat(field_values) for field_values in zip(*values)] # concat across time
-
-        multi_episode_data = dict(zip(keys, values))
-
-        multi_episode_data['_lens'] = episode_lens.sum()
-
-        multi_episode_data['_episode_indices'] = cat([torch.full((episode_len,), episode_index) for episode_len, episode_index in zip(episode_lens, episode_indices)])
-
-        return multi_episode_data
-
-class ReplayBuffer:
-
-    @beartype
-    def __init__(
-        self,
-        folder: str | Path,
-        max_episodes: int,
-        max_timesteps: int,
-        fields: dict[
-            str,
-            str | tuple[str, int | tuple[int, ...]]
-        ],
-        meta_fields: dict[
-            str,
-            str | tuple[str, int | tuple[int, ...]]
-        ] = dict()
-    ):
-
-        # folder for data
-
-        if not isinstance(folder, Path):
-            folder = Path(folder)
-            folder.mkdir(exist_ok = True)
-
-        self.folder = folder
-        assert folder.is_dir()
-
-        # keeping track of episode length
-
-        self.episode_index = 0
-        self.timestep_index = 0
-
-        self.max_episodes = max_episodes
-        self.max_timesteps= max_timesteps
-
-        assert not 'episode_lens' in meta_fields
-        meta_fields.update(episode_lens = 'int')
-
-        # create the memmap for meta data tracks
-
-        self.meta_shapes = dict()
-        self.meta_dtypes = dict()
-        self.meta_memmaps = dict()
-        self.meta_fieldnames = set(meta_fields.keys())
-
-        def parse_field_info(field_info):
-            # some flexibility
-
-            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
-
-            dtype_str, shape = field_info
-            assert dtype_str in {'int', 'float', 'bool'}
-
-            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
-            return dtype, shape
-
-        for field_name, field_info in meta_fields.items():
-
-            dtype, shape = parse_field_info(field_info)
-
-            # memmap file
-
-            filepath = folder / f'{field_name}.data.meta.npy'
-
-            if isinstance(shape, int):
-                shape = (shape,)
-
-            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, *shape))
-
-            self.meta_memmaps[field_name] = memmap
-            self.meta_shapes[field_name] = shape
-            self.meta_dtypes[field_name] = dtype
-
-        # create the memmap for individual data tracks
-
-        self.shapes = dict()
-        self.dtypes = dict()
-        self.memmaps = dict()
-        self.fieldnames = set(fields.keys())
-
-        for field_name, field_info in fields.items():
-
-            dtype, shape = parse_field_info(field_info)
-
-            # memmap file
-
-            filepath = folder / f'{field_name}.data.npy'
-
-            if isinstance(shape, int):
-                shape = (shape,)
-
-            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
-
-            self.memmaps[field_name] = memmap
-            self.shapes[field_name] = shape
-            self.dtypes[field_name] = dtype
-
-        self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
-
-    def __len__(self):
-        return (self.episode_lens > 0).sum().item()
-
-    @property
-    def episode_lens(self):
-        return self.meta_memmaps['episode_lens']
-
-    def reset_(self):
-        self.episode_lens[:] = 0
-        self.episode_index = 0
-        self.timestep_index = 0
-
-    def advance_episode(self):
-        self.episode_index = (self.episode_index + 1) % self.max_episodes
-        self.timestep_index = 0
-
-    def flush(self):
-        self.episode_lens[self.episode_index] = self.timestep_index
-
-        for memmap in self.memmaps.values():
-            memmap.flush()
-
-        self.episode_lens.flush()
-
-    @contextmanager
-    def one_episode(self):
-
-        # storing data before exiting the context
-
-        final_meta_data_store = dict()
-
-        yield final_meta_data_store
-
-        # store meta data for use in constructing sequences for learning
-
-        for key, value in final_meta_data_store.items():
-            assert key in self.meta_memmaps, f'{key} not defined in `meta_fields` on init'
-
-            self.meta_memmaps[key][self.episode_index] = value
-
-        # flush and advance
-
-        self.flush()
-        self.advance_episode()
-
-    @beartype
-    def store_datapoint(
-        self,
-        episode_index: int,
-        timestep_index: int,
-        name: str,
-        datapoint: Tensor | ndarray
-    ):
-        assert 0 <= episode_index < self.max_episodes
-        assert 0 <= timestep_index < self.max_timesteps
-
-        if is_tensor(datapoint):
-            datapoint = datapoint.detach().cpu().numpy()
-
-        assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
-
-        assert datapoint.shape == self.shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
-
-        self.memmaps[name][self.episode_index, self.timestep_index] = datapoint
-
-    def store(
-        self,
-        **data
-    ):
-        assert is_bearable(data, dict[str, Tensor | ndarray])
-
-        assert not self.timestep_index >= self.max_timesteps, 'you exceeded the `max_timesteps` set on the replay buffer'
-
-        for name, datapoint in data.items():
-
-            self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
-
-        self.timestep_index += 1
-
-        return self.memory_namedtuple(**data)
-
-    def dataset(
-        self,
-        episode_mapping: Tensor | list[list[int]] | None = None,
-        fields: tuple[str, ...] | None = None
-    ) -> Dataset:
-        self.flush()
-
-        dataset = ReplayDataset(self.folder, fields)
-
-        if not exists(episode_mapping):
-            return dataset
-
-        return RemappedReplayDataset(dataset, episode_mapping)
-
-    def dataloader(
-        self,
-        batch_size,
-        episode_mapping: Tensor | list[list[int]] | None = None,
-        fields: tuple[str, ...] | None = None,
-        **kwargs
-    ) -> DataLoader:
-        self.flush()
-
-        return DataLoader(self.dataset(episode_mapping, fields), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
 
 # normalization + conditioning (needed for the commands to the robot)
 
@@ -976,12 +630,71 @@ class TransformerXL(Module):
 
         return embed, (next_kv_cache, next_gru_hiddens)
 
+# state embedder
+
+class StateEmbedder(nn.Module):
+        def __init__(
+            self,
+            dim,
+            dim_state,
+            num_internal_state = None,
+            internal_state_selectors = None
+        ):
+            super().__init__()
+            dim_hidden = dim * 2
+
+            self.image_to_token = nn.Sequential(
+                Rearrange('b t c h w -> b c t h w'),
+                nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
+                nn.ReLU(),
+                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+                nn.ReLU(),
+                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+                Reduce('b c t h w -> b t c', 'mean'),
+                nn.Linear(dim_hidden, dim)
+            )
+
+            self.state_to_token = MLP(dim_state, 64, bias = False)
+
+            # internal state embeds for each robot
+
+            self.internal_state_embedder = None
+
+            if exists(num_internal_state) and exists(internal_state_selectors):
+                self.internal_state_embedder = Embed(
+                    dim_state,
+                    num_continuous = num_internal_state,
+                    internal_state_selectors = internal_state_selectors
+                )
+
+        def forward(
+            self,
+            state,
+            state_type,
+            internal_state = None,
+            internal_state_selector_id: int | None = None
+        ):
+
+            if state_type == 'image':
+                token_embeds = self.image_to_token(state)
+            elif state_type == 'raw':
+                token_embeds = self.state_to_token(state)
+            else:
+                raise ValueError('invalid state type')
+
+            if exists(internal_state_selector_id):
+                internal_state_embed = self.internal_state_embedder(internal_state, selector_id = internal_state_selector_id)
+
+                token_embeds = token_embeds + internal_state_embed
+
+            return token_embeds
+
 # class
 
 class Locoformer(Module):
     def __init__(
         self,
-        embedder: Module,
+        embedder: dict | Module,
         unembedder: dict | Readout,
         transformer: dict | TransformerXL,
         *,
@@ -1013,6 +726,9 @@ class Locoformer(Module):
         self.transformer = transformer
 
         # handle state embedder
+
+        if isinstance(embedder, dict):
+            embedder = StateEmbedder(**embedder)
 
         self.embedder = embedder
 
@@ -1114,6 +830,50 @@ class Locoformer(Module):
             return []
 
         return self.to_value_pred.parameters()
+
+    def learn(
+        self,
+        optims,
+        accelerator,
+        replay,
+        state_embed_kwargs: dict,
+        action_select_kwargs: dict,
+        batch_size = 16,
+        epochs = 2,
+        use_vision = False,
+        compute_state_pred_loss = False
+    ):
+        state_field = 'state_image' if use_vision else 'state'
+
+        dl = replay.dataloader(
+            batch_size = batch_size,
+            shuffle = True
+        )
+
+        self, dl, *optims = accelerator.prepare(self, dl, *optims)
+
+        for _ in range(epochs):
+            for data in dl:
+
+                data = SimpleNamespace(**data)
+
+                actor_loss, critic_loss = self.ppo(
+                    state = getattr(data, state_field),
+                    action = data.action,
+                    old_action_log_prob = data.action_log_prob,
+                    reward = data.reward,
+                    old_value = data.value,
+                    mask = data.learnable,
+                    condition = data.condition,
+                    episode_lens = data._lens,
+                    optims = optims,
+                    state_embed_kwargs = state_embed_kwargs,
+                    action_select_kwargs = action_select_kwargs,
+                    compute_state_pred_loss = compute_state_pred_loss,
+                    accelerator = accelerator
+                )
+
+                accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
 
     def evolve(
         self,
