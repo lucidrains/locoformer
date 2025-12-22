@@ -1203,7 +1203,7 @@ class Locoformer(Module):
         wrapped_env_functions: tuple[Callable, Callable],
         replay: ReplayBuffer,
         embed_past_action = False,
-        max_timesteps = -1,
+        max_timesteps = None,
         use_vision = False,
         action_select_kwargs: dict = dict(),
         state_embed_kwargs: dict = dict(),
@@ -1214,8 +1214,9 @@ class Locoformer(Module):
         env_reset, env_step = wrapped_env_functions
 
         state_image, (state, *_) = env_reset()
-
         timestep = 0
+
+        max_timesteps = default(max_timesteps, replay.max_timesteps)
 
         stateful_forward = self.get_stateful_forward(
             has_batch_dim = False,

@@ -78,6 +78,9 @@ def main(
     reward_range = (-300., 300.)
 ):
 
+    if clear_video:
+        rmtree(video_folder, ignore_errors = True)
+
     # possible envs
 
     envs = [
@@ -163,13 +166,10 @@ def main(
 
         env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
 
-        if clear_video:
-            rmtree(video_folder, ignore_errors = True)
-
         env = gym.wrappers.RecordVideo(
             env = env,
             video_folder = video_folder,
-            name_prefix = 'lunar-video',
+            name_prefix = f'{learn_cycle}-lunar-video',
             episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
             disable_logger = True
         )
@@ -229,6 +229,7 @@ def main(
             cum_reward = locoformer.gather_experience_from_env_(
                 wrapped_env_functions,
                 replay,
+                max_timesteps = max_timesteps,
                 use_vision = use_vision,
                 action_select_kwargs = action_select_kwargs,
                 state_embed_kwargs = state_embed_kwargs,
