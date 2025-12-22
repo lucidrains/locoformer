@@ -84,9 +84,9 @@ def main(
     # possible envs
 
     envs = [
-        ('CartPole-v1', False),
-        ('LunarLander-v3', False),
-        ('LunarLander-v3', True),
+        ('CartPole-v1', False, 1),
+        ('LunarLander-v3', False, 0),
+        ('LunarLander-v3', True), 0,
     ]
 
     # accelerate
@@ -95,8 +95,6 @@ def main(
     device = accelerator.device
 
     # model
-
-    env_index_to_state_id = [1, 0, 0]
 
     locoformer = Locoformer(
         embedder = dict(
@@ -156,7 +154,7 @@ def main(
 
         # environment
 
-        env_name, continuous = envs[env_index]
+        env_name, continuous, state_id = envs[env_index]
 
         pbar.set_description(f'environment: {env_name} {"continuous" if continuous else "discrete"}')
 
@@ -209,11 +207,11 @@ def main(
             state_embed_kwargs = dict(state_type = 'raw')
             compute_state_pred_loss = True
 
-        # networks
+        # specific embodiment state id and action selector id
+
+        state_id_kwarg = dict(state_id = state_id)
 
         action_select_kwargs = dict(selector_index = env_index)
-
-        state_id_kwarg = dict(state_id = env_index_to_state_id[env_index])
 
         # able to wrap the env for all values to torch tensors and back
         # all environments should follow usual MDP interface, domain randomization should be given at instantiation
