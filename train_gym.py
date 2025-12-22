@@ -212,7 +212,6 @@ def main(
                 reward      = 'float',
                 value       = 'float',
                 done        = 'bool',
-                learnable   = 'bool',
                 condition   = ('float', 2)
             ),
             meta_fields = dict(

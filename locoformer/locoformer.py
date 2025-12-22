@@ -855,6 +855,8 @@ class Locoformer(Module):
     ):
         state_field = 'state_image' if use_vision else 'state'
 
+        episode_mapping = None
+
         if exists(maybe_construct_trial_from_buffer):
             episode_mapping = maybe_construct_trial_from_buffer(replay)
 
@@ -874,10 +876,10 @@ class Locoformer(Module):
                 actor_loss, critic_loss = self.ppo(
                     state = getattr(data, state_field),
                     action = data.action,
-                    old_action_log_prob = data.action_log_prob,
+                    action_log_prob = data.action_log_prob,
                     reward = data.reward,
-                    old_value = data.value,
-                    mask = data.learnable,
+                    value = data.value,
+                    done = data.done,
                     condition = data.condition,
                     episode_lens = data._lens,
                     optims = optims,
@@ -902,10 +904,10 @@ class Locoformer(Module):
         self,
         state,
         action,
-        old_action_log_prob,
+        action_log_prob,
         reward,
-        old_value,
-        mask,
+        value,
+        done,
         episode_lens,
         condition: Tensor | None = None,
         optims: list[Optimizer] | None = None,
@@ -917,12 +919,14 @@ class Locoformer(Module):
         max_grad_norm = 0.5
     ):
         window_size = self.window_size
+        mask = ~done
         total_learnable_tokens = mask.sum().item()
 
         seq_len = state.shape[1]
-        gae_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
+        padding_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
+        gae_mask = padding_mask & mask
 
-        advantage, returns = calc_gae(reward, old_value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
+        advantage, returns = calc_gae(reward, value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
         advantage = normalize(advantage)
 
@@ -934,9 +938,9 @@ class Locoformer(Module):
             state,
             action,
             past_action,
-            old_action_log_prob,
+            action_log_prob,
             reward,
-            old_value,
+            value,
             mask,
             advantage,
             returns
@@ -1266,15 +1270,14 @@ class Locoformer(Module):
 
                 cum_rewards += reward
 
-                # append to memory
+                # increment counters
+                # we will store the step with done=False, as only the bootstrap/boundary node is done=True
 
                 exceeds_max_timesteps = max_timesteps >= 0 and timestep == (max_timesteps - 1)
-                done = truncated or terminated or tensor(exceeds_max_timesteps)
-
+                should_stop = truncated or terminated or tensor(exceeds_max_timesteps)
                 # get log prob of action
 
                 action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
-
                 memory = replay.store(
                     state = state,
                     state_image = state_image,
@@ -1282,36 +1285,40 @@ class Locoformer(Module):
                     action_log_prob = action_log_prob,
                     reward = reward,
                     value = value,
-                    done = done,
-                    learnable = tensor(True),
+                    done = tensor(False),
                     condition = rand_command
                 )
-
-                # increment counters
 
                 timestep += 1
 
                 # break if done or exceed max timestep
-
-                if done:
+                if should_stop:
 
                     # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
                     # only if terminated signal not detected
-
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
                         _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
-
-                        memory = memory._replace(
+                        bootstrap_node = memory._replace(
                             state = next_state,
                             state_image = next_state_image,
                             value = next_value,
                             reward = next_value,
-                            learnable = tensor(False)
+                            done = tensor(True)
                         )
 
-                        replay.store(**memory._asdict())
+                        replay.store(**bootstrap_node._asdict())
+                    else:
+                        # terminal node - store a step with 0 reward and value, and done=True, to stop GAE scan
+                        terminal_node = memory._replace(
+                            state = next_state,
+                            state_image = next_state_image,
+                            value = torch.zeros_like(value),
+                            reward = torch.zeros_like(reward),
+                            done = tensor(True)
+                        )
+                        replay.store(**terminal_node._asdict())
 
                     # store the final cumulative reward into meta data
 
