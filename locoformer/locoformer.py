@@ -838,6 +838,7 @@ class Locoformer(Module):
 
         return self.to_value_pred.parameters()
 
+    @beartype
     def learn(
         self,
         optims,
@@ -849,18 +850,23 @@ class Locoformer(Module):
         batch_size = 16,
         epochs = 2,
         use_vision = False,
-        compute_state_pred_loss = False
+        compute_state_pred_loss = False,
+        maybe_construct_trial_from_buffer: Callable[[ReplayBuffer], Tensor] | None = None
     ):
         state_field = 'state_image' if use_vision else 'state'
 
+        if exists(maybe_construct_trial_from_buffer):
+            episode_mapping = maybe_construct_trial_from_buffer(replay)
+
         dl = replay.dataloader(
             batch_size = batch_size,
-            shuffle = True
+            shuffle = True,
+            episode_mapping = episode_mapping
         )
 
         self, dl, *optims = accelerator.prepare(self, dl, *optims)
 
-        for epoch in range(epochs):
+        for _ in range(epochs):
             for data in dl:
 
                 data = SimpleNamespace(**data)

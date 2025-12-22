@@ -224,6 +224,7 @@ class ReplayBuffer:
         self.episode_index = 0
         self.timestep_index = 0
 
+        self.num_episodes = 0
         self.max_episodes = max_episodes
         self.max_timesteps= max_timesteps
 
@@ -309,6 +310,7 @@ class ReplayBuffer:
     def advance_episode(self):
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0
+        self.num_episodes += 1
 
     def flush(self):
         self.episode_lens[self.episode_index] = self.timestep_index
