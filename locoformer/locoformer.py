@@ -1275,9 +1275,11 @@ class Locoformer(Module):
 
                 exceeds_max_timesteps = max_timesteps >= 0 and timestep == (max_timesteps - 1)
                 should_stop = truncated or terminated or tensor(exceeds_max_timesteps)
+
                 # get log prob of action
 
                 action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
+
                 memory = replay.store(
                     state = state,
                     state_image = state_image,
@@ -1300,7 +1302,7 @@ class Locoformer(Module):
                         next_state_for_model = next_state_image if use_vision else next_state
 
                         _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
-                        bootstrap_node = memory._replace(
+                        terminal_node = dict(
                             state = next_state,
                             state_image = next_state_image,
                             value = next_value,
@@ -1308,17 +1310,19 @@ class Locoformer(Module):
                             done = tensor(True)
                         )
 
-                        replay.store(**bootstrap_node._asdict())
                     else:
                         # terminal node - store a step with 0 reward and value, and done=True, to stop GAE scan
-                        terminal_node = memory._replace(
+                        terminal_node = dict(
                             state = next_state,
                             state_image = next_state_image,
                             value = torch.zeros_like(value),
                             reward = torch.zeros_like(reward),
                             done = tensor(True)
                         )
-                        replay.store(**terminal_node._asdict())
+
+                    terminal_memory = memory._replace(**terminal_node)
+
+                    replay.store(**terminal_memory._asdict())
 
                     # store the final cumulative reward into meta data
 
