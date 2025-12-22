@@ -84,9 +84,9 @@ def main(
     # possible envs
 
     envs = [
+        ('CartPole-v1', False),
         ('LunarLander-v3', False),
         ('LunarLander-v3', True),
-        ('CartPole-v1', False),
     ]
 
     # accelerate
@@ -96,7 +96,7 @@ def main(
 
     # model
 
-    env_index_to_state_id = [0, 0, 1]
+    env_index_to_state_id = [1, 0, 0]
 
     locoformer = Locoformer(
         embedder = dict(
@@ -108,9 +108,9 @@ def main(
             num_discrete = 6,
             num_continuous = 3,
             selectors = [
+                [[4, 5]],        # cart pole discrete
                 [[0, 1, 2, 3]],  # lunar lander discrete
                 [0, 1],          # lunar lander continuous
-                [[4, 5]],        # cart pole discrete
             ]
         ),
         state_pred_network = Feedforwards(dim = 64, depth = 1),
@@ -169,7 +169,7 @@ def main(
         env = gym.wrappers.RecordVideo(
             env = env,
             video_folder = video_folder,
-            name_prefix = f'{learn_cycle}-lunar-video',
+            name_prefix = f'{learn_cycle}-env-video',
             episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
             disable_logger = True
         )

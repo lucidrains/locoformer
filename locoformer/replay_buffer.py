@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+from shutil import rmtree
 from contextlib import contextmanager
 from collections import namedtuple
 from typing import Callable
@@ -292,6 +293,9 @@ class ReplayBuffer:
 
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
+
+    def clear(self):
+        rmtree(str(self.folder), ignore_errors = True)
 
     @property
     def episode_lens(self):

@@ -1295,7 +1295,7 @@ class Locoformer(Module):
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs)
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
 
                         memory = memory._replace(
                             state = next_state,
