@@ -53,6 +53,27 @@ def get_snapshot(env, shape):
     reshaped = F.interpolate(vision_state, shape, mode = 'bilinear')
     return rearrange(reshaped / 255., '1 c h w -> c h w')
 
+# a contrived inter-trial construction
+# it randomly selects pairs of episodes, and then order them with increasing cumulative rewards
+# allow researchers to construct it however they wish
+
+def create_episode_mapping_from_replay(buffer):
+    episodes = torch.arange(buffer.num_episodes)
+    cum_rewards = torch.from_numpy(buffer.meta_memmaps['cum_rewards'][:buffer.num_episodes])
+
+    # pair the episode previous with the next episode, just for testing
+
+    two_episodes = torch.stack((episodes, torch.roll(episodes, 1, dims = (0,))), dim = -1)
+    two_cum_rewards  = torch.stack((cum_rewards, torch.roll(cum_rewards, 1, dims = (0,))), dim = -1)
+
+    # now we sort and rearrange the episode indices
+
+    sorted_cum_rewards = two_cum_rewards.sort(dim = -1).indices
+
+    paired_episodes_sorted_by_cum_reward = two_episodes.gather(-1, sorted_cum_rewards)
+
+    return paired_episodes_sorted_by_cum_reward
+
 # main function
 
 def main(
@@ -75,7 +96,8 @@ def main(
     state_entropy_bonus_weight = .05,
     batch_size = 16,
     epochs = 3,
-    reward_range = (-300., 300.)
+    reward_range = (-300., 300.),
+    test_episode_mapping_constructor = False
 ):
 
     if clear_video:
@@ -86,7 +108,7 @@ def main(
     envs = [
         ('CartPole-v1', False, 1),
         ('LunarLander-v3', False, 0),
-        ('LunarLander-v3', True), 0,
+        ('LunarLander-v3', True, 0),
     ]
 
     # accelerate
@@ -250,7 +272,8 @@ def main(
             batch_size,
             epochs,
             use_vision,
-            compute_state_pred_loss
+            compute_state_pred_loss,
+            create_episode_mapping_from_replay if test_episode_mapping_constructor else None
         )
 
 # main
