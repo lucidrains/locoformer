@@ -39,9 +39,9 @@ from x_mlps_pytorch import MLP
 
 from x_evolution import EvoStrategy
 
-from discrete_continuous_embed_readout import EmbedAndReadout, Readout
+from discrete_continuous_embed_readout import EmbedAndReadout, Embed, Readout
 
-from .replay_buffer import ReplayBuffer
+from locoformer.replay_buffer import ReplayBuffer
 
 # constants
 
@@ -635,66 +635,77 @@ class TransformerXL(Module):
 
 # state embedder
 
-class StateEmbedder(nn.Module):
-        def __init__(
-            self,
-            dim,
-            dim_state: tuple[int, ...] | int,
-            num_internal_state = None,
-            internal_state_selectors = None
-        ):
-            super().__init__()
-            dim_hidden = dim * 2
+class StateEmbedder(Module):
+    @beartype
+    def __init__(
+        self,
+        dim,
+        dim_state: tuple[int, ...] | list[int] | int,
+        num_internal_states: int | None = None,
+        internal_states_selectors: list[list[int]] | None = None
+    ):
+        super().__init__()
+        dim_hidden = dim * 2
 
-            self.image_to_token = nn.Sequential(
-                Rearrange('b t c h w -> b c t h w'),
-                nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
-                nn.ReLU(),
-                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
-                nn.ReLU(),
-                nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
-                Reduce('b c t h w -> b t c', 'mean'),
-                nn.Linear(dim_hidden, dim)
+        self.image_to_token = nn.Sequential(
+            Rearrange('b t c h w -> b c t h w'),
+            nn.Conv3d(3, dim_hidden, (1, 7, 7), padding = (0, 3, 3)),
+            nn.ReLU(),
+            nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+            nn.ReLU(),
+            nn.Conv3d(dim_hidden, dim_hidden, (1, 3, 3), stride = (1, 2, 2), padding = (0, 1, 1)),
+            Reduce('b c t h w -> b t c', 'mean'),
+            nn.Linear(dim_hidden, dim)
+        )
+
+        dim_states = (dim_state,) if not isinstance(dim_state, (tuple, list)) else dim_state
+
+        self.state_to_token = ModuleList([MLP(dim_state, dim, bias = False) for dim_state in dim_states])
+
+        # internal state embeds for each robot
+
+        self.internal_state_embedder = None
+
+        if exists(num_internal_states) and exists(internal_states_selectors):
+            self.internal_state_embedder = Embed(
+                dim,
+                num_continuous = num_internal_states,
+                selectors = internal_states_selectors
             )
 
-            dim_states = (dim_state,) if not isinstance(dim_state, (tuple, list)) else dim_state
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
-            self.state_to_token = ModuleList([MLP(dim_state, 64, bias = False) for dim_state in dim_states])
+    def forward(
+        self,
+        state,
+        state_type,
+        state_id = 0,
+        internal_state = None,
+        internal_state_selector_id: int | None = None
+    ):
 
-            # internal state embeds for each robot
+        if state_type == 'image':
+            token_embeds = self.image_to_token(state)
+        elif state_type == 'raw':
+            state_to_token = self.state_to_token[state_id]
+            token_embeds = state_to_token(state)
+        else:
+            raise ValueError('invalid state type')
 
-            self.internal_state_embedder = None
-
-            if exists(num_internal_state) and exists(internal_state_selectors):
-                self.internal_state_embedder = Embed(
-                    dim_state,
-                    num_continuous = num_internal_state,
-                    internal_state_selectors = internal_state_selectors
-                )
-
-        def forward(
-            self,
-            state,
-            state_type,
-            state_id = 0,
-            internal_state = None,
-            internal_state_selector_id: int | None = None
+        if (
+            exists(internal_state_selector_id) and
+            exists(internal_state) and
+            exists(self.internal_state_embedder)
         ):
+            internal_state = internal_state.to(self.device)
 
-            if state_type == 'image':
-                token_embeds = self.image_to_token(state)
-            elif state_type == 'raw':
-                state_to_token = self.state_to_token[state_id]
-                token_embeds = state_to_token(state)
-            else:
-                raise ValueError('invalid state type')
+            internal_state_embed = self.internal_state_embedder(internal_state, selector_index = internal_state_selector_id)
 
-            if exists(internal_state_selector_id):
-                internal_state_embed = self.internal_state_embedder(internal_state, selector_id = internal_state_selector_id)
+            token_embeds = token_embeds + internal_state_embed
 
-                token_embeds = token_embeds + internal_state_embed
-
-            return token_embeds
+        return token_embeds
 
 # class
 
@@ -875,6 +886,7 @@ class Locoformer(Module):
 
                 actor_loss, critic_loss = self.ppo(
                     state = getattr(data, state_field),
+                    internal_state = data.internal_state,
                     action = data.action,
                     action_log_prob = data.action_log_prob,
                     reward = data.reward,
@@ -903,6 +915,7 @@ class Locoformer(Module):
     def ppo(
         self,
         state,
+        internal_state,
         action,
         action_log_prob,
         reward,
@@ -936,6 +949,7 @@ class Locoformer(Module):
 
         data_tensors = (
             state,
+            internal_state,
             action,
             past_action,
             action_log_prob,
@@ -965,6 +979,7 @@ class Locoformer(Module):
 
         for (
             state,
+            internal_state,
             action,
             past_action,
             old_action_log_prob,
@@ -979,7 +994,7 @@ class Locoformer(Module):
             if has_condition:
                 condition, = rest
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, past_action = past_action if self.embed_past_action else None, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, past_action = past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
@@ -1096,7 +1111,12 @@ class Locoformer(Module):
 
         return stack(rewards)
 
-    def wrap_env_functions(self, env, transform_step_output = identity):
+    @beartype
+    def wrap_env_functions(
+        self,
+        env,
+        env_output_transforms: dict[str, Callable] = []
+    ):
 
         def transform_output(el):
             if isinstance(el, ndarray):
@@ -1110,7 +1130,13 @@ class Locoformer(Module):
             env_reset_out =  env.reset(*args, **kwargs)
 
             env_reset_out_torch = tree_map(transform_output, env_reset_out)
-            return transform_step_output(env_reset_out_torch, env)
+
+            derived_states = dict()
+
+            for derived_name, transform in env_output_transforms.items():
+                derived_states[derived_name] = transform(env_reset_out_torch, env)
+
+            return (derived_states, *env_reset_out_torch)
 
         def wrapped_step(action, *args, **kwargs):
 
@@ -1127,7 +1153,12 @@ class Locoformer(Module):
             if self.has_reward_shaping:
                 shaped_rewards = self.state_and_command_to_rewards(env_step_out_torch)
 
-            env_step_out_torch = transform_step_output(env_step_out_torch, env)
+            derived_states = dict()
+
+            for derived_name, transform in env_output_transforms.items():
+                derived_states[derived_name] = transform(env_step_out_torch, env)
+
+            env_step_out_torch = (derived_states, *env_step_out_torch)
 
             if not self.has_reward_shaping:
                 return env_step_out_torch
@@ -1223,7 +1254,11 @@ class Locoformer(Module):
 
         env_reset, env_step = wrapped_env_functions
 
-        state_image, (state, *_) = env_reset()
+        derived, state, *_ = env_reset()
+
+        state_image = derived.get('state_image', None)
+        internal_state = derived.get('internal_state', None)
+
         timestep = 0
 
         max_timesteps = default(max_timesteps, replay.max_timesteps)
@@ -1248,13 +1283,16 @@ class Locoformer(Module):
 
                 state_for_model = state_image if use_vision else state
 
-                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = state_embed_kwargs, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, past_action = past_action if embed_past_action else None, condition = rand_command, return_values = True, return_state_pred = True)
+                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, past_action = past_action if embed_past_action else None, condition = rand_command, return_values = True, return_state_pred = True)
 
                 action = self.unembedder.sample(action_logits, **action_select_kwargs)
 
                 # pass to environment
 
-                next_state_image, (next_state, reward, terminated, truncated, *_) = env_step(action)
+                derived, next_state, reward, terminated, truncated, *_ = env_step(action)
+
+                next_state_image = derived.get('state_image', None)
+                next_internal_state = derived.get('internal_state', None)
 
                 # maybe state entropy bonus
 
@@ -1285,6 +1323,7 @@ class Locoformer(Module):
                     state_image = state_image,
                     action = action,
                     action_log_prob = action_log_prob,
+                    internal_state = next_internal_state,
                     reward = reward,
                     value = value,
                     done = tensor(False),
@@ -1301,7 +1340,8 @@ class Locoformer(Module):
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = state_embed_kwargs, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+
                         terminal_node = dict(
                             state = next_state,
                             state_image = next_state_image,
@@ -1332,6 +1372,7 @@ class Locoformer(Module):
 
                 state = next_state
                 state_image = next_state_image
+                internal_state = next_internal_state
 
                 past_action = action
 

@@ -13,8 +13,6 @@ from fire import Fire
 from shutil import rmtree
 from tqdm import tqdm
 
-from types import SimpleNamespace
-
 from accelerate import Accelerator
 
 import gymnasium as gym
@@ -79,6 +77,7 @@ def create_episode_mapping_from_replay(buffer):
 def main(
     num_learning_cycles = 1_000,
     num_episodes_before_learn = 64,
+    alternate_env_every = 1,
     max_timesteps = 500,
     replay_buffer_size = 128,
     use_vision = False,
@@ -97,7 +96,8 @@ def main(
     batch_size = 16,
     epochs = 3,
     reward_range = (-300., 300.),
-    test_episode_mapping_constructor = False
+    test_episode_mapping_constructor = False,
+    test_mock_internal_states = False
 ):
 
     if clear_video:
@@ -121,7 +121,13 @@ def main(
     locoformer = Locoformer(
         embedder = dict(
             dim = 64,
-            dim_state = [8, 4] # 8 for lunar lander, 4 for cartpole
+            dim_state = [8, 4], # 8 for lunar lander, 4 for cartpole
+            num_internal_states = 4,
+            internal_states_selectors = [
+                [0, 1],
+                [2, 3],
+                [0, 3]
+            ]
         ),
         unembedder = dict(
             dim = 64,
@@ -172,7 +178,7 @@ def main(
 
     for learn_cycle in pbar:
 
-        env_index = learn_cycle % len(envs)
+        env_index = (learn_cycle // alternate_env_every) % len(envs)
 
         # environment
 
@@ -212,7 +218,8 @@ def main(
                 reward      = 'float',
                 value       = 'float',
                 done        = 'bool',
-                condition   = ('float', 2)
+                condition   = ('float', 2),
+                internal_state = ('float', 2)
             ),
             meta_fields = dict(
                 cum_rewards = 'float'
@@ -234,14 +241,29 @@ def main(
 
         action_select_kwargs = dict(selector_index = env_index)
 
+        if test_mock_internal_states:
+            state_id_kwarg.update(internal_state_selector_id = state_id)
+
         # able to wrap the env for all values to torch tensors and back
         # all environments should follow usual MDP interface, domain randomization should be given at instantiation
 
         def get_snapshot_from_env(step_output, env):
-            snapshot = get_snapshot(env, dim_state_image_shape[1:])
-            return snapshot, step_output
+            return get_snapshot(env, dim_state_image_shape[1:])
 
-        wrapped_env_functions = locoformer.wrap_env_functions(env, transform_step_output = get_snapshot_from_env)
+        transforms = dict(state_image = get_snapshot_from_env)
+
+        # for testing of embedding shared internal states of robots across bodies
+
+        def derive_internal_state(step_output, env):
+            state, *_ = step_output
+            return state[:2]
+
+        transforms.update(internal_state = derive_internal_state)
+
+        wrapped_env_functions = locoformer.wrap_env_functions(
+            env,
+            env_output_transforms = transforms
+        )
 
         for _ in tqdm(range(num_episodes_before_learn), leave = False):
 
