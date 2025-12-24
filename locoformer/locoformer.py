@@ -26,7 +26,7 @@ from torch.distributions import Normal
 from torch.optim import Optimizer
 
 import einx
-from einops import rearrange, einsum, reduce
+from einops import rearrange, repeat, einsum, reduce
 from einops.layers.torch import Rearrange, Reduce
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -632,6 +632,124 @@ class TransformerXL(Module):
         next_kv_cache = next_kv_cache[..., -self.window_size:, :]
 
         return embed, (next_kv_cache, next_gru_hiddens)
+
+# simply 2 layer memory mlp
+# following ttt/titans
+
+from torch.func import functional_call, grad, vmap
+
+class MemoryMLP(Module):
+    def __init__(
+        self,
+        dim,
+        expansion_factor = 4.
+    ):
+        super().__init__()
+
+        dim_hidden = int(dim * expansion_factor)
+
+        self.norm = nn.RMSNorm(dim)
+
+        # queries, keys, values
+
+        self.to_queries = Linear(dim, dim, bias = False)
+        self.to_key_values = Linear(dim, dim * 2, bias = False)
+
+        # memory mlp
+
+        self.mlp = MLP(dim, dim_hidden, dim, activation = nn.SiLU())
+
+        # initial params
+
+        self.init_mlp_params = dict(self.mlp.named_parameters())
+
+        # grad for storing
+
+        def retrieve_fn(params, queries: Tensor):
+            return functional_call(self.mlp, params, queries)
+
+        def loss_fn(params, inputs: tuple[Tensor, Tensor, Tensor]):
+            keys, values, learning_rate = inputs
+            pred = functional_call(self.mlp, params, keys)
+            loss = F.mse_loss(pred, values, reduction = 'none')
+            loss = loss * learning_rate
+            return loss.mean()
+
+        self.grad_fn = vmap(grad(loss_fn), in_dims = (0, None))
+
+        self.retrieve_fn = vmap(retrieve_fn, in_dims = (0, 0))
+
+        # forgetting
+
+        self.to_forget_gate = nn.Sequential(
+            Reduce('b n d -> b d', 'mean'),
+            nn.Linear(dim, 1, bias = False),
+            Rearrange('b 1 -> b')
+        )
+
+        # loss weight / learning rate
+
+        self.to_loss_weight = nn.Linear(dim, 1, bias = False)
+
+    def get_init_mlp_params(
+        self,
+        batch_size
+    ):
+        return {name: repeat(params, '... -> b ...', b = batch_size) for name, params in self.init_mlp_params.items()}
+
+    def store(
+        self,
+        tokens, # (b n d)
+        memories: dict[str, Tensor] | None = None
+    ):
+
+        batch_size = tokens.shape[0]
+
+        if not exists(memories):
+            memories = self.get_init_mlp_params(batch_size)
+
+        tokens = self.norm(tokens)
+
+        keys, values = self.to_key_values(tokens).chunk(2, dim = -1)
+
+        loss_weight = self.to_loss_weight(tokens)
+
+        grad = self.grad_fn(memories, (keys, values, loss_weight))
+
+        # prepare forget
+
+        forget = self.to_forget_gate(tokens)
+
+        # update memories
+
+        next_memories = dict()
+
+        for param_name, past_memory in memories.items():
+            change = grad[param_name]
+
+            past_memory = einx.multiply('b, b ...', forget, past_memory)
+
+            next_memories[param_name] = past_memory + change
+
+        return next_memories
+
+    def forward(
+        self,
+        tokens, # (b n d)
+        memories: dict[str, Tensor] | None = None
+    ):
+        batch_size = tokens.shape[0]
+
+        if not exists(memories):
+            memories = self.get_init_mlp_params(batch_size)
+
+        tokens = self.norm(tokens)
+
+        queries = self.to_queries(tokens)
+
+        retrieved = self.retrieve_fn(memories, queries)
+
+        return retrieved
 
 # state embedder
 
