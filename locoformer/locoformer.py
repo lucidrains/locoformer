@@ -512,6 +512,7 @@ class FeedForward(Module):
         return self.proj_out(x)
 
 class TransformerXL(Module):
+    @beartype
     def __init__(
         self,
         dim,
@@ -523,10 +524,20 @@ class TransformerXL(Module):
         dim_cond = None,
         final_norm = True,
         fixed_window_size = False,
-        gru_layers = False
+        gru_layers = False,
+        long_term_mem_layers: tuple[int, ...] = (),
+        mem_kwargs: dict = dict()
     ):
         super().__init__()
         self.dim = dim
+
+        # memory
+
+        long_term_mem_layers = set(long_term_mem_layers)
+
+        assert all([1 <= l <= depth for l in long_term_mem_layers])
+
+        # condition
 
         condition = exists(dim_cond)
 
@@ -534,19 +545,25 @@ class TransformerXL(Module):
 
         norm_fn = partial(MaybeAdaRMSNormWrapper, dim = dim, dim_cond = (dim * 2) if condition else None) 
 
+        # layers
+
         layers = ModuleList([])
 
         for i in range(depth):
-            is_first = i == 0
+            layer = i + 1
+            is_first = layer == 1
+            has_mem = layer in long_term_mem_layers
 
             gru = norm_fn(nn.GRU(dim, dim, batch_first = True)) if gru_layers else None
+
+            mem = MemoryMLP(dim, **mem_kwargs) if has_mem else None
 
             attn = norm_fn(Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first))
 
             ff = norm_fn(FeedForward(dim = dim, expansion_factor = expansion_factor))
 
             layers.append(ModuleList([
-                gru, attn, ff
+                gru, mem, attn, ff
             ]))
 
         self.layers = layers
@@ -566,6 +583,8 @@ class TransformerXL(Module):
         return_kv_cache = False,
         condition: Tensor | None = None
     ):
+
+        is_first_window = not exists(cache)
 
         # cache and residuals
 
@@ -596,7 +615,7 @@ class TransformerXL(Module):
 
         # layers
 
-        for (maybe_gru, attn, ff), layer_gru_cache, layer_kv_cache in zip(self.layers, gru_cache, kv_cache):
+        for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_kv_cache in zip(self.layers, gru_cache, kv_cache):
 
             # handle maybe rnn
 
@@ -605,6 +624,17 @@ class TransformerXL(Module):
                 x = rnn_out + x
 
                 next_gru_hiddens.append(gru_hiddens)
+
+            # maybe handle retrieving
+
+            is_mem_layer = exists(maybe_mem)
+
+            if (
+                is_first_window and
+                is_mem_layer
+            ):
+                retrieved_mem = maybe_mem(x)
+                x = x + retrieved_mem
 
             # attention
 

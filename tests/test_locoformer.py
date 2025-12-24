@@ -12,10 +12,12 @@ from locoformer.locoformer import Locoformer
 @param('gru_layers', (False, True))
 @param('recurrent_cache', (False, True))
 @param('has_commands', (False, True))
+@param('long_term_mem_layers', ((), (1, 2)))
 def test_locoformer(
     gru_layers,
     recurrent_cache,
     has_commands,
+    long_term_mem_layers
 ):
     
     model = Locoformer(
@@ -27,10 +29,11 @@ def test_locoformer(
         recurrent_cache = recurrent_cache,
         transformer = dict(
             dim = 128,
-            depth = 1,
+            depth = 2,
             window_size = 512,
             gru_layers = gru_layers,
-            dim_cond = 2 if has_commands else None
+            dim_cond = 2 if has_commands else None,
+            long_term_mem_layers = long_term_mem_layers
         )
     )
 
