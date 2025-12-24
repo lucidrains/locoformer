@@ -653,7 +653,11 @@ class MemoryMLP(Module):
         # queries, keys, values
 
         self.to_queries = Linear(dim, dim, bias = False)
-        self.to_key_values = Linear(dim, dim * 2, bias = False)
+
+        self.to_key_values = nn.Sequential(
+            Linear(dim, dim * 2, bias = False),
+            nn.SiLU()
+        )
 
         # memory mlp
 
