@@ -219,3 +219,26 @@ def test_unified_state():
     logits, cache = model(state1, state_embed_kwargs = dict(state_type = 0))
     logits, cache = model(state2, state_embed_kwargs = dict(state_type = 1), cache = cache)
     logits, cache = model(state1, state_embed_kwargs = dict(state_type = 0), cache = cache)
+
+def test_memory():
+    from locoformer.locoformer import MemoryMLP
+
+    memory = MemoryMLP(512)
+
+    tokens = torch.randn(2, 32, 512)
+
+    memories = None
+
+    retrieved = memory(tokens, memories)
+
+    tokens = tokens + retrieved
+
+    memories = memory.store(tokens, memories)
+
+    retrieved = memory(tokens, memories)
+
+    tokens = tokens + retrieved
+
+    memories = memory.store(tokens, memories)
+
+    assert tokens.shape == (2, 32, 512)
