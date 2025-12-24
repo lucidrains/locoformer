@@ -633,7 +633,7 @@ class TransformerXL(Module):
 
         return embed, (next_kv_cache, next_gru_hiddens)
 
-# simply 2 layer memory mlp
+# simple 2 layer memory mlp
 # following ttt/titans
 
 from torch.func import functional_call, grad, vmap
@@ -653,7 +653,11 @@ class MemoryMLP(Module):
         # queries, keys, values
 
         self.to_queries = Linear(dim, dim, bias = False)
-        self.to_key_values = Linear(dim, dim * 2, bias = False)
+
+        self.to_key_values = nn.Sequential(
+            Linear(dim, dim * 2, bias = False),
+            nn.SiLU()
+        )
 
         # memory mlp
 
