@@ -537,6 +537,10 @@ class TransformerXL(Module):
 
         assert all([1 <= l <= depth for l in long_term_mem_layers])
 
+        self.long_term_mem_layers = long_term_mem_layers
+        self.num_mem_mlps = len(long_term_mem_layers)
+        self.has_mem = self.num_mem_mlps > 0
+
         # condition
 
         condition = exists(dim_cond)
@@ -590,16 +594,18 @@ class TransformerXL(Module):
 
         num_layers = len(self.layers)
 
-        kv_cache = gru_cache = None
+        kv_cache = gru_cache = mem_mlp_cache = None
 
         if exists(cache):
-            kv_cache, gru_cache = cache
+            kv_cache, gru_cache, mem_mlp_cache = cache
 
         kv_cache = default(kv_cache, (None,) * num_layers)
         gru_cache = default(gru_cache, (None,) * num_layers)
+        mem_mlp_cache = default(mem_mlp_cache, (None,) * num_layers)
 
         next_kv_caches = []
         next_gru_hiddens = [] if self.gru_layers else None
+        next_mem_mlp_cache = [] if self.has_mem else None
 
         value_residual = None
 
@@ -615,7 +621,7 @@ class TransformerXL(Module):
 
         # layers
 
-        for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_kv_cache in zip(self.layers, gru_cache, kv_cache):
+        for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache):
 
             # handle maybe rnn
 
@@ -633,7 +639,7 @@ class TransformerXL(Module):
                 is_first_window and
                 is_mem_layer
             ):
-                retrieved_mem = maybe_mem(x)
+                retrieved_mem = maybe_mem(x, layer_mem_mlp)
                 x = x + retrieved_mem
 
             # attention
@@ -641,6 +647,16 @@ class TransformerXL(Module):
             attn_out, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, return_kv_cache = True)
 
             x = attn_out + x
+
+            # handle storing of memory
+
+            if self.has_mem:
+                next_mem_mlp = None
+
+                if is_mem_layer:
+                    next_mem_mlp = maybe_mem.store(x, layer_mem_mlp)
+
+                next_mem_mlp_cache.append(next_mem_mlp)
 
             # feedforward
 
@@ -661,7 +677,7 @@ class TransformerXL(Module):
 
         next_kv_cache = next_kv_cache[..., -self.window_size:, :]
 
-        return embed, (next_kv_cache, next_gru_hiddens)
+        return embed, (next_kv_cache, next_gru_hiddens, next_mem_mlp_cache)
 
 # simple 2 layer memory mlp
 # following ttt/titans
@@ -718,7 +734,8 @@ class MemoryMLP(Module):
         self.to_forget_gate = nn.Sequential(
             Reduce('b n d -> b d', 'mean'),
             nn.Linear(dim, 1, bias = False),
-            Rearrange('b 1 -> b')
+            Rearrange('b 1 -> b'),
+            nn.Sigmoid()
         )
 
         # loss weight / learning rate
@@ -1635,7 +1652,7 @@ class Locoformer(Module):
 
         window_size = self.window_size
 
-        kv_cache, gru_cache = cache
+        kv_cache, gru_cache, mem_mlp_cache = cache
 
         if self.fixed_window_size or divisible_by(next_timestep, window_size * 2):
             kv_cache = kv_cache[..., -window_size:, :]
@@ -1648,6 +1665,6 @@ class Locoformer(Module):
             if exists(gru_cache):
                 gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
-        cache = (kv_cache, gru_cache)
+        cache = (kv_cache, gru_cache, mem_mlp_cache)
 
         return out, (next_timestep, cache)
