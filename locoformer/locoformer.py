@@ -636,7 +636,7 @@ class TransformerXL(Module):
             is_mem_layer = exists(maybe_mem)
 
             if (
-                is_first_window and
+                not is_first_window and
                 is_mem_layer
             ):
                 retrieved_mem = maybe_mem(x, layer_mem_mlp)
@@ -725,7 +725,7 @@ class MemoryMLP(Module):
             loss = loss * learning_rate
             return loss.mean()
 
-        self.grad_fn = vmap(grad(loss_fn), in_dims = (0, None))
+        self.grad_fn = vmap(grad(loss_fn), in_dims = (0, (0, 0, 0)))
 
         self.retrieve_fn = vmap(retrieve_fn, in_dims = (0, 0))
 
@@ -780,7 +780,7 @@ class MemoryMLP(Module):
 
             past_memory = einx.multiply('b, b ...', forget, past_memory)
 
-            next_memories[param_name] = past_memory + change
+            next_memories[param_name] = past_memory - change
 
         return next_memories
 
