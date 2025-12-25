@@ -725,7 +725,7 @@ class MemoryMLP(Module):
             loss = loss * learning_rate
             return loss.mean()
 
-        self.grad_fn = vmap(grad(loss_fn), in_dims = (0, None))
+        self.grad_fn = vmap(grad(loss_fn), in_dims = (0, (0, 0, 0)))
 
         self.retrieve_fn = vmap(retrieve_fn, in_dims = (0, 0))
 

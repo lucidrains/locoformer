@@ -79,7 +79,8 @@ model = Locoformer(
         dim = dim_model,
         depth = 6,
         fixed_window_size = FIXED_WINDOW_SIZE,
-        window_size = SEQ_LEN
+        window_size = SEQ_LEN,
+        long_term_mem_layers = (3, 4)
     )
 )
 
