@@ -145,10 +145,10 @@ def test_reward_shaping():
 
     class MockEnv:
         def reset(self):
-            return np.random.normal(size = (10,))
+            return np.random.normal(size = (10,)), {}
 
         def step(self, *args, **kwargs):
-            return np.random.normal(size = (10,))
+            return np.random.normal(size = (10,)), 0., False, False, {}
 
 
     env = MockEnv()

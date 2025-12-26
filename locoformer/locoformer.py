@@ -57,6 +57,12 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def always(val):
+    def inner(*args, **kwargs):
+        return val
+
+    return inner
+
 def identity(t, *args, **kwargs):
     return t
 
@@ -1295,7 +1301,8 @@ class Locoformer(Module):
         self,
         env,
         env_output_transforms: dict[str, Callable] = dict(),
-        state_transform: Callable = identity
+        state_transform: Callable = identity,
+        command_generator: Callable = always(None)
     ):
 
         def transform_output(el):
@@ -1324,7 +1331,7 @@ class Locoformer(Module):
 
             return (derived_states, *env_reset_out_torch)
 
-        def wrapped_step(action, *args, **kwargs):
+        def wrapped_step(action, *args, command = None, **kwargs):
 
             if is_tensor(action):
                 if action.numel() == 1:
@@ -1343,7 +1350,7 @@ class Locoformer(Module):
             env_step_out_torch = (state, *rest)
 
             if self.has_reward_shaping:
-                shaped_rewards = self.state_and_command_to_rewards(env_step_out_torch)
+                shaped_rewards = self.state_and_command_to_rewards(state, command)
 
             derived_states = dict()
 
@@ -1441,7 +1448,8 @@ class Locoformer(Module):
         action_select_kwargs: dict = dict(),
         state_embed_kwargs: dict = dict(),
         state_id_kwarg: dict = dict(),
-        state_entropy_bonus_weight = 0.
+        state_entropy_bonus_weight = 0.,
+        command_fn: Callable = always(None)
     ):
 
         env_reset, env_step = wrapped_env_functions
@@ -1469,7 +1477,7 @@ class Locoformer(Module):
 
             while True:
 
-                rand_command = torch.randn(2)
+                maybe_command = command_fn(state_for_model)
 
                 # predict next action
 
@@ -1481,7 +1489,7 @@ class Locoformer(Module):
 
                 # pass to environment
 
-                derived, next_state, reward, terminated, truncated, *_ = env_step(action)
+                derived, next_state, reward, terminated, truncated, *_ = env_step(action, command = maybe_command)
 
                 next_state_image = derived.get('state_image', None)
                 next_internal_state = derived.get('internal_state', None)
@@ -1519,7 +1527,7 @@ class Locoformer(Module):
                     reward = reward,
                     value = value,
                     done = tensor(False),
-                    condition = rand_command
+                    condition = maybe_command
                 )
 
                 timestep += 1
