@@ -894,7 +894,7 @@ class Locoformer(Module):
         value_network: Module = nn.Identity(),
         state_pred_network: Module | None = None,
         embed_past_action = False,
-        state_pred_loss_weight = 0.1,
+        state_pred_loss_weight = 0.05,
         reward_range: tuple[float, float] | None = None,
         reward_shaping_fns: list[Callable[..., float | Tensor]] | None = None,
         num_reward_bins = 32,
@@ -1202,6 +1202,8 @@ class Locoformer(Module):
                 loss_mask = mask[:, :-1]
 
                 state_pred_loss = self.state_pred_head.calculate_loss(state_pred, state_labels, return_unreduced_loss = True)
+
+                state_pred_loss = state_pred_loss.mean(dim = -1) # average over state features
 
                 windowed_state_pred_loss = state_pred_loss[loss_mask].sum() / total_learnable_tokens # todo - calculate denom correctly
 
