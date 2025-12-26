@@ -230,10 +230,10 @@ def main(
 
         if use_vision:
             state_embed_kwargs = dict(state_type = 'image')
-            compute_state_pred_loss = False
         else:
             state_embed_kwargs = dict(state_type = 'raw')
-            compute_state_pred_loss = True
+
+        compute_state_pred_loss = True
 
         # specific embodiment state id and action selector id
 

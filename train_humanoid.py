@@ -157,7 +157,6 @@ def main(
             reward      = 'float',
             value       = 'float',
             done        = 'bool',
-            internal_state = ('float', 2),
             condition   = ('float', 2)
         ),
         meta_fields = dict(
@@ -193,26 +192,20 @@ def main(
 
     # transforms for replay buffer
 
+    def state_transform(state):
+        return state.float()
+
     def get_snapshot_from_env(step_output, env):
         return get_snapshot(env, dim_state_image_shape[1:])
 
-    def derive_internal_state(step_output, env):
-        return torch.zeros(2)
-
     transforms = dict(
         state_image = get_snapshot_from_env,
-        internal_state = derive_internal_state
     )
-
-    class Float32ObservationWrapper(gym.ObservationWrapper):
-        def observation(self, obs):
-            return obs.astype('float32')
-
-    env = Float32ObservationWrapper(env)
 
     wrapped_env_functions = locoformer.wrap_env_functions(
         env,
-        env_output_transforms = transforms
+        env_output_transforms = transforms,
+        state_transform = state_transform
     )
 
     for learn_cycle in pbar:

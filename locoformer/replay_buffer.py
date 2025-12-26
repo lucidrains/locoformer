@@ -369,13 +369,14 @@ class ReplayBuffer:
 
         assert not self.timestep_index >= self.max_timesteps, 'you exceeded the `max_timesteps` set on the replay buffer'
 
-        for name, datapoint in data.items():
+        filtered_data = {name: datapoint for name, datapoint in data.items() if exists(datapoint)}
 
+        for name, datapoint in filtered_data.items():
             self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
 
         self.timestep_index += 1
 
-        return self.memory_namedtuple(**data)
+        return self.memory_namedtuple(**filtered_data)
 
     def dataset(
         self,

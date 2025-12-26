@@ -829,6 +829,7 @@ class StateEmbedder(Module):
 
         dim_states = (dim_state,) if not isinstance(dim_state, (tuple, list)) else dim_state
 
+        self.dim_states = dim_states
         self.state_to_token = ModuleList([MLP(dim_state, dim, bias = False) for dim_state in dim_states])
 
         # internal state embeds for each robot
@@ -970,7 +971,12 @@ class Locoformer(Module):
         self.state_pred_network = state_pred_network
 
         if exists(state_pred_network):
-            self.state_pred_head = Readout(transformer.dim, num_continuous = 1)
+            dim_states = self.embedder.dim_states
+            total_dim_states = sum(dim_states)
+
+            selectors = [t.tolist() for t in arange(total_dim_states).split(dim_states)]
+
+            self.state_pred_head = Readout(transformer.dim, num_continuous = total_dim_states, selectors = selectors)
 
         self.has_state_pred_loss = state_pred_loss_weight > 0.
         self.state_pred_loss_weight = state_pred_loss_weight
@@ -1201,7 +1207,9 @@ class Locoformer(Module):
                 state_labels = state[:, 1:]
                 loss_mask = mask[:, :-1]
 
-                state_pred_loss = self.state_pred_head.calculate_loss(state_pred, state_labels, return_unreduced_loss = True)
+                state_id = state_id_kwarg.get('state_id', 0)
+
+                state_pred_loss = self.state_pred_head.calculate_loss(state_pred, state_labels, selector_index = state_id, return_unreduced_loss = True)
 
                 state_pred_loss = state_pred_loss.mean(dim = -1) # average over state features
 
@@ -1286,7 +1294,8 @@ class Locoformer(Module):
     def wrap_env_functions(
         self,
         env,
-        env_output_transforms: dict[str, Callable] = dict()
+        env_output_transforms: dict[str, Callable] = dict(),
+        state_transform: Callable = identity
     ):
 
         def transform_output(el):
@@ -1301,6 +1310,12 @@ class Locoformer(Module):
             env_reset_out =  env.reset(*args, **kwargs)
 
             env_reset_out_torch = tree_map(transform_output, env_reset_out)
+
+            state, *rest = env_reset_out_torch
+
+            state = state_transform(state)
+
+            env_reset_out_torch = (state, *rest)
 
             derived_states = dict()
 
@@ -1320,6 +1335,12 @@ class Locoformer(Module):
             env_step_out = env.step(action, *args, **kwargs)
 
             env_step_out_torch = tree_map(transform_output, env_step_out)
+
+            state, *rest = env_step_out_torch
+
+            state = state_transform(state)
+
+            env_step_out_torch = (state, *rest)
 
             if self.has_reward_shaping:
                 shaped_rewards = self.state_and_command_to_rewards(env_step_out_torch)
@@ -1468,8 +1489,8 @@ class Locoformer(Module):
                 # maybe state entropy bonus
 
                 if state_entropy_bonus_weight > 0. and exists(state_pred):
-
-                    entropy = self.state_pred_head.entropy(state_pred)
+                    state_id = state_id_kwarg.get('state_id', 0)
+                    entropy = self.state_pred_head.entropy(state_pred, selector_index = state_id)
 
                     state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum()
 
@@ -1624,8 +1645,9 @@ class Locoformer(Module):
             state_pred = None
 
             if self.can_pred_state:
+                state_id = state_id_kwarg.get('state_id', 0)
                 state_pred_embed = self.state_pred_network(embed)
-                state_pred = self.state_pred_head(state_pred_embed)
+                state_pred = self.state_pred_head(state_pred_embed, selector_index = state_id)
 
             out = (out, state_pred)
 
