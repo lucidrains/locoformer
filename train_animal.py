@@ -55,7 +55,7 @@ def get_snapshot(env, shape):
 def main(
     num_learning_cycles = 1_000,
     num_episodes_before_learn = 32,
-    max_timesteps = 1000,
+    max_timesteps = 250,
     replay_buffer_size = 48,
     use_vision = False,
     embed_past_action = True,
@@ -78,34 +78,31 @@ def main(
     if clear_video:
         rmtree(video_folder, ignore_errors = True)
 
-    # environment configuration
+    # possible envs
 
-    env_name = 'Humanoid-v5'
-    
+    envs = [
+        ('Humanoid-v5', 'humanoid', 348, 17),
+        ('HalfCheetah-v5', 'cheetah', 17, 6),
+    ]
+
     # accelerate
 
     accelerator = Accelerator()
     device = accelerator.device
-
-    # initialize environment once to get dimensions
-
-    env = gym.make(env_name, render_mode = 'rgb_array')
-    dim_state = env.observation_space.shape[0]
-    num_actions = env.action_space.shape[0]
-    env.close()
 
     # model
 
     locoformer = Locoformer(
         embedder = dict(
             dim = 128,
-            dim_state = [dim_state],
+            dim_state = [348, 17],
         ),
         unembedder = dict(
             dim = 128,
-            num_continuous = num_actions,
+            num_continuous = 17 + 6,
             selectors = [
-                list(range(num_actions))
+                list(range(17)),
+                list(range(17, 17 + 6))
             ]
         ),
         state_pred_network = Feedforwards(dim = 128, depth = 1),
@@ -141,74 +138,79 @@ def main(
 
     optims = [optim_base, optim_actor, optim_critic]
 
-    # memory
-
-    dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
-
-    replay = ReplayBuffer(
-        'replay_humanoid',
-        replay_buffer_size,
-        max_timesteps + 1,
-        fields = dict(
-            state       = ('float', dim_state),
-            state_image = ('float', dim_state_image_shape),
-            action      = ('float', num_actions),
-            action_log_prob = ('float', num_actions),
-            reward      = 'float',
-            value       = 'float',
-            done        = 'bool',
-            condition   = ('float', 2)
-        ),
-        meta_fields = dict(
-            cum_rewards = 'float'
-        )
-    )
-
     # loop
 
-    pbar = tqdm(range(num_learning_cycles), desc = f'environment: {env_name}')
-
-    env = gym.make(env_name, render_mode = 'rgb_array')
-
-    env = gym.wrappers.RecordVideo(
-        env = env,
-        video_folder = video_folder,
-        name_prefix = 'humanoid-video',
-        episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
-        disable_logger = True
-    )
-
-    # state embed kwargs
-
-    if use_vision:
-        state_embed_kwargs = dict(state_type = 'image')
-        compute_state_pred_loss = False
-    else:
-        state_embed_kwargs = dict(state_type = 'raw')
-        compute_state_pred_loss = True
-
-    state_id_kwarg = dict(state_id = 0)
-    action_select_kwargs = dict(selector_index = 0)
-
-    # transforms for replay buffer
-
-    def state_transform(state):
-        return state.float()
-
-    def get_snapshot_from_env(step_output, env):
-        return get_snapshot(env, dim_state_image_shape[1:])
-
-    transforms = dict(
-        state_image = get_snapshot_from_env,
-    )
-
-    wrapped_env_functions = locoformer.wrap_env_functions(
-        env,
-        env_output_transforms = transforms,
-        state_transform = state_transform
-    )
+    pbar = tqdm(range(num_learning_cycles), desc = 'learning cycles')
 
     for learn_cycle in pbar:
+
+        env_index = learn_cycle % len(envs)
+        env_name, env_short_name, dim_state, num_actions = envs[env_index]
+
+        pbar.set_description(f'environment: {env_name}')
+
+        env = gym.make(env_name, render_mode = 'rgb_array')
+
+        env = gym.wrappers.RecordVideo(
+            env = env,
+            video_folder = video_folder,
+            name_prefix = f'{learn_cycle}-{env_short_name}',
+            episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
+            disable_logger = True
+        )
+
+        # memory
+
+        dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
+
+        replay = ReplayBuffer(
+            f'replay_{env_short_name}',
+            replay_buffer_size,
+            max_timesteps + 1,
+            fields = dict(
+                state       = ('float', dim_state),
+                state_image = ('float', dim_state_image_shape),
+                action      = ('float', num_actions),
+                action_log_prob = ('float', num_actions),
+                reward      = 'float',
+                value       = 'float',
+                done        = 'bool',
+                condition   = ('float', 2)
+            ),
+            meta_fields = dict(
+                cum_rewards = 'float'
+            )
+        )
+
+        # state embed kwargs
+
+        if use_vision:
+            state_embed_kwargs = dict(state_type = 'image')
+            compute_state_pred_loss = False
+        else:
+            state_embed_kwargs = dict(state_type = 'raw')
+            compute_state_pred_loss = True
+
+        state_id_kwarg = dict(state_id = env_index)
+        action_select_kwargs = dict(selector_index = env_index)
+
+        # transforms for replay buffer
+
+        def state_transform(state):
+            return state.float()
+
+        def get_snapshot_from_env(step_output, env):
+            return get_snapshot(env, dim_state_image_shape[1:])
+
+        transforms = dict(
+            state_image = get_snapshot_from_env,
+        )
+
+        wrapped_env_functions = locoformer.wrap_env_functions(
+            env,
+            env_output_transforms = transforms,
+            state_transform = state_transform
+        )
 
         for _ in range(num_episodes_before_learn):
 
@@ -241,7 +243,7 @@ def main(
             compute_state_pred_loss
         )
 
-    env.close()
+        env.close()
 
 # main
 

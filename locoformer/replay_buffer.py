@@ -365,18 +365,22 @@ class ReplayBuffer:
         self,
         **data
     ):
-        assert is_bearable(data, dict[str, Tensor | ndarray])
-
         assert not self.timestep_index >= self.max_timesteps, 'you exceeded the `max_timesteps` set on the replay buffer'
 
-        filtered_data = {name: datapoint for name, datapoint in data.items() if exists(datapoint)}
+        # filter to only what is defined in the namedtuple, and store those that are present
 
-        for name, datapoint in filtered_data.items():
-            self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
+        store_data = dict()
+
+        for name in self.memory_namedtuple._fields:
+            datapoint = data.get(name)
+            store_data[name] = datapoint
+
+            if exists(datapoint):
+                self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
 
         self.timestep_index += 1
 
-        return self.memory_namedtuple(**filtered_data)
+        return self.memory_namedtuple(**store_data)
 
     def dataset(
         self,
