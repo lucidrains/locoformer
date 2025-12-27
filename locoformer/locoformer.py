@@ -349,12 +349,14 @@ class MaybeAdaRMSNormWrapper(Module):
     ):
 
         need_cond = self.accept_condition
+        has_cond = need_cond and exists(cond)
 
-        assert xnor(exists(cond), need_cond)
+        if exists(cond):
+            assert self.accept_condition
 
         prenormed = self.norm(x)
 
-        if need_cond:
+        if has_cond:
             if cond.ndim == 2:
                 cond = rearrange(cond, 'b d -> b 1 d')
 
@@ -363,14 +365,14 @@ class MaybeAdaRMSNormWrapper(Module):
 
         all_fn_out = self.fn(prenormed, *args, **kwargs)
 
-        if not need_cond:
+        if not has_cond:
             return all_fn_out
 
         # function may return multiple args
 
         (out, *rest), tree_spec = tree_flatten(all_fn_out)
 
-        if need_cond:
+        if has_cond:
             scale_out = self.to_ada_norm_zero(cond).sigmoid()
             out = out * scale_out
 
@@ -1067,13 +1069,13 @@ class Locoformer(Module):
 
                 actor_loss, critic_loss = self.ppo(
                     state = getattr(data, state_field),
-                    internal_state = data.internal_state,
+                    internal_state = getattr(data, 'internal_state', None),
                     action = data.action,
                     action_log_prob = data.action_log_prob,
                     reward = data.reward,
                     value = data.value,
                     done = data.done,
-                    condition = data.condition,
+                    condition = getattr(data, 'condition', None),
                     episode_lens = data._lens,
                     optims = optims,
                     state_embed_kwargs = state_embed_kwargs,
@@ -1146,8 +1148,10 @@ class Locoformer(Module):
         if exists(condition):
             data_tensors = (*data_tensors, condition)
 
+        num_windows = seq_len // window_size
+
         windowed_tensors = [
-            t.split(window_size, dim = 1) for t in
+            t.split(window_size, dim = 1) if exists(t) else ((None,) * num_windows) for t in
             data_tensors
         ]
 
@@ -1406,7 +1410,12 @@ class Locoformer(Module):
 
             # forwards
 
-            out, cache = self.forward(state, condition = condition, cache = cache, **{**kwargs, **override_kwargs})
+            out, cache = self.forward(
+                state,
+                condition = condition,
+                cache = cache,
+                **{**kwargs, **override_kwargs}
+            )
 
             # maybe remove batch or time
 
@@ -1476,14 +1485,22 @@ class Locoformer(Module):
             past_action = None
 
             while True:
+                state_for_model = state_image if use_vision else state
 
                 maybe_command = command_fn(state_for_model)
 
                 # predict next action
 
-                state_for_model = state_image if use_vision else state
-
-                (action_logits, state_pred), value = stateful_forward(state_for_model, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, past_action = past_action if embed_past_action else None, condition = rand_command, return_values = True, return_state_pred = True)
+                (action_logits, state_pred), value = stateful_forward(
+                    state_for_model,
+                    condition = maybe_command,
+                    state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state},
+                    action_select_kwargs = action_select_kwargs,
+                    state_id_kwarg = state_id_kwarg,
+                    past_action = past_action if embed_past_action else None,
+                    return_values = True,
+                    return_state_pred = True
+                )
 
                 action = self.unembedder.sample(action_logits, **action_select_kwargs)
 
@@ -1540,14 +1557,15 @@ class Locoformer(Module):
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = rand_command, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                        _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
 
                         terminal_node = dict(
                             state = next_state,
                             state_image = next_state_image,
                             value = next_value,
                             reward = next_value,
-                            done = tensor(True)
+                            done = tensor(True),
+                            condition = maybe_command
                         )
 
                     else:
@@ -1557,7 +1575,8 @@ class Locoformer(Module):
                             state_image = next_state_image,
                             value = torch.zeros_like(value),
                             reward = torch.zeros_like(reward),
-                            done = tensor(True)
+                            done = tensor(True),
+                            condition = maybe_command
                         )
 
                     terminal_memory = memory._replace(**terminal_node)
@@ -1639,7 +1658,12 @@ class Locoformer(Module):
 
         # attention
 
-        embed, cache = self.transformer(tokens, condition = condition, cache = prev_kv_cache, return_kv_cache = True)
+        embed, cache = self.transformer(
+            tokens,
+            condition = condition,
+            cache = prev_kv_cache,
+            return_kv_cache = True
+        )
 
         # unembed to actions - in language models this would be the next state
 
