@@ -47,7 +47,12 @@ from locoformer.replay_buffer import ReplayBuffer
 
 LinearNoBias = partial(Linear, bias = False)
 
-Cache = namedtuple('Cache', ('curr_timestep', 'kv_cache')) # (int, Tensor)
+TransformerMemory = namedtuple('TransformerMemory', (
+    'total_tokens',
+    'kv_cache',
+    'gru_cache',
+    'mem_mlp_cache'
+))
 
 # helper functions
 
@@ -591,29 +596,36 @@ class TransformerXL(Module):
     def forward(
         self,
         x,
-        cache = None,
+        cache: TransformerMemory | None = None,
         return_kv_cache = False,
         condition: Tensor | None = None
     ):
-
-        is_first_window = not exists(cache)
+        curr_token_seq_len = x.shape[-2]
 
         # cache and residuals
 
         num_layers = len(self.layers)
 
+        # extract variables from cache
+
+        is_first_window = True
+        total_tokens = 0
         kv_cache = gru_cache = mem_mlp_cache = None
 
         if exists(cache):
-            kv_cache, gru_cache, mem_mlp_cache = cache
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache = cache
+            is_first_window = total_tokens < self.window_size
 
         kv_cache = default(kv_cache, (None,) * num_layers)
         gru_cache = default(gru_cache, (None,) * num_layers)
         mem_mlp_cache = default(mem_mlp_cache, (None,) * num_layers)
 
+        # prepare next cache
+
         next_kv_caches = []
         next_gru_hiddens = [] if self.gru_layers else None
         next_mem_mlp_cache = [] if self.has_mem else None
+        next_total_tokens = total_tokens + curr_token_seq_len
 
         value_residual = None
 
@@ -675,17 +687,14 @@ class TransformerXL(Module):
 
         embed = self.norm(x)
 
-        if not return_kv_cache:
-            return embed
-
         next_kv_cache = stack(next_kv_caches)
 
         if exists(next_gru_hiddens):
             next_gru_hiddens = stack(next_gru_hiddens)
 
-        next_kv_cache = next_kv_cache[..., -self.window_size:, :]
+        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache)
 
-        return embed, (next_kv_cache, next_gru_hiddens, next_mem_mlp_cache)
+        return embed, next_cache
 
 # simple 2 layer memory mlp
 # following ttt/titans
@@ -1600,7 +1609,7 @@ class Locoformer(Module):
     def forward(
         self,
         state: Tensor,
-        cache: Cache | None = None,
+        cache: TransformerMemory | None = None,
         condition: Tensor | None = None,
         past_action: Tensor | None = None,
         state_embed_kwargs: dict = dict(),
@@ -1629,13 +1638,19 @@ class Locoformer(Module):
 
         # maybe add past action
 
-        is_first_window = not exists(cache)
+        # determine if first window and start of sequence
+
+        total_tokens = cache.total_tokens if exists(cache) else 0
+
+        is_start_of_sequence = total_tokens == 0
+
+        # maybe add past action
 
         if exists(past_action):
             assert self.embed_past_action
             past_action_embed = self.past_action_embedder(past_action, **action_select_kwargs)
 
-            if is_first_window:
+            if is_start_of_sequence:
                 past_action_embed = pad_at_dim(past_action_embed[..., 1:, :], (1, 0), dim = -2)
 
             tokens = tokens + past_action_embed
@@ -1644,24 +1659,16 @@ class Locoformer(Module):
 
         time = tokens.shape[-2]
 
-        # destruct the cache for the current timestep and the cache
-
-        prev_kv_cache = None
-        timestep_start = 0
-
-        if exists(cache):
-            timestep_start, prev_kv_cache = cache
-
         # an assert - make sure during training or inference, forward never gets anything that crosses the window segment boundary, to open up some possibilities with extending memory
 
-        assert ((timestep_start % self.window_size) + time) <= self.window_size
+        assert ((total_tokens % self.window_size) + time) <= self.window_size
 
         # attention
 
         embed, cache = self.transformer(
             tokens,
             condition = condition,
-            cache = prev_kv_cache,
+            cache = cache,
             return_kv_cache = True
         )
 
@@ -1700,27 +1707,23 @@ class Locoformer(Module):
 
             out = (out, values)
 
-        # output and cache
-
-        next_timestep = time + timestep_start
-
         # handle curtailing kv cache at the right intervals
 
         window_size = self.window_size
 
-        kv_cache, gru_cache, mem_mlp_cache = cache
+        total_tokens, kv_cache, gru_cache, mem_mlp_cache = cache
 
-        if self.fixed_window_size or divisible_by(next_timestep, window_size * 2):
+        if self.fixed_window_size or divisible_by(total_tokens, window_size * 2):
             kv_cache = kv_cache[..., -window_size:, :]
 
         # maybe recurrent cache - shift the kv cache from one layer above to the one below, for extending on receptive field of past
 
-        if self.recurrent_cache and divisible_by(next_timestep, window_size):
+        if self.recurrent_cache and divisible_by(total_tokens, window_size):
             kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
 
             if exists(gru_cache):
                 gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
-        cache = (kv_cache, gru_cache, mem_mlp_cache)
+        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache)
 
-        return out, (next_timestep, cache)
+        return out, cache
