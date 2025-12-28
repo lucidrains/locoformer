@@ -75,8 +75,9 @@ def create_episode_mapping_from_replay(buffer):
 # main function
 
 def main(
+    fixed_env_index = -1,
     num_learning_cycles = 1_000,
-    num_episodes_before_learn = 64,
+    num_episodes_before_learn = 32,
     alternate_env_every = 1,
     max_timesteps = 500,
     replay_buffer_size = 128,
@@ -154,8 +155,8 @@ def main(
         gae_lam = gae_lam,
         ppo_eps_clip = ppo_eps_clip,
         ppo_entropy_weight = ppo_entropy_weight,
-        use_spo = True,
-        value_network = Feedforwards(dim = 64, depth = 1),
+        policy_network = Feedforwards(dim = 64, depth = 1),
+        value_network = Feedforwards(dim = 64, depth = 2),
         dim_value_input = 64,
         reward_range = reward_range,
         hl_gauss_loss_kwargs = dict(),
@@ -163,7 +164,8 @@ def main(
         calc_gae_kwargs = dict(
             use_accelerated = False
         ),
-        asymmetric_spo = True
+        use_spo = False,
+        asymmetric_spo = False
     ).to(device)
 
     optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
@@ -172,13 +174,20 @@ def main(
 
     optims = [optim_base, optim_actor, optim_critic]
 
+    # replay buffers
+
+    replay_buffers = dict()
+
     # loop
 
     pbar = tqdm(range(num_learning_cycles), desc = 'learning cycles')
 
     for learn_cycle in pbar:
 
-        env_index = (learn_cycle // alternate_env_every) % len(envs)
+        if fixed_env_index > -1:
+            env_index = fixed_env_index
+        else:
+            env_index = (learn_cycle // alternate_env_every) % len(envs)
 
         # environment
 
@@ -206,25 +215,31 @@ def main(
 
         # memory
 
-        replay = ReplayBuffer(
-            'replay',
-            replay_buffer_size,
-            max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
-            fields = dict(
-                state       = ('float', dim_state),
-                state_image = ('float', dim_state_image_shape),
-                action      = ('int', 1) if not continuous else ('float', num_actions),
-                action_log_prob = ('float', 1 if not continuous else num_actions),
-                reward      = 'float',
-                value       = 'float',
-                done        = 'bool',
-                condition   = ('float', 2),
-                internal_state = ('float', 2)
-            ),
-            meta_fields = dict(
-                cum_rewards = 'float'
+        replay = replay_buffers.get(env_index, None)
+
+        if not exists(replay):
+            replay = ReplayBuffer(
+                'replay',
+                replay_buffer_size,
+                max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
+                fields = dict(
+                    state       = ('float', dim_state),
+                    state_image = ('float', dim_state_image_shape),
+                    action      = ('int', 1) if not continuous else ('float', num_actions),
+                    action_log_prob = ('float', 1 if not continuous else num_actions),
+                    reward      = 'float',
+                    value       = 'float',
+                    done        = 'bool',
+                    condition   = ('float', 2),
+                    cond_mask   = 'bool',
+                    internal_state = ('float', 2)
+                ),
+                meta_fields = dict(
+                    cum_rewards = 'float'
+                )
             )
-        )
+
+            replay_buffers[env_index] = replay
 
         # state embed kwargs
 

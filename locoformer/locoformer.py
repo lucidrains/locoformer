@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from typing import Callable
 from types import SimpleNamespace
 from functools import partial, wraps
@@ -144,8 +145,14 @@ def safe_cat(t, next_t, dim = -1):
 
     return cat((t, next_t), dim = dim)
 
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / t.std().clamp_min(eps)
+def normalize(t, mask = None, eps = 1e-5):
+    if exists(mask):
+        assert mask.any()
+
+    t_for_stats = t[mask] if exists(mask) else t
+    var, mean = torch.var_mean(t_for_stats)
+
+    return (t - mean) / var.sqrt().clamp_min(eps)
 
 def tensor_to_dict(
     t: Tensor,
@@ -357,35 +364,50 @@ class MaybeAdaRMSNormWrapper(Module):
         x,
         *args,
         cond = None,
+        cond_mask = None,
         **kwargs
     ):
 
         need_cond = self.accept_condition
-        has_cond = need_cond and exists(cond)
+        has_input_cond = need_cond and exists(cond)
 
         if exists(cond):
             assert self.accept_condition
 
         prenormed = self.norm(x)
 
-        if has_cond:
+        if has_input_cond:
             if cond.ndim == 2:
                 cond = rearrange(cond, 'b d -> b 1 d')
 
-            scale_in = self.to_gamma(cond)
-            prenormed = prenormed * (scale_in + 1.)
+            cond_scale = self.to_gamma(cond)
+
+            conditioned = prenormed * cond_scale
+
+            # handle a condition mask
+
+            if exists(cond_mask):
+                prenormed = einx.where('b n, b n d, b n d', cond_mask, conditioned, prenormed)
+            else:
+                prenormed = conditioned
+
+        # the main block, either attention or feedforward or whatever
 
         all_fn_out = self.fn(prenormed, *args, **kwargs)
 
-        if not has_cond:
+        if not has_input_cond:
             return all_fn_out
 
         # function may return multiple args
 
         (out, *rest), tree_spec = tree_flatten(all_fn_out)
 
-        if has_cond:
-            scale_out = self.to_ada_norm_zero(cond).sigmoid()
+        scale_out = self.to_ada_norm_zero(cond).sigmoid()
+
+        if exists(cond_mask):
+            is_cond = rearrange(cond_mask, '... -> ... 1')
+            out = torch.where(is_cond, out * scale_out, out)
+        else:
             out = out * scale_out
 
         # restore
@@ -605,7 +627,8 @@ class TransformerXL(Module):
         x,
         cache: TransformerMemory | None = None,
         return_kv_cache = False,
-        condition: Tensor | None = None
+        condition: Tensor | None = None,
+        cond_mask: Tensor | None = None
     ):
         curr_token_seq_len = x.shape[-2]
 
@@ -648,7 +671,7 @@ class TransformerXL(Module):
             assert exists(self.to_cond_tokens)
             cond_tokens = self.to_cond_tokens(condition)
 
-        cond_kwargs = dict(cond = cond_tokens)
+        cond_kwargs = dict(cond = cond_tokens, cond_mask = cond_mask)
 
         # layers
 
@@ -928,6 +951,7 @@ class Locoformer(Module):
         ppo_value_clip = 0.4,
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
+        policy_network: Module = nn.Identity(),
         state_pred_network: Module | None = None,
         embed_past_action = False,
         state_pred_loss_weight = 0.05,
@@ -978,6 +1002,10 @@ class Locoformer(Module):
 
         self.fixed_window_size = transformer.fixed_window_size
         self.window_size = transformer.window_size
+
+        # policy network
+
+        self.policy_network = policy_network
 
         # determine value network, using HL Gauss Layer
 
@@ -1051,7 +1079,10 @@ class Locoformer(Module):
         return next(self.parameters()).device
 
     def actor_parameters(self):
-        return self.unembedder.parameters()
+        return [
+            *self.policy_network.parameters(),
+            *self.unembedder.parameters()
+        ]
 
     def critic_parameters(self):
         if not exists(self.to_value_pred):
@@ -1103,6 +1134,7 @@ class Locoformer(Module):
                     value = data.value,
                     done = data.done,
                     condition = getattr(data, 'condition', None),
+                    cond_mask = getattr(data, 'cond_mask', None),
                     episode_lens = data._lens,
                     optims = optims,
                     state_embed_kwargs = state_embed_kwargs,
@@ -1133,6 +1165,7 @@ class Locoformer(Module):
         done,
         episode_lens,
         condition: Tensor | None = None,
+        cond_mask: Tensor | None = None,
         optims: list[Optimizer] | None = None,
         state_embed_kwargs: dict = dict(),
         action_select_kwargs: dict = dict(),
@@ -1143,44 +1176,44 @@ class Locoformer(Module):
     ):
         window_size = self.window_size
         mask = ~done
-        total_learnable_tokens = mask.sum().item()
-
         seq_len = state.shape[1]
         padding_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
         gae_mask = padding_mask & mask
 
+        total_learnable_tokens = gae_mask.sum().item()
+
         advantage, returns = calc_gae(reward, value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
-        advantage = normalize(advantage)
+        advantage = normalize(advantage, mask = gae_mask)
 
         advantage = rearrange(advantage, '... -> ... 1')
 
         past_action = pad_at_dim(action, (1, -1), dim = -2)
 
-        data_tensors = (
-            state,
-            internal_state,
-            action,
-            past_action,
-            action_log_prob,
-            reward,
-            value,
-            mask,
-            advantage,
-            returns
+        data_dict = dict(
+            state = state,
+            internal_state = internal_state,
+            action = action,
+            past_action = past_action,
+            old_action_log_prob = action_log_prob,
+            reward = reward,
+            mask = mask,
+            advantage = advantage,
+            returns = returns,
+            windowed_gae_mask = gae_mask,
+            condition = condition,
+            cond_mask = cond_mask
         )
 
-        has_condition = exists(condition)
+        num_windows = math.ceil(seq_len / window_size)
 
-        if exists(condition):
-            data_tensors = (*data_tensors, condition)
+        windowed_data = dict()
 
-        num_windows = seq_len // window_size
-
-        windowed_tensors = [
-            t.split(window_size, dim = 1) if exists(t) else ((None,) * num_windows) for t in
-            data_tensors
-        ]
+        for name, tensor in data_dict.items():
+            if exists(tensor):
+                windowed_data[name] = tensor.split(window_size, dim = 1)
+            else:
+                windowed_data[name] = (None,) * num_windows
 
         mean_actor_loss = self.zero.clone()
         mean_critic_loss = self.zero.clone()
@@ -1189,40 +1222,27 @@ class Locoformer(Module):
 
         cache = None
 
-        for (
-            state,
-            internal_state,
-            action,
-            past_action,
-            old_action_log_prob,
-            reward,
-            old_value,
-            mask,
-            advantage,
-            returns,
-            *rest
-        ) in zip(*windowed_tensors):
+        for window_tensors in zip(*windowed_data.values()):
 
-            if has_condition:
-                condition, = rest
+            data = SimpleNamespace(**dict(zip(windowed_data.keys(), window_tensors)))
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(state, past_action = past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = condition, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
-            log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
+            log_prob = self.unembedder.log_prob(action_logits, data.action, **action_select_kwargs)
 
             entropy = self.unembedder.entropy(action_logits, **action_select_kwargs)
 
             # update actor, classic clipped surrogate loss
 
             eps_clip = self.ppo_eps_clip
-            ratio = (log_prob - old_action_log_prob).exp()
+            ratio = (log_prob - data.old_action_log_prob).exp()
 
-            calc_spo = lambda: -(ratio * advantage - (advantage.abs() * (ratio - 1.).square()) / (2 * eps_clip))
+            calc_spo = lambda: -(ratio * data.advantage - (data.advantage.abs() * (ratio - 1.).square()) / (2 * eps_clip))
 
-            calc_ppo = lambda: -torch.min(ratio * advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * advantage)
+            calc_ppo = lambda: -torch.min(ratio * data.advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * data.advantage)
 
             if self.asymmetric_spo:
-                actor_loss = torch.where(advantage >= 0, calc_ppo(), calc_spo())
+                actor_loss = torch.where(data.advantage >= 0, calc_ppo(), calc_spo())
             elif self.use_spo:
                 actor_loss = calc_spo()
             else:
@@ -1230,7 +1250,7 @@ class Locoformer(Module):
 
             actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
-            windowed_actor_loss = actor_loss[mask].sum() / total_learnable_tokens
+            windowed_actor_loss = actor_loss[data.windowed_gae_mask].sum() / total_learnable_tokens
 
             # maybe add state prediction
 
@@ -1238,11 +1258,11 @@ class Locoformer(Module):
                 exists(maybe_state_pred) and
                 self.has_state_pred_loss and
                 compute_state_pred_loss and
-                mask[:, :-1].any()
+                data.windowed_gae_mask[:, :-1].any()
             ):
                 state_pred = maybe_state_pred[:, :-1]
-                state_labels = state[:, 1:]
-                loss_mask = mask[:, :-1]
+                state_labels = data.state[:, 1:]
+                loss_mask = data.windowed_gae_mask[:, :-1]
 
                 state_id = state_id_kwarg.get('state_id', 0)
 
@@ -1250,7 +1270,7 @@ class Locoformer(Module):
 
                 state_pred_loss = state_pred_loss.mean(dim = -1) # average over state features
 
-                windowed_state_pred_loss = state_pred_loss[loss_mask].sum() / total_learnable_tokens # todo - calculate denom correctly
+                windowed_state_pred_loss = state_pred_loss[loss_mask].sum() / total_learnable_tokens
 
                 windowed_actor_loss = (
                     windowed_actor_loss +
@@ -1263,17 +1283,9 @@ class Locoformer(Module):
 
             # update critic
 
-            value_loss = self.hl_gauss_loss(value_logits, returns, reduction = 'none')
+            value_loss = self.hl_gauss_loss(value_logits, data.returns, reduction = 'none') * self.value_loss_weight
 
-            value_clip = self.ppo_value_clip
-            value = self.hl_gauss_loss(value_logits)
-
-            clipped_value = old_value + (value - old_value).clamp(-value_clip, value_clip)
-            clipped_value_loss = self.hl_gauss_loss(clipped_value, returns, reduction = 'none')
-
-            critic_loss = torch.maximum(value_loss, clipped_value_loss) * self.value_loss_weight
-
-            windowed_critic_loss = critic_loss[mask].sum() / total_learnable_tokens
+            windowed_critic_loss = value_loss[data.windowed_gae_mask].sum() / total_learnable_tokens
             windowed_critic_loss.backward(retain_graph = True)
 
             # accumulate
@@ -1412,6 +1424,7 @@ class Locoformer(Module):
         def stateful_forward(
             state: Tensor,
             condition: Tensor | None = None,
+            cond_mask: Tensor | None = None,
             **override_kwargs
         ):
             nonlocal cache
@@ -1521,6 +1534,7 @@ class Locoformer(Module):
                 (action_logits, state_pred), value = stateful_forward(
                     state_for_model,
                     condition = maybe_command,
+                    cond_mask = tensor(exists(maybe_command)),
                     state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state},
                     action_select_kwargs = action_select_kwargs,
                     state_id_kwarg = state_id_kwarg,
@@ -1567,11 +1581,12 @@ class Locoformer(Module):
                     state_image = state_image,
                     action = action,
                     action_log_prob = action_log_prob,
-                    internal_state = next_internal_state,
+                    internal_state = internal_state,
                     reward = reward,
                     value = value,
                     done = tensor(False),
-                    condition = maybe_command
+                    condition = maybe_command,
+                    cond_mask = tensor(exists(maybe_command))
                 )
 
                 timestep += 1
@@ -1584,15 +1599,17 @@ class Locoformer(Module):
                     if not terminated:
                         next_state_for_model = next_state_image if use_vision else next_state
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                        _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = tensor(exists(maybe_command)), return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
 
                         terminal_node = dict(
                             state = next_state,
                             state_image = next_state_image,
+                            internal_state = next_internal_state,
                             value = next_value,
                             reward = next_value,
                             done = tensor(True),
-                            condition = maybe_command
+                            condition = maybe_command,
+                            cond_mask = tensor(exists(maybe_command))
                         )
 
                     else:
@@ -1600,10 +1617,12 @@ class Locoformer(Module):
                         terminal_node = dict(
                             state = next_state,
                             state_image = next_state_image,
+                            internal_state = next_internal_state,
                             value = torch.zeros_like(value),
                             reward = torch.zeros_like(reward),
                             done = tensor(True),
-                            condition = maybe_command
+                            condition = maybe_command,
+                            cond_mask = tensor(exists(maybe_command))
                         )
 
                     terminal_memory = memory._replace(**terminal_node)
@@ -1629,6 +1648,7 @@ class Locoformer(Module):
         state: Tensor,
         cache: TransformerMemory | None = None,
         condition: Tensor | None = None,
+        cond_mask: Tensor | None = None,
         past_action: Tensor | None = None,
         state_embed_kwargs: dict = dict(),
         action_select_kwargs: dict = dict(),
@@ -1686,13 +1706,16 @@ class Locoformer(Module):
         embed, cache = self.transformer(
             tokens,
             condition = condition,
+            cond_mask = cond_mask,
             cache = cache,
             return_kv_cache = True
         )
 
         # unembed to actions - in language models this would be the next state
 
-        action_logits = self.unembedder(embed, **action_select_kwargs)
+        policy_embed = self.policy_network(embed)
+
+        action_logits = self.unembedder(policy_embed, **action_select_kwargs)
 
         out = action_logits
 
