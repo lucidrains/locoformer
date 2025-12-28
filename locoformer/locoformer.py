@@ -1607,9 +1607,9 @@ class Locoformer(Module):
                             internal_state = next_internal_state,
                             value = next_value,
                             reward = next_value,
-                            done = tensor(True),
+                            done = True,
                             condition = maybe_command,
-                            cond_mask = tensor(exists(maybe_command))
+                            cond_mask = exists(maybe_command)
                         )
 
                     else:
@@ -1620,9 +1620,9 @@ class Locoformer(Module):
                             internal_state = next_internal_state,
                             value = torch.zeros_like(value),
                             reward = torch.zeros_like(reward),
-                            done = tensor(True),
+                            done = True,
                             condition = maybe_command,
-                            cond_mask = tensor(exists(maybe_command))
+                            cond_mask = exists(maybe_command)
                         )
 
                     terminal_memory = memory._replace(**terminal_node)

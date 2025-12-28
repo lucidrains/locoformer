@@ -185,6 +185,7 @@ def main(
     for learn_cycle in pbar:
 
         if fixed_env_index > -1:
+            assert 0 <= fixed_env_index <= len(envs)
             env_index = fixed_env_index
         else:
             env_index = (learn_cycle // alternate_env_every) % len(envs)

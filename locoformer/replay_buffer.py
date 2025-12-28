@@ -19,6 +19,10 @@ from beartype.door import is_bearable
 
 import einx
 
+# constants
+
+PrimitiveType = int | float | bool
+
 # helpers
 
 def exists(v):
@@ -347,11 +351,14 @@ class ReplayBuffer:
         episode_index: int,
         timestep_index: int,
         name: str,
-        datapoint: Tensor | ndarray
+        datapoint: PrimitiveType | Tensor | ndarray
     ):
         assert 0 <= episode_index < self.max_episodes
         assert 0 <= timestep_index < self.max_timesteps
 
+        if is_bearable(datapoint, PrimitiveType):
+            datapoint = tensor(datapoint)
+            
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
