@@ -285,9 +285,7 @@ def main(
         # for testing of embedding shared internal states of robots across bodies
 
         def derive_internal_state(step_output, env):
-            state = step_output.get('state')
-            if not exists(state):
-                state = step_output.get('next_state')
+            state = step_output['state']
             return state[:2]
 
         transforms.update(internal_state = derive_internal_state)

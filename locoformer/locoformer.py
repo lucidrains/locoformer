@@ -8,6 +8,8 @@ from pathlib import Path
 from contextlib import contextmanager
 from collections import namedtuple
 
+from glom import glom
+
 from inspect import signature
 
 import numpy as np
@@ -954,9 +956,9 @@ def default_parse_env_step_out(step_out: tuple):
     assert len(step_out) in {4, 5}
 
     if len(step_out) == 5:
-        data_dict = dict(zip(('next_state', 'reward', 'terminated', 'truncated', 'info'), step_out))
+        data_dict = dict(zip(('state', 'reward', 'terminated', 'truncated', 'info'), step_out))
     elif len(step_out) == 4:
-        data_dict = dict(zip(('next_state', 'reward', 'terminated', 'info'), step_out))
+        data_dict = dict(zip(('state', 'reward', 'terminated', 'info'), step_out))
         data_dict['truncated'] = False
 
     return data_dict
@@ -1438,10 +1440,10 @@ class Locoformer(Module):
 
             env_step_out_dict = self.parse_env_step_out(env_step_out_torch)
 
-            env_step_out_dict['next_state'] = state_transform(env_step_out_dict['next_state'])
+            env_step_out_dict['state'] = state_transform(env_step_out_dict['state'])
 
             if self.has_reward_shaping:
-                shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['next_state'], command, env_index = env_index)
+                shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['state'], command, env_index = env_index)
                 env_step_out_dict['shaped_rewards'] = shaped_rewards
 
             derived_states = dict()
@@ -1597,7 +1599,7 @@ class Locoformer(Module):
 
                 step_dict = env_step(action, command = maybe_command, env_index = env_index)
 
-                derived, next_state, reward, terminated, truncated = pick(step_dict, ('derived_state', 'next_state', 'reward', 'terminated', 'truncated'))
+                derived, next_state, reward, terminated, truncated = pick(step_dict, ('derived_state', 'state', 'reward', 'terminated', 'truncated'))
 
                 next_state_image = derived.get('state_image', None)
                 next_internal_state = derived.get('internal_state', None)

@@ -157,9 +157,9 @@ def test_reward_shaping():
 
     reset_fn()
 
-    _, rewards = step_fn(3)
+    step_dict = step_fn(3)
 
-    assert len(rewards) == 2
+    assert len(step_dict['shaped_rewards']) == 2
 
 def test_tensor_to_dict():
     state = torch.randn(1, 3, 5)
