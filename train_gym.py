@@ -219,7 +219,7 @@ def main(
 
         if not exists(replay):
             replay = ReplayBuffer(
-                'replay',
+                f'replay/env_{env_index}',
                 replay_buffer_size,
                 max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
                 fields = dict(
