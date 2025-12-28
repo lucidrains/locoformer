@@ -27,7 +27,7 @@ from torch.distributions import Normal
 from torch.optim import Optimizer
 
 import einx
-from einops import rearrange, repeat, einsum, reduce
+from einops import rearrange, repeat, einsum, reduce, pack
 from einops.layers.torch import Rearrange, Reduce
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -72,6 +72,9 @@ def always(val):
 
 def identity(t, *args, **kwargs):
     return t
+
+def pick(data, keys):
+    return tuple(data[k] for k in keys)
 
 def first(arr):
     return arr[0]
@@ -937,6 +940,27 @@ class StateEmbedder(Module):
 
 # class
 
+OneRewardShaper = Callable[..., float | Tensor]
+
+MaybeOneRewardShaper = OneRewardShaper | None
+
+@beartype
+def default_parse_env_reset_out(reset_out: tuple):
+    assert len(reset_out) == 2
+    return dict(zip(('state', 'info'), reset_out))
+
+@beartype
+def default_parse_env_step_out(step_out: tuple):
+    assert len(step_out) in {4, 5}
+
+    if len(step_out) == 5:
+        data_dict = dict(zip(('next_state', 'reward', 'terminated', 'truncated', 'info'), step_out))
+    elif len(step_out) == 4:
+        data_dict = dict(zip(('next_state', 'reward', 'terminated', 'info'), step_out))
+        data_dict['truncated'] = False
+
+    return data_dict
+
 class Locoformer(Module):
     def __init__(
         self,
@@ -956,11 +980,17 @@ class Locoformer(Module):
         embed_past_action = False,
         state_pred_loss_weight = 0.05,
         reward_range: tuple[float, float] | None = None,
-        reward_shaping_fns: list[Callable[..., float | Tensor]] | None = None,
+        reward_shaping_fns: (
+            MaybeOneRewardShaper |
+            list[MaybeOneRewardShaper] |
+            list[list[MaybeOneRewardShaper]]
+        ) = None,
         num_reward_bins = 32,
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
         calc_gae_kwargs: dict = dict(),
+        parse_env_reset_out: Callable | None = None,
+        parse_env_step_out: Callable | None = None,
         recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False  # https://openreview.net/pdf?id=BA6n0nmagi
@@ -1065,10 +1095,20 @@ class Locoformer(Module):
 
         self.recurrent_cache = recurrent_cache
 
+        # environment returns to dictionary
+
+        self.parse_env_reset_out = default(parse_env_reset_out, default_parse_env_reset_out)
+        self.parse_env_step_out = default(parse_env_step_out, default_parse_env_step_out)
+
         # reward shaping function
 
         self.has_reward_shaping = exists(reward_shaping_fns)
+
+        if is_bearable(reward_shaping_fns, OneRewardShaper):
+            reward_shaping_fns = [reward_shaping_fns]
+
         self.reward_shaping_fns = reward_shaping_fns
+        self.reward_shaping_fns_multiple_envs = is_bearable(reward_shaping_fns, list[list[OneRewardShaper]])
 
         # loss related
 
@@ -1313,14 +1353,18 @@ class Locoformer(Module):
     def state_and_command_to_rewards(
         self,
         state,
-        commands = None
+        commands = None,
+        env_index: int | None = None
     ) -> Tensor:
 
         assert self.has_reward_shaping
+        assert xnor(exists(env_index), self.reward_shaping_fns_multiple_envs), f'`env_index` must be passed in if multiple reward shaping functions are defined, and vice versa (not passed in if only single list of reward shaping functions)'
 
         rewards = []
 
-        for fn in self.reward_shaping_fns:
+        reward_shaping_fns = self.reward_shaping_fns[env_index] if exists(env_index) else self.reward_shaping_fns
+
+        for fn in reward_shaping_fns:
             param_names = get_param_names(fn)
             param_names = set(param_names) & {'state', 'command'}
 
@@ -1337,7 +1381,13 @@ class Locoformer(Module):
 
         rewards = [tensor(reward) if not is_tensor(reward) else reward for reward in rewards]
 
-        return stack(rewards)
+        assert all([r.numel() == 1 for r in rewards])
+
+        if len(rewards) == 0:
+            return None
+
+        packed_rewards, _ = pack(rewards, '*')
+        return packed_rewards
 
     @beartype
     def wrap_env_functions(
@@ -1361,20 +1411,20 @@ class Locoformer(Module):
 
             env_reset_out_torch = tree_map(transform_output, env_reset_out)
 
-            state, *rest = env_reset_out_torch
+            env_reset_out_dict = self.parse_env_reset_out(env_reset_out_torch)
 
-            state = state_transform(state)
-
-            env_reset_out_torch = (state, *rest)
+            env_reset_out_dict['state'] = state_transform(env_reset_out_dict['state'])
 
             derived_states = dict()
 
             for derived_name, transform in env_output_transforms.items():
-                derived_states[derived_name] = transform(env_reset_out_torch, env)
+                derived_states[derived_name] = transform(env_reset_out_dict, env)
 
-            return (derived_states, *env_reset_out_torch)
+            env_reset_out_dict['derived_state'] = derived_states
 
-        def wrapped_step(action, *args, command = None, **kwargs):
+            return env_reset_out_dict
+
+        def wrapped_step(action, *args, command = None, env_index = None, **kwargs):
 
             if is_tensor(action):
                 if action.numel() == 1:
@@ -1386,26 +1436,22 @@ class Locoformer(Module):
 
             env_step_out_torch = tree_map(transform_output, env_step_out)
 
-            state, *rest = env_step_out_torch
+            env_step_out_dict = self.parse_env_step_out(env_step_out_torch)
 
-            state = state_transform(state)
-
-            env_step_out_torch = (state, *rest)
+            env_step_out_dict['next_state'] = state_transform(env_step_out_dict['next_state'])
 
             if self.has_reward_shaping:
-                shaped_rewards = self.state_and_command_to_rewards(state, command)
+                shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['next_state'], command, env_index = env_index)
+                env_step_out_dict['shaped_rewards'] = shaped_rewards
 
             derived_states = dict()
 
             for derived_name, transform in env_output_transforms.items():
-                derived_states[derived_name] = transform(env_step_out_torch, env)
+                derived_states[derived_name] = transform(env_step_out_dict, env)
 
-            env_step_out_torch = (derived_states, *env_step_out_torch)
+            env_step_out_dict['derived_state'] = derived_states
 
-            if not self.has_reward_shaping:
-                return env_step_out_torch
-
-            return env_step_out_torch, shaped_rewards
+            return env_step_out_dict
 
         return wrapped_reset, wrapped_step
 
@@ -1497,13 +1543,15 @@ class Locoformer(Module):
         action_select_kwargs: dict = dict(),
         state_embed_kwargs: dict = dict(),
         state_id_kwarg: dict = dict(),
+        env_index: int | None = None,
         state_entropy_bonus_weight = 0.,
         command_fn: Callable = always(None)
     ):
 
         env_reset, env_step = wrapped_env_functions
 
-        derived, state, *_ = env_reset()
+        reset_out_dict = env_reset()
+        derived, state = pick(reset_out_dict, ('derived_state', 'state'))
 
         state_image = derived.get('state_image', None)
         internal_state = derived.get('internal_state', None)
@@ -1547,7 +1595,9 @@ class Locoformer(Module):
 
                 # pass to environment
 
-                derived, next_state, reward, terminated, truncated, *_ = env_step(action, command = maybe_command)
+                step_dict = env_step(action, command = maybe_command, env_index = env_index)
+
+                derived, next_state, reward, terminated, truncated = pick(step_dict, ('derived_state', 'next_state', 'reward', 'terminated', 'truncated'))
 
                 next_state_image = derived.get('state_image', None)
                 next_internal_state = derived.get('internal_state', None)
@@ -1624,6 +1674,8 @@ class Locoformer(Module):
                             condition = maybe_command,
                             cond_mask = exists(maybe_command)
                         )
+
+                    terminal_node = {key: value for key, value in terminal_node.items() if key in memory._fields}
 
                     terminal_memory = memory._replace(**terminal_node)
 

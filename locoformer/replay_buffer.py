@@ -218,7 +218,7 @@ class ReplayBuffer:
 
         if not isinstance(folder, Path):
             folder = Path(folder)
-            folder.mkdir(exist_ok = True)
+            folder.mkdir(exist_ok = True, parents = True)
 
         self.folder = folder
         assert folder.is_dir()

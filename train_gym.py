@@ -84,7 +84,7 @@ def main(
     use_vision = False,
     embed_past_action = False,
     vision_height_width_dim = 64,
-    clear_video = False,
+    clear_folders = True,
     video_folder = 'recordings',
     record_every_episode = 250,
     learning_rate = 8e-4,
@@ -98,11 +98,13 @@ def main(
     epochs = 3,
     reward_range = (-300., 300.),
     test_episode_mapping_constructor = False,
-    test_mock_internal_states = False
+    test_mock_internal_states = False,
+    test_mock_reward_shaping = False
 ):
 
-    if clear_video:
+    if clear_folders:
         rmtree(video_folder, ignore_errors = True)
+        rmtree('./replay', ignore_errors = True)
 
     # possible envs
 
@@ -117,9 +119,21 @@ def main(
     accelerator = Accelerator()
     device = accelerator.device
 
+    # testing reward shaping, and storing of the values
+
+    reward_shaping_fns = None
+
+    if test_mock_reward_shaping:
+        reward_shaping_fns = [
+            [lambda state: state.norm()],
+            [lambda state: state.norm(), lambda state: state[2:3].abs()],
+            []
+        ]
+
     # model
 
     locoformer = Locoformer(
+        reward_shaping_fns = reward_shaping_fns,
         embedder = dict(
             dim = 64,
             dim_state = [8, 4], # 8 for lunar lander, 4 for cartpole
@@ -271,7 +285,9 @@ def main(
         # for testing of embedding shared internal states of robots across bodies
 
         def derive_internal_state(step_output, env):
-            state, *_ = step_output
+            state = step_output.get('state')
+            if not exists(state):
+                state = step_output.get('next_state')
             return state[:2]
 
         transforms.update(internal_state = derive_internal_state)
@@ -289,6 +305,7 @@ def main(
                 max_timesteps = max_timesteps,
                 use_vision = use_vision,
                 action_select_kwargs = action_select_kwargs,
+                env_index = env_index,
                 state_embed_kwargs = state_embed_kwargs,
                 state_id_kwarg = state_id_kwarg,
                 state_entropy_bonus_weight = state_entropy_bonus_weight,
