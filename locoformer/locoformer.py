@@ -51,7 +51,8 @@ TransformerMemory = namedtuple('TransformerMemory', (
     'total_tokens',
     'kv_cache',
     'gru_cache',
-    'mem_mlp_cache'
+    'mem_mlp_cache',
+    'mem_mlp_hidden_states'
 ))
 
 # helper functions
@@ -136,6 +137,12 @@ def pad_at_dim(
     dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
+
+def safe_cat(t, next_t, dim = -1):
+    if not exists(t):
+        return next_t
+
+    return cat((t, next_t), dim = dim)
 
 def normalize(t, eps = 1e-5):
     return (t - t.mean()) / t.std().clamp_min(eps)
@@ -610,22 +617,26 @@ class TransformerXL(Module):
 
         is_first_window = True
         total_tokens = 0
-        kv_cache = gru_cache = mem_mlp_cache = None
+        kv_cache = gru_cache = mem_mlp_cache = mem_mlp_hidden_states = None
 
         if exists(cache):
-            total_tokens, kv_cache, gru_cache, mem_mlp_cache = cache
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states = cache
             is_first_window = total_tokens < self.window_size
 
         kv_cache = default(kv_cache, (None,) * num_layers)
         gru_cache = default(gru_cache, (None,) * num_layers)
         mem_mlp_cache = default(mem_mlp_cache, (None,) * num_layers)
+        mem_mlp_hidden_states = default(mem_mlp_hidden_states, (None,) * num_layers)
 
         # prepare next cache
 
         next_kv_caches = []
         next_gru_hiddens = [] if self.gru_layers else None
         next_mem_mlp_cache = [] if self.has_mem else None
+        next_mem_mlp_hidden_states = [] if self.has_mem else None
         next_total_tokens = total_tokens + curr_token_seq_len
+
+        is_window_boundary = divisible_by(next_total_tokens, self.window_size)
 
         value_residual = None
 
@@ -641,7 +652,7 @@ class TransformerXL(Module):
 
         # layers
 
-        for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache):
+        for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache, layer_hidden_states in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache, mem_mlp_hidden_states):
 
             # handle maybe rnn
 
@@ -671,12 +682,19 @@ class TransformerXL(Module):
             # handle storing of memory
 
             if self.has_mem:
-                next_mem_mlp = None
+                next_mem_mlp = layer_mem_mlp
+                next_layer_hidden_states = layer_hidden_states
 
                 if is_mem_layer:
-                    next_mem_mlp = maybe_mem.store(x, layer_mem_mlp)
+                    # accumulate hidden states
+                    next_layer_hidden_states = safe_cat(layer_hidden_states, x, dim = -2)
+
+                    if is_window_boundary:
+                        next_mem_mlp = maybe_mem.store(next_layer_hidden_states, layer_mem_mlp)
+                        next_layer_hidden_states = None
 
                 next_mem_mlp_cache.append(next_mem_mlp)
+                next_mem_mlp_hidden_states.append(next_layer_hidden_states)
 
             # feedforward
 
@@ -692,7 +710,7 @@ class TransformerXL(Module):
         if exists(next_gru_hiddens):
             next_gru_hiddens = stack(next_gru_hiddens)
 
-        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache)
+        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache, next_mem_mlp_hidden_states)
 
         return embed, next_cache
 
@@ -1711,7 +1729,7 @@ class Locoformer(Module):
 
         window_size = self.window_size
 
-        total_tokens, kv_cache, gru_cache, mem_mlp_cache = cache
+        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states = cache
 
         if self.fixed_window_size or divisible_by(total_tokens, window_size * 2):
             kv_cache = kv_cache[..., -window_size:, :]
@@ -1724,6 +1742,6 @@ class Locoformer(Module):
             if exists(gru_cache):
                 gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
-        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache)
+        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states)
 
         return out, cache
