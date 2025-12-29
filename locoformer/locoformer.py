@@ -1272,7 +1272,6 @@ class Locoformer(Module):
 
             log_prob = self.unembedder.log_prob(action_logits, data.action, **action_select_kwargs)
 
-            entropy = self.unembedder.entropy(action_logits, **action_select_kwargs)
 
             # update actor, classic clipped surrogate loss
 
@@ -1290,7 +1289,13 @@ class Locoformer(Module):
             else:
                 actor_loss = calc_ppo()
 
-            actor_loss = actor_loss - self.ppo_entropy_weight * entropy
+            # maybe entropy
+
+            if self.ppo_entropy_weight > 0.:
+                entropy = self.unembedder.entropy(action_logits, **action_select_kwargs)
+
+                if exists(entropy):
+                    actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
             windowed_actor_loss = actor_loss[data.windowed_gae_mask].sum() / total_learnable_tokens
 
@@ -1397,6 +1402,7 @@ class Locoformer(Module):
         env,
         env_output_transforms: dict[str, Callable] = dict(),
         state_transform: Callable = identity,
+        reward_norm = 1.,
         command_generator: Callable = always(None)
     ):
 
@@ -1441,6 +1447,8 @@ class Locoformer(Module):
             env_step_out_dict = self.parse_env_step_out(env_step_out_torch)
 
             env_step_out_dict['state'] = state_transform(env_step_out_dict['state'])
+
+            env_step_out_dict['reward'] = env_step_out_dict['reward'] / reward_norm
 
             if self.has_reward_shaping:
                 shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['state'], command, env_index = env_index)
@@ -1547,6 +1555,7 @@ class Locoformer(Module):
         state_id_kwarg: dict = dict(),
         env_index: int | None = None,
         state_entropy_bonus_weight = 0.,
+        action_rescale_range: tuple[float, float] | None = None,
         command_fn: Callable = always(None)
     ):
 
@@ -1594,6 +1603,12 @@ class Locoformer(Module):
                 )
 
                 action = self.unembedder.sample(action_logits, **action_select_kwargs)
+
+                # maybe clip
+
+                if exists(action_rescale_range):
+                    min_val, max_val = action_rescale_range
+                    action = (action + 1.) * 0.5 * (max_val - min_val) + min_val
 
                 # pass to environment
 

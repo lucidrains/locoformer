@@ -53,10 +53,11 @@ def get_snapshot(env, shape):
 # main function
 
 def main(
+    fixed_env_index = -1,
     num_learning_cycles = 1_000,
     num_episodes_before_learn = 32,
     max_timesteps = 250,
-    replay_buffer_size = 48,
+    replay_buffer_size = 96,
     use_vision = False,
     embed_past_action = True,
     vision_height_width_dim = 64,
@@ -71,8 +72,8 @@ def main(
     ppo_entropy_weight = .01,
     state_entropy_bonus_weight = .01,
     batch_size = 16,
-    epochs = 5,
-    reward_range = (-10000., 10000.),
+    epochs = 4,
+    reward_range = (-100., 100.),
 ):
 
     if clear_video:
@@ -81,9 +82,13 @@ def main(
     # possible envs
 
     envs = [
-        ('Humanoid-v5', 'humanoid', 348, 17),
-        ('HalfCheetah-v5', 'cheetah', 17, 6),
+        ('Humanoid-v5', 'humanoid', 348, 17, 100., (-0.4, 0.4)),
+        ('HalfCheetah-v5', 'cheetah', 17, 6, 100., None),
     ]
+
+    # replays
+
+    replay_buffers = dict()
 
     # accelerate
 
@@ -100,6 +105,7 @@ def main(
         unembedder = dict(
             dim = 128,
             num_continuous = 17 + 6,
+            continuous_squashed = True,
             selectors = [
                 list(range(17)),
                 list(range(17, 17 + 6))
@@ -124,6 +130,7 @@ def main(
         value_network = Feedforwards(dim = 128, depth = 1),
         dim_value_input = 128,
         reward_range = reward_range,
+        num_reward_bins = 2500,
         hl_gauss_loss_kwargs = dict(),
         recurrent_cache = True,
         calc_gae_kwargs = dict(
@@ -144,8 +151,12 @@ def main(
 
     for learn_cycle in pbar:
 
-        env_index = learn_cycle % len(envs)
-        env_name, env_short_name, dim_state, num_actions = envs[env_index]
+        if fixed_env_index > -1:
+            env_index = fixed_env_index
+        else:
+            env_index = learn_cycle % len(envs)
+
+        env_name, env_short_name, dim_state, num_actions, reward_norm, rescale_range = envs[env_index]
 
         pbar.set_description(f'environment: {env_name}')
 
@@ -163,24 +174,29 @@ def main(
 
         dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
 
-        replay = ReplayBuffer(
-            f'replay_{env_short_name}',
-            replay_buffer_size,
-            max_timesteps + 1,
-            fields = dict(
-                state       = ('float', dim_state),
-                state_image = ('float', dim_state_image_shape),
-                action      = ('float', num_actions),
-                action_log_prob = ('float', num_actions),
-                reward      = 'float',
-                value       = 'float',
-                done        = 'bool',
-                condition   = ('float', 2)
-            ),
-            meta_fields = dict(
-                cum_rewards = 'float'
+        replay = replay_buffers.get(env_index, None)
+
+        if not exists(replay):
+            replay = ReplayBuffer(
+                f'replay_{env_short_name}',
+                replay_buffer_size,
+                max_timesteps + 1,
+                fields = dict(
+                    state       = ('float', dim_state),
+                    state_image = ('float', dim_state_image_shape),
+                    action      = ('float', num_actions),
+                    action_log_prob = ('float', num_actions),
+                    reward      = 'float',
+                    value       = 'float',
+                    done        = 'bool',
+                    condition   = ('float', 2)
+                ),
+                meta_fields = dict(
+                    cum_rewards = 'float'
+                )
             )
-        )
+
+            replay_buffers[env_index] = replay
 
         # state embed kwargs
 
@@ -209,7 +225,8 @@ def main(
         wrapped_env_functions = locoformer.wrap_env_functions(
             env,
             env_output_transforms = transforms,
-            state_transform = state_transform
+            state_transform = state_transform,
+            reward_norm = reward_norm
         )
 
         for _ in range(num_episodes_before_learn):
@@ -223,7 +240,8 @@ def main(
                 state_embed_kwargs = state_embed_kwargs,
                 state_id_kwarg = state_id_kwarg,
                 state_entropy_bonus_weight = state_entropy_bonus_weight,
-                embed_past_action = embed_past_action
+                embed_past_action = embed_past_action,
+                action_rescale_range = rescale_range
             )
 
             pbar.set_postfix(reward = f'{cum_reward:.2f}')
