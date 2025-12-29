@@ -109,7 +109,10 @@ def main(
             selectors = [
                 list(range(17)),
                 list(range(17, 17 + 6))
-            ]
+            ],
+            readout_kwargs = dict(
+                continuous_softclamp_logvar = 15.,
+            ),
         ),
         state_pred_network = Feedforwards(dim = 128, depth = 1),
         embed_past_action = embed_past_action,
