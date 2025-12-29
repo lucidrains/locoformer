@@ -62,7 +62,7 @@ def main(
     embed_past_action = True,
     vision_height_width_dim = 64,
     clear_video = True,
-    video_folder = 'recordings_humanoid',
+    video_folder = 'recordings_animal',
     record_every_episode = 32,
     learning_rate = 3e-4,
     discount_factor = 0.99,
@@ -70,10 +70,12 @@ def main(
     gae_lam = 0.95,
     ppo_eps_clip = 0.2,
     ppo_entropy_weight = .01,
-    state_entropy_bonus_weight = .01,
+    state_entropy_bonus_weight = .25,
     batch_size = 16,
-    epochs = 4,
-    reward_range = (-100., 100.),
+    epochs = 5,
+    reward_range = (-10000., 10000.),
+    num_reward_bins = 10_000,
+    cpu = False
 ):
 
     if clear_video:
@@ -82,8 +84,8 @@ def main(
     # possible envs
 
     envs = [
-        ('Humanoid-v5', 'humanoid', 348, 17, 100., (-0.4, 0.4)),
-        ('HalfCheetah-v5', 'cheetah', 17, 6, 100., None),
+        ('Humanoid-v5', 'humanoid', 348, 17, 0.001),
+        ('HalfCheetah-v5', 'cheetah', 17, 6, 0.05),
     ]
 
     # replays
@@ -92,7 +94,7 @@ def main(
 
     # accelerate
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
 
     # model
@@ -105,14 +107,10 @@ def main(
         unembedder = dict(
             dim = 128,
             num_continuous = 17 + 6,
-            continuous_squashed = True,
             selectors = [
                 list(range(17)),
                 list(range(17, 17 + 6))
-            ],
-            readout_kwargs = dict(
-                continuous_softclamp_logvar = 15.,
-            ),
+            ]
         ),
         state_pred_network = Feedforwards(dim = 128, depth = 1),
         embed_past_action = embed_past_action,
@@ -132,8 +130,8 @@ def main(
         use_spo = True,
         value_network = Feedforwards(dim = 128, depth = 1),
         dim_value_input = 128,
+        num_reward_bins = num_reward_bins,
         reward_range = reward_range,
-        num_reward_bins = 2500,
         hl_gauss_loss_kwargs = dict(),
         recurrent_cache = True,
         calc_gae_kwargs = dict(
@@ -159,7 +157,7 @@ def main(
         else:
             env_index = learn_cycle % len(envs)
 
-        env_name, env_short_name, dim_state, num_actions, reward_norm, rescale_range = envs[env_index]
+        env_name, env_short_name, dim_state, num_actions, env_state_pred_loss_weight = envs[env_index]
 
         pbar.set_description(f'environment: {env_name}')
 
@@ -219,6 +217,9 @@ def main(
             return state.float()
 
         def get_snapshot_from_env(step_output, env):
+            if not use_vision:
+                return None
+
             return get_snapshot(env, dim_state_image_shape[1:])
 
         transforms = dict(
@@ -228,8 +229,7 @@ def main(
         wrapped_env_functions = locoformer.wrap_env_functions(
             env,
             env_output_transforms = transforms,
-            state_transform = state_transform,
-            reward_norm = reward_norm
+            state_transform = state_transform
         )
 
         for _ in range(num_episodes_before_learn):
@@ -243,8 +243,7 @@ def main(
                 state_embed_kwargs = state_embed_kwargs,
                 state_id_kwarg = state_id_kwarg,
                 state_entropy_bonus_weight = state_entropy_bonus_weight,
-                embed_past_action = embed_past_action,
-                action_rescale_range = rescale_range
+                embed_past_action = embed_past_action
             )
 
             pbar.set_postfix(reward = f'{cum_reward:.2f}')
@@ -261,7 +260,8 @@ def main(
             batch_size,
             epochs,
             use_vision,
-            compute_state_pred_loss
+            compute_state_pred_loss,
+            env_state_pred_loss_weight
         )
 
         env.close()

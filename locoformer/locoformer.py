@@ -468,6 +468,8 @@ class Attention(Module):
         self.fixed_window_size = fixed_window_size
         self.window_size = window_size
 
+        self.register_buffer('causal_mask', None, persistent = False)
+
     def forward(
         self,
         tokens,
@@ -512,7 +514,10 @@ class Attention(Module):
             dist = einx.subtract('i, j -> i j', i_seq, j_seq)
             causal_mask = (dist < 0) | (dist > self.window_size)
         else:
-            causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
+            if not exists(self.causal_mask) or self.causal_mask.shape != (i, j):
+                self.causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
+
+            causal_mask = self.causal_mask
 
         sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
@@ -1145,6 +1150,7 @@ class Locoformer(Module):
         epochs = 2,
         use_vision = False,
         compute_state_pred_loss = False,
+        state_pred_loss_weight = None,
         maybe_construct_trial_from_buffer: Callable[[ReplayBuffer], Tensor] | None = None
     ):
         state_field = 'state_image' if use_vision else 'state'
@@ -1183,6 +1189,7 @@ class Locoformer(Module):
                     action_select_kwargs = action_select_kwargs,
                     state_id_kwarg = state_id_kwarg,
                     compute_state_pred_loss = compute_state_pred_loss,
+                    state_pred_loss_weight = state_pred_loss_weight,
                     accelerator = accelerator
                 )
 
@@ -1213,9 +1220,12 @@ class Locoformer(Module):
         action_select_kwargs: dict = dict(),
         state_id_kwarg: dict = dict(),
         compute_state_pred_loss = True,
+        state_pred_loss_weight = None,
         accelerator = None,
         max_grad_norm = 0.5
     ):
+        state_pred_loss_weight = default(state_pred_loss_weight, self.state_pred_loss_weight)
+
         window_size = self.window_size
         mask = ~done
         seq_len = state.shape[1]
@@ -1272,7 +1282,6 @@ class Locoformer(Module):
 
             log_prob = self.unembedder.log_prob(action_logits, data.action, **action_select_kwargs)
 
-
             # update actor, classic clipped surrogate loss
 
             eps_clip = self.ppo_eps_clip
@@ -1321,7 +1330,7 @@ class Locoformer(Module):
 
                 windowed_actor_loss = (
                     windowed_actor_loss +
-                    windowed_state_pred_loss * self.state_pred_loss_weight
+                    windowed_state_pred_loss * state_pred_loss_weight
                 )
 
             # windowed loss

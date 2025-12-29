@@ -99,7 +99,8 @@ def main(
     reward_range = (-300., 300.),
     test_episode_mapping_constructor = False,
     test_mock_internal_states = False,
-    test_mock_reward_shaping = False
+    test_mock_reward_shaping = False,
+    cpu = False
 ):
 
     if clear_folders:
@@ -116,7 +117,7 @@ def main(
 
     # accelerate
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
 
     # testing reward shaping, and storing of the values
@@ -278,6 +279,9 @@ def main(
         # all environments should follow usual MDP interface, domain randomization should be given at instantiation
 
         def get_snapshot_from_env(step_output, env):
+            if not use_vision:
+                return None
+
             return get_snapshot(env, dim_state_image_shape[1:])
 
         transforms = dict(state_image = get_snapshot_from_env)
