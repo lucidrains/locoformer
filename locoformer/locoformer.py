@@ -980,6 +980,8 @@ class Locoformer(Module):
         ppo_eps_clip = 0.2,
         ppo_entropy_weight = 0.01,
         ppo_value_clip = 0.4,
+        ppo_soft_constrain_action_max = None,
+        ppo_soft_constrain_action_loss_weight = 0.1,
         dim_value_input = None,                 # needs to be set for value network to be available
         value_network: Module = nn.Identity(),
         policy_network: Module = nn.Identity(),
@@ -1088,6 +1090,9 @@ class Locoformer(Module):
         self.ppo_eps_clip = ppo_eps_clip
         self.ppo_entropy_weight = ppo_entropy_weight
         self.ppo_value_clip = ppo_value_clip
+        self.ppo_soft_constrain_action_max = ppo_soft_constrain_action_max
+        self.ppo_soft_constrain_action_loss_weight = ppo_soft_constrain_action_loss_weight
+
         self.value_loss_weight = value_loss_weight
 
         self.calc_gae_kwargs = calc_gae_kwargs
@@ -1333,6 +1338,22 @@ class Locoformer(Module):
                     windowed_state_pred_loss * state_pred_loss_weight
                 )
 
+            # maybe soft constrain continuous actions
+
+            if (
+                self.ppo_soft_constrain_action_max and
+                self.unembedder.has_continuous
+            ):
+                loss_mask = data.windowed_gae_mask
+
+                soft_constrain_loss = (action_logits[..., 0].abs() - self.ppo_soft_constrain_action_max).relu().pow(2)
+                windowed_soft_constrain_loss = soft_constrain_loss[loss_mask].sum() / total_learnable_tokens
+
+                windowed_actor_loss = (
+                    windowed_actor_loss +
+                    windowed_soft_constrain_loss * self.ppo_soft_constrain_action_loss_weight
+                )
+
             # windowed loss
 
             windowed_actor_loss.backward(retain_graph = True)
@@ -1461,7 +1482,13 @@ class Locoformer(Module):
 
             if self.has_reward_shaping:
                 shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['state'], command, env_index = env_index)
-                env_step_out_dict['shaped_rewards'] = shaped_rewards
+
+                if exists(shaped_rewards):
+                    env_step_out_dict['shaped_rewards'] = shaped_rewards
+
+                    # add shaped rewards to main reward
+
+                    env_step_out_dict['reward'] = env_step_out_dict['reward'] + shaped_rewards.sum()
 
             derived_states = dict()
 
@@ -1499,6 +1526,9 @@ class Locoformer(Module):
             if exists(condition):
                 condition = condition.to(self.device)
 
+            if exists(cond_mask):
+                cond_mask = cond_mask.to(self.device)
+
             # handle no batch or time, for easier time rolling out against envs
 
             if not has_batch_dim:
@@ -1507,17 +1537,24 @@ class Locoformer(Module):
                 if exists(condition):
                     condition = rearrange(condition, '... -> 1 ...')
 
+                if exists(cond_mask):
+                    cond_mask = rearrange(cond_mask, '... -> 1 ...')
+
             if not has_time_dim:
                 state = state.unsqueeze(state_time_dim)
 
                 if exists(condition):
                     condition = rearrange(condition, '... d -> ... 1 d')
 
+                if exists(cond_mask):
+                    cond_mask = cond_mask.unsqueeze(state_time_dim)
+
             # forwards
 
             out, cache = self.forward(
                 state,
                 condition = condition,
+                cond_mask = cond_mask,
                 cache = cache,
                 **{**kwargs, **override_kwargs}
             )

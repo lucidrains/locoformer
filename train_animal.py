@@ -27,9 +27,45 @@ from torch.optim import Adam
 
 from einops import rearrange, einsum
 
-from locoformer.locoformer import Locoformer
+from locoformer.locoformer import Locoformer, check_has_param_attr, tensor_to_dict
 from locoformer.replay_buffer import ReplayBuffer
 from x_mlps_pytorch import Feedforwards, MLP
+
+# humanoid observation config
+
+HUMANOID_OBS_CONFIG = (
+    ('height', 1),
+    ('quat', 4),
+    ('v_x', 1),
+    ('v_y', 1),
+    ('v_z', 1),
+    ('rest', 340)
+)
+
+@check_has_param_attr('state', 'height')
+@check_has_param_attr('state', 'v_x')
+def reward_humanoid_walking(
+    state,
+    s_height = 1.0,
+    s_vel = 1.25,
+    height_nominal = 1.4,
+    height_threshold = 0.4
+):
+    # maintaining nominal height
+    height_error = (state.height - height_nominal).pow(2)
+    height_reward = (-height_error / s_height).exp()
+
+    # falling
+    fall_penalty = (state.height < (height_nominal - height_threshold)).float() * -10.
+
+    # forward velocity reward
+    vel_reward = state.v_x * s_vel
+
+    return height_reward + vel_reward + fall_penalty
+
+def humanoid_reward_shaping(state):
+    state_named = tensor_to_dict(state, HUMANOID_OBS_CONFIG)
+    return reward_humanoid_walking(state_named)
 
 # helper functions
 
@@ -55,26 +91,26 @@ def get_snapshot(env, shape):
 def main(
     fixed_env_index = -1,
     num_learning_cycles = 5_000,
-    num_episodes_before_learn = 64,
+    num_episodes_before_learn = 128,
+    record_every_episode = 128,
     max_timesteps = 250,
-    replay_buffer_size = 128,
+    replay_buffer_size = 256,
     use_vision = False,
     embed_past_action = True,
     vision_height_width_dim = 64,
     clear_video = True,
     video_folder = 'recordings_animal',
-    record_every_episode = 64,
     learning_rate = 3e-4,
     discount_factor = 0.99,
     betas = (0.9, 0.99),
     gae_lam = 0.95,
     ppo_eps_clip = 0.2,
-    ppo_entropy_weight = .01,
-    state_entropy_bonus_weight = .25,
-    batch_size = 32,
-    epochs = 5,
+    ppo_entropy_weight = .02,
+    state_entropy_bonus_weight = .1,
+    batch_size = 64,
+    epochs = 3,
     reward_range = (-10000., 10000.),
-    num_reward_bins = 10_000,
+    num_reward_bins = 25_000,
     cpu = False
 ):
 
@@ -101,21 +137,22 @@ def main(
 
     locoformer = Locoformer(
         embedder = dict(
-            dim = 128,
+            dim = 256,
             dim_state = [348, 17],
         ),
         unembedder = dict(
-            dim = 128,
+            dim = 256,
             num_continuous = 17 + 6,
             selectors = [
                 list(range(17)),
                 list(range(17, 17 + 6))
             ]
         ),
-        state_pred_network = Feedforwards(dim = 128, depth = 1),
+        state_pred_loss_weight = 0.005,
+        state_pred_network = Feedforwards(dim = 256, depth = 2, final_norm = True),
         embed_past_action = embed_past_action,
         transformer = dict(
-            dim = 128,
+            dim = 256,
             dim_head = 32,
             heads = 8,
             depth = 6,
@@ -127,9 +164,10 @@ def main(
         gae_lam = gae_lam,
         ppo_eps_clip = ppo_eps_clip,
         ppo_entropy_weight = ppo_entropy_weight,
-        use_spo = True,
-        value_network = Feedforwards(dim = 128, depth = 1),
-        dim_value_input = 128,
+        ppo_soft_constrain_action_max = 1.,
+        policy_network = Feedforwards(dim = 256, depth = 2, final_norm = True),
+        value_network = Feedforwards(dim = 256, depth = 4, final_norm = True),
+        dim_value_input = 256,
         num_reward_bins = num_reward_bins,
         reward_range = reward_range,
         hl_gauss_loss_kwargs = dict(),
@@ -137,7 +175,12 @@ def main(
         calc_gae_kwargs = dict(
             use_accelerated = False
         ),
-        asymmetric_spo = True
+        reward_shaping_fns = [
+            [humanoid_reward_shaping],
+            []
+        ],
+        use_spo = True,
+        asymmetric_spo = False
     ).to(device)
 
     optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
@@ -242,6 +285,7 @@ def main(
                 action_select_kwargs = action_select_kwargs,
                 state_embed_kwargs = state_embed_kwargs,
                 state_id_kwarg = state_id_kwarg,
+                env_index = env_index,
                 state_entropy_bonus_weight = state_entropy_bonus_weight,
                 embed_past_action = embed_past_action
             )
