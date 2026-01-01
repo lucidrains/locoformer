@@ -44,7 +44,7 @@ from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import EmbedAndReadout, Embed, Readout
 
-from locoformer.replay_buffer import ReplayBuffer
+from memmap_replay_buffer import ReplayBuffer
 
 # constants
 
