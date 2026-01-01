@@ -44,7 +44,7 @@ from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import EmbedAndReadout, Embed, Readout
 
-from memmap_replay_buffer import ReplayBuffer
+from memmap_replay_buffer import ReplayBuffer, ReplayDataset
 
 # constants
 
@@ -177,6 +177,76 @@ def tensor_to_dict(
         return tensor_dict
 
     return SimpleNamespace(**tensor_dict)
+
+# dataset related
+
+class RemappedReplayDataset(Dataset):
+    def __init__(
+        self,
+        dataset: ReplayDataset,
+        episode_mapping: Tensor | list[list[int]],
+        shuffle_episodes = False,
+        num_trials_select = None
+    ):
+        assert len(dataset) > 0
+        self.dataset = dataset
+
+        if is_tensor(episode_mapping):
+            assert episode_mapping.dtype in (torch.int, torch.long) and episode_mapping.ndim == 2
+            episode_mapping = episode_mapping.tolist()
+
+        self.episode_mapping = episode_mapping
+        self.shuffle_episodes = shuffle_episodes
+
+        assert not (exists(num_trials_select) and num_trials_select <= 0)
+        self.sub_select_trials = exists(num_trials_select)
+        self.num_trials_select = num_trials_select
+
+    def __len__(self):
+        return len(self.episode_mapping)
+
+    def __getitem__(self, idx):
+
+        episode_indices = self.episode_mapping[idx]
+
+        episode_indices = tensor(episode_indices)
+        episode_indices = episode_indices[(episode_indices >= 0) & (episode_indices < len(self.dataset))]
+
+        assert not is_empty(episode_indices)
+
+        # shuffle the episode indices if either shuffle episodes is turned on, or `num_trial_select` passed in (for sub selecting episodes from a set)
+
+        if (
+            episode_indices.numel() > 1 and
+            (self.shuffle_episodes or self.sub_select_trials)
+        ):
+            num_episodes = len(episode_indices)
+            episode_indices = episode_indices[torch.randperm(num_episodes)]
+
+        # crop out the episodes
+
+        if self.sub_select_trials:
+            episode_indices = episode_indices[:self.num_trials_select]
+
+        # now select out the episode data and merge along time
+
+        episode_data = [self.dataset[i] for i in episode_indices.tolist()]
+
+        episode_lens = stack([data.pop('_lens') for data in episode_data])
+
+        keys = first(episode_data).keys()
+
+        values = [list(data.values()) for data in episode_data]
+
+        values = [cat(field_values) for field_values in zip(*values)] # concat across time
+
+        multi_episode_data = dict(zip(keys, values))
+
+        multi_episode_data['_lens'] = episode_lens.sum()
+
+        multi_episode_data['_episode_indices'] = cat([torch.full((episode_len,), episode_index) for episode_len, episode_index in zip(episode_lens, episode_indices)])
+
+        return multi_episode_data
 
 # reward functions - A.2
 
@@ -1165,8 +1235,14 @@ class Locoformer(Module):
         if exists(maybe_construct_trial_from_buffer):
             episode_mapping = maybe_construct_trial_from_buffer(replay)
 
+        dataset = replay.dataset()
+
+        if exists(episode_mapping):
+            dataset = RemappedReplayDataset(dataset, episode_mapping)
+
         dl = replay.dataloader(
             batch_size = batch_size,
+            dataset = dataset,
             shuffle = True,
             episode_mapping = episode_mapping
         )
