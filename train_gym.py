@@ -26,9 +26,7 @@ from torch.optim import Adam
 
 from einops import rearrange, einsum
 
-from locoformer.locoformer import Locoformer
-
-from locoformer.replay_buffer import ReplayBuffer
+from locoformer.locoformer import Locoformer, ReplayBuffer
 
 from x_mlps_pytorch import Feedforwards, MLP
 

@@ -27,8 +27,7 @@ from torch.optim import Adam
 
 from einops import rearrange, einsum
 
-from locoformer.locoformer import Locoformer, check_has_param_attr, tensor_to_dict
-from locoformer.replay_buffer import ReplayBuffer
+from locoformer.locoformer import Locoformer, ReplayBuffer, check_has_param_attr, tensor_to_dict
 from x_mlps_pytorch import Feedforwards, MLP
 
 # humanoid observation config
