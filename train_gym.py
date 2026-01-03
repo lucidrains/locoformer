@@ -78,7 +78,7 @@ def main(
     num_episodes_before_learn = 32,
     alternate_env_every = 1,
     max_timesteps = 500,
-    replay_buffer_size = 128,
+    replay_buffer_size = 64,
     use_vision = False,
     embed_past_action = False,
     vision_height_width_dim = 64,
@@ -250,7 +250,8 @@ def main(
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
-                )
+                ),
+                circular = True
             )
 
             replay_buffers[env_index] = replay

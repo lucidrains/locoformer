@@ -1243,8 +1243,7 @@ class Locoformer(Module):
         dl = replay.dataloader(
             batch_size = batch_size,
             dataset = dataset,
-            shuffle = True,
-            episode_mapping = episode_mapping
+            shuffle = True
         )
 
         self, dl, *optims = accelerator.prepare(self, dl, *optims)

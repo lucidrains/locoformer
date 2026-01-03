@@ -236,7 +236,8 @@ def main(
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
-                )
+                ),
+                circular = True
             )
 
             replay_buffers[env_index] = replay
