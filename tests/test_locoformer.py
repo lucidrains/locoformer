@@ -13,11 +13,13 @@ from locoformer.locoformer import Locoformer
 @param('recurrent_cache', (False, True))
 @param('has_commands', (False, True))
 @param('long_term_mem_layers', ((), (1, 2)))
+@param('hyper_conn', (False, True))
 def test_locoformer(
     gru_layers,
     recurrent_cache,
     has_commands,
-    long_term_mem_layers
+    long_term_mem_layers,
+    hyper_conn
 ):
     
     model = Locoformer(
@@ -33,7 +35,8 @@ def test_locoformer(
             window_size = 512,
             gru_layers = gru_layers,
             dim_cond = 2 if has_commands else None,
-            long_term_mem_layers = long_term_mem_layers
+            long_term_mem_layers = long_term_mem_layers,
+            num_residual_streams = 2 if hyper_conn else 1
         )
     )
 

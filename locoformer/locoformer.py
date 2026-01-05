@@ -697,6 +697,8 @@ class TransformerXL(Module):
 
             # maybe hyper connections
 
+            mem_store_hc = init_hyper_conn(dim = dim, add_branch_out_to_residual = False)
+
             if num_residual_streams > 1:
 
                 attn = init_hyper_conn(dim = dim, branch = attn)
@@ -710,7 +712,7 @@ class TransformerXL(Module):
                     mem = init_hyper_conn(dim = dim, branch = mem, forward_method_names = ('store',))
 
             layers.append(ModuleList([
-                gru, mem, attn, ff
+                gru, mem, mem_store_hc, attn, ff
             ]))
 
         self.layers = layers
@@ -780,7 +782,7 @@ class TransformerXL(Module):
 
         # layers
 
-        for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache, layer_hidden_states in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache, mem_mlp_hidden_states):
+        for (maybe_gru, maybe_mem, maybe_mem_store_hc, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache, layer_hidden_states in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache, mem_mlp_hidden_states):
 
             # handle maybe rnn
 
@@ -814,7 +816,9 @@ class TransformerXL(Module):
                     next_layer_hidden_states = safe_cat(layer_hidden_states, x, dim = -2)
 
                     if is_window_boundary:
-                        next_mem_mlp = maybe_mem.store(next_layer_hidden_states, layer_mem_mlp)
+                        mem_store_input, _ = maybe_mem_store_hc(next_layer_hidden_states)
+
+                        next_mem_mlp = maybe_mem.store(mem_store_input, layer_mem_mlp)
                         next_layer_hidden_states = None
 
                 next_mem_mlp_cache.append(next_mem_mlp)
