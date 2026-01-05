@@ -30,6 +30,7 @@ from locoformer.locoformer import Locoformer
 
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 16
+GRAD_ACCUM_EVERY = 1
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
 
@@ -75,13 +76,14 @@ embed, readout = EmbedAndReadout(dim_model, num_discrete = 256)
 model = Locoformer(
     embedder = embed,
     unembedder = readout,
+    max_mem_segments = 2,
     transformer = dict(
         dim = dim_model,
         depth = 6,
         fixed_window_size = FIXED_WINDOW_SIZE,
         window_size = SEQ_LEN,
         long_term_mem_layers = (3, 4),
-        num_residual_streams = 4
+        num_residual_streams = 1
     )
 )
 
@@ -131,26 +133,27 @@ val_loader_iter = cycle(val_loader)
 for i in range(NUM_BATCHES):
     model.train()
 
-    seq = next(train_loader_iter)
-    seq, labels = seq[:, :-1], seq[:, 1:]
+    for _ in range(GRAD_ACCUM_EVERY):
+        seq = next(train_loader_iter)
+        seq, labels = seq[:, :-1], seq[:, 1:]
 
-    cache = None
+        cache = None
 
-    for segment_seq, segment_labels in zip(seq.chunk(NUM_SEGMENTS, dim = -1), labels.chunk(NUM_SEGMENTS, dim = -1)):
+        for segment_seq, segment_labels in zip(seq.chunk(NUM_SEGMENTS, dim = -1), labels.chunk(NUM_SEGMENTS, dim = -1)):
 
-        logits, cache = model(
-            segment_seq,
-            cache = cache,
-            detach_cache = True
-        )
+            logits, cache = model(
+                segment_seq,
+                cache = cache,
+                detach_cache = True
+            )
 
-        loss = F.cross_entropy(
-            rearrange(logits, 'b n l -> b l n'),
-            segment_labels
-        )
+            loss = F.cross_entropy(
+                rearrange(logits, 'b n l -> b l n'),
+                segment_labels
+            )
 
-        accelerate.backward(loss / NUM_SEGMENTS)
-        accelerate.print(f'[{i}] loss: {loss.item():.3f}')
+            accelerate.backward(loss / (NUM_SEGMENTS * GRAD_ACCUM_EVERY))
+            accelerate.print(f'[{i}] loss: {loss.item():.3f}')
 
         optim.step()
         optim.zero_grad()

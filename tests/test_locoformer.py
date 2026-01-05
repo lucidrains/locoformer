@@ -254,3 +254,41 @@ def test_memory():
     memories = memory.store(tokens, memories)
 
     assert tokens.shape == (2, 32, 512)
+
+@param('recurrent_cache', (False, True))
+def test_locoformer_multi_segment(recurrent_cache):
+    model = Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256, bias = False),
+        max_mem_segments = 2,
+        recurrent_cache = recurrent_cache,
+        transformer = dict(
+            dim = 128,
+            depth = 1,
+            window_size = 128
+        )
+    ).eval()
+
+    seq = torch.randint(0, 256, (1, 128 * 2))
+
+    logits_full = []
+    cache = None
+
+    for segment in seq.chunk(2, dim = -1):
+        logits, cache = model(segment, cache = cache)
+        logits_full.append(logits)
+
+    logits_full = torch.cat(logits_full, dim = 1)
+
+    stateful_forward = model.get_stateful_forward(has_batch_dim = True, has_time_dim = True, inference_mode = True)
+
+    logits_stateful = []
+
+    for step_seq in seq.unbind(dim = -1):
+        step_seq = rearrange(step_seq, 'b -> b 1')
+        logits = stateful_forward(step_seq)
+        logits_stateful.append(logits)
+    
+    logits_stateful = torch.cat(logits_stateful, dim = 1)
+    
+    assert torch.allclose(logits_full, logits_stateful, atol = 1e-5)

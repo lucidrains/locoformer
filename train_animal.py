@@ -179,7 +179,8 @@ def main(
             []
         ],
         use_spo = True,
-        asymmetric_spo = False
+        asymmetric_spo = False,
+        max_mem_segments = 2
     ).to(device)
 
     optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
