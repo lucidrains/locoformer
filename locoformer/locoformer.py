@@ -6,7 +6,7 @@ from functools import partial, wraps
 
 from pathlib import Path
 from contextlib import contextmanager
-from collections import namedtuple
+from collections import namedtuple, deque
 
 from glom import glom
 
@@ -57,7 +57,8 @@ TransformerMemory = namedtuple('TransformerMemory', (
     'kv_cache',
     'gru_cache',
     'mem_mlp_cache',
-    'mem_mlp_hidden_states'
+    'mem_mlp_hidden_states',
+    'memory_segments'
 ))
 
 # helper functions
@@ -503,7 +504,8 @@ class Attention(Module):
         dim_head = 64,
         heads = 8,
         fixed_window_size = False,
-        accept_value_residual = False
+        accept_value_residual = False,
+        max_mem_segments = 1
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -539,6 +541,7 @@ class Attention(Module):
 
         self.fixed_window_size = fixed_window_size
         self.window_size = window_size
+        self.max_mem_segments = max_mem_segments
 
         self.register_buffer('causal_mask', None, persistent = False)
 
@@ -547,6 +550,7 @@ class Attention(Module):
         tokens,
         value_residual = None,
         kv_cache = None,
+        past_segments = None,
         return_kv_cache = False,
     ):
         seq_len = tokens.shape[-2]
@@ -571,6 +575,11 @@ class Attention(Module):
             k = cat((ck, k), dim = -2)
             v = cat((cv, v), dim = -2)
 
+        if exists(past_segments):
+            pk, pv = past_segments
+            k = cat((pk, k), dim = -2)
+            v = cat((pv, v), dim = -2)
+
         if return_kv_cache:
             next_kv_cache = stack((k, v))
 
@@ -584,7 +593,7 @@ class Attention(Module):
             i_seq = arange(i, device = device)
             j_seq = arange(j, device = device) - (j - i)
             dist = einx.subtract('i, j -> i j', i_seq, j_seq)
-            causal_mask = (dist < 0) | (dist > self.window_size)
+            causal_mask = (dist < 0) | (dist > (self.max_mem_segments * self.window_size))
         else:
             if not exists(self.causal_mask) or self.causal_mask.shape != (i, j):
                 self.causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
@@ -651,7 +660,8 @@ class TransformerXL(Module):
         gru_layers = False,
         long_term_mem_layers: tuple[int, ...] = (),
         mem_kwargs: dict = dict(),
-        num_residual_streams = 1
+        num_residual_streams = 1,
+        max_mem_segments = 1
     ):
         super().__init__()
         self.dim = dim
@@ -665,6 +675,7 @@ class TransformerXL(Module):
         self.long_term_mem_layers = long_term_mem_layers
         self.num_mem_mlps = len(long_term_mem_layers)
         self.has_mem = self.num_mem_mlps > 0
+        self.max_mem_segments = max_mem_segments
 
         # hyper connections
 
@@ -691,7 +702,7 @@ class TransformerXL(Module):
 
             mem = MemoryMLP(dim, **mem_kwargs) if has_mem else None
 
-            attn = norm_fn(Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first))
+            attn = norm_fn(Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first, max_mem_segments = max_mem_segments))
 
             ff = norm_fn(FeedForward(dim = dim, expansion_factor = expansion_factor))
 
@@ -743,11 +754,20 @@ class TransformerXL(Module):
 
         is_first_window = True
         total_tokens = 0
-        kv_cache = gru_cache = mem_mlp_cache = mem_mlp_hidden_states = None
+        kv_cache = gru_cache = mem_mlp_cache = mem_mlp_hidden_states = memory_segments = None
 
         if exists(cache):
-            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states = cache
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments = cache
             is_first_window = total_tokens < self.window_size
+        else:
+            memory_segments = deque(maxlen = self.max_mem_segments)
+
+        # handle memory segments
+
+        past_segments = None
+        if len(memory_segments) > 0:
+            past_segments = stack(list(memory_segments), dim = 0)
+            past_segments = rearrange(past_segments, 'l depth kv b h n d -> depth kv b h (l n) d')
 
         kv_cache = default(kv_cache, (None,) * num_layers)
         gru_cache = default(gru_cache, (None,) * num_layers)
@@ -782,7 +802,7 @@ class TransformerXL(Module):
 
         # layers
 
-        for (maybe_gru, maybe_mem, maybe_mem_store_hc, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache, layer_hidden_states in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache, mem_mlp_hidden_states):
+        for layer_index, ((maybe_gru, maybe_mem, maybe_mem_store_hc, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache, layer_hidden_states) in enumerate(zip(self.layers, gru_cache, mem_mlp_cache, kv_cache, mem_mlp_hidden_states)):
 
             # handle maybe rnn
 
@@ -803,7 +823,11 @@ class TransformerXL(Module):
 
             # attention
 
-            x, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, return_kv_cache = True)
+            layer_past_segments = None
+            if exists(past_segments):
+                layer_past_segments = past_segments[layer_index]
+
+            x, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, past_segments = layer_past_segments, return_kv_cache = True)
 
             # handle storing of memory
 
@@ -844,7 +868,7 @@ class TransformerXL(Module):
         if exists(next_gru_hiddens):
             next_gru_hiddens = stack(next_gru_hiddens)
 
-        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache, next_mem_mlp_hidden_states)
+        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache, next_mem_mlp_hidden_states, memory_segments)
 
         return embed, next_cache
 
@@ -1103,12 +1127,13 @@ class Locoformer(Module):
         parse_env_step_out: Callable | None = None,
         recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
-        asymmetric_spo = False  # https://openreview.net/pdf?id=BA6n0nmagi
+        asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
+        max_mem_segments = 1
     ):
         super().__init__()
 
         if isinstance(transformer, dict):
-            transformer = TransformerXL(**transformer)
+            transformer = TransformerXL(max_mem_segments = max_mem_segments, **transformer)
 
         self.transformer = transformer
 
@@ -1142,6 +1167,7 @@ class Locoformer(Module):
 
         self.fixed_window_size = transformer.fixed_window_size
         self.window_size = transformer.window_size
+        self.max_mem_segments = max_mem_segments
 
         # policy network
 
@@ -1924,11 +1950,18 @@ class Locoformer(Module):
 
         # attention
 
+        if not exists(cache):
+            memory_segments = deque(maxlen = self.max_mem_segments)
+        else:
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments = cache
+
+        attn_cache = cache
+
         embed, cache = self.transformer(
             tokens,
             condition = condition,
             cond_mask = cond_mask,
-            cache = cache,
+            cache = attn_cache,
             return_kv_cache = True
         )
 
@@ -1971,21 +2004,20 @@ class Locoformer(Module):
 
         # handle curtailing kv cache at the right intervals
 
-        window_size = self.window_size
+        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments = cache
 
-        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states = cache
+        if self.fixed_window_size or divisible_by(total_tokens, self.window_size * 2):
+            kv_cache = kv_cache[..., -self.window_size:, :]
 
-        if self.fixed_window_size or divisible_by(total_tokens, window_size * 2):
-            kv_cache = kv_cache[..., -window_size:, :]
-
-        # maybe recurrent cache - shift the kv cache from one layer above to the one below, for extending on receptive field of past
-
-        if self.recurrent_cache and divisible_by(total_tokens, window_size):
+        if self.recurrent_cache and divisible_by(total_tokens, self.window_size):
             kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
 
             if exists(gru_cache):
                 gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
-        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states)
+        if divisible_by(total_tokens, self.window_size):
+            memory_segments.append(kv_cache.detach())
+
+        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments)
 
         return out, cache
