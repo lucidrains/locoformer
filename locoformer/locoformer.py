@@ -44,6 +44,8 @@ from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import EmbedAndReadout, Embed, Readout
 
+from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
+
 from memmap_replay_buffer import ReplayBuffer, ReplayDataset
 
 # constants
@@ -648,7 +650,8 @@ class TransformerXL(Module):
         fixed_window_size = False,
         gru_layers = False,
         long_term_mem_layers: tuple[int, ...] = (),
-        mem_kwargs: dict = dict()
+        mem_kwargs: dict = dict(),
+        num_residual_streams = 1
     ):
         super().__init__()
         self.dim = dim
@@ -662,6 +665,10 @@ class TransformerXL(Module):
         self.long_term_mem_layers = long_term_mem_layers
         self.num_mem_mlps = len(long_term_mem_layers)
         self.has_mem = self.num_mem_mlps > 0
+
+        # hyper connections
+
+        init_hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams)
 
         # condition
 
@@ -687,6 +694,20 @@ class TransformerXL(Module):
             attn = norm_fn(Attention(dim = dim, dim_head = dim_head, heads = heads, fixed_window_size = fixed_window_size, window_size = window_size, accept_value_residual = not is_first))
 
             ff = norm_fn(FeedForward(dim = dim, expansion_factor = expansion_factor))
+
+            # maybe hyper connections
+
+            if num_residual_streams > 1:
+
+                attn = init_hyper_conn(dim = dim, branch = attn)
+
+                ff = init_hyper_conn(dim = dim, branch = ff)
+
+                if gru_layers:
+                    gru = init_hyper_conn(dim = dim, branch = gru)
+
+                if has_mem:
+                    mem = init_hyper_conn(dim = dim, branch = mem, forward_method_names = ('store',))
 
             layers.append(ModuleList([
                 gru, mem, attn, ff
@@ -753,6 +774,10 @@ class TransformerXL(Module):
 
         cond_kwargs = dict(cond = cond_tokens, cond_mask = cond_mask)
 
+        # hc expand
+
+        x = self.expand_streams(x)
+
         # layers
 
         for (maybe_gru, maybe_mem, attn, ff), layer_gru_cache, layer_mem_mlp, layer_kv_cache, layer_hidden_states in zip(self.layers, gru_cache, mem_mlp_cache, kv_cache, mem_mlp_hidden_states):
@@ -760,8 +785,7 @@ class TransformerXL(Module):
             # handle maybe rnn
 
             if exists(maybe_gru):
-                rnn_out, gru_hiddens = maybe_gru(x, layer_gru_cache, **cond_kwargs)
-                x = rnn_out + x
+                x, gru_hiddens = maybe_gru(x, layer_gru_cache, **cond_kwargs)
 
                 next_gru_hiddens.append(gru_hiddens)
 
@@ -773,14 +797,11 @@ class TransformerXL(Module):
                 not is_first_window and
                 is_mem_layer
             ):
-                retrieved_mem = maybe_mem(x, layer_mem_mlp)
-                x = x + retrieved_mem
+                x = maybe_mem(x, layer_mem_mlp)
 
             # attention
 
-            attn_out, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, return_kv_cache = True)
-
-            x = attn_out + x
+            x, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, return_kv_cache = True)
 
             # handle storing of memory
 
@@ -801,10 +822,16 @@ class TransformerXL(Module):
 
             # feedforward
 
-            x = ff(x, **cond_kwargs) + x
+            x = ff(x, **cond_kwargs)
 
             next_kv_caches.append(next_kv_cache)
             value_residual = default(value_residual, values)
+
+        # hc reduce
+
+        x = self.reduce_streams(x)
+
+        # norm
 
         embed = self.norm(x)
 
