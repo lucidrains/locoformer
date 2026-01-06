@@ -539,9 +539,11 @@ class Attention(Module):
 
         # fixed window size
 
-        self.fixed_window_size = fixed_window_size
-        self.window_size = window_size
+        assert max_mem_segments >= 1
         self.max_mem_segments = max_mem_segments
+
+        self.fixed_window_size = fixed_window_size or max_mem_segments > 1
+        self.window_size = window_size
 
         self.register_buffer('causal_mask', None, persistent = False)
 

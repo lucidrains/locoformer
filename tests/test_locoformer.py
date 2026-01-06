@@ -269,12 +269,12 @@ def test_locoformer_multi_segment(recurrent_cache):
         )
     ).eval()
 
-    seq = torch.randint(0, 256, (1, 128 * 2))
+    seq = torch.randint(0, 256, (1, 128 * 4))
 
     logits_full = []
     cache = None
 
-    for segment in seq.chunk(2, dim = -1):
+    for segment in seq.chunk(4, dim = -1):
         logits, cache = model(segment, cache = cache)
         logits_full.append(logits)
 
