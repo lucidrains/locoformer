@@ -55,7 +55,7 @@ def get_snapshot(env, shape):
 
 def create_episode_mapping_from_replay(buffer):
     episodes = torch.arange(buffer.num_episodes)
-    cum_rewards = torch.from_numpy(buffer.meta_memmaps['cum_rewards'][:buffer.num_episodes])
+    cum_rewards = torch.from_numpy(buffer.meta_data['cum_rewards'][:buffer.num_episodes])
 
     # pair the episode previous with the next episode, just for testing
 
@@ -251,7 +251,8 @@ def main(
                 meta_fields = dict(
                     cum_rewards = 'float'
                 ),
-                circular = True
+                circular = True,
+                overwrite = True
             )
 
             replay_buffers[env_index] = replay

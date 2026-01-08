@@ -662,8 +662,9 @@ class TransformerXL(Module):
         gru_layers = False,
         long_term_mem_layers: tuple[int, ...] = (),
         mem_kwargs: dict = dict(),
+        max_mem_segments = 1,
         num_residual_streams = 1,
-        max_mem_segments = 1
+        mhc_sinkhorn_iters = 4
     ):
         super().__init__()
         self.dim = dim
@@ -681,7 +682,7 @@ class TransformerXL(Module):
 
         # hyper connections
 
-        init_hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams)
+        init_hyper_conn, self.expand_streams, self.reduce_streams = mc_get_init_and_expand_reduce_stream_functions(num_residual_streams, sinkhorn_iters = mhc_sinkhorn_iters)
 
         # condition
 
@@ -1305,6 +1306,8 @@ class Locoformer(Module):
             shuffle = True
         )
 
+        self.train()
+
         self, dl, *optims = accelerator.prepare(self, dl, *optims)
 
         for _ in range(epochs):
@@ -1738,6 +1741,8 @@ class Locoformer(Module):
         action_rescale_range: tuple[float, float] | None = None,
         command_fn: Callable = always(None)
     ):
+
+        self.eval()
 
         env_reset, env_step = wrapped_env_functions
 

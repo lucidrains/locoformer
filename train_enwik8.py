@@ -155,8 +155,8 @@ for i in range(NUM_BATCHES):
             accelerate.backward(loss / (NUM_SEGMENTS * GRAD_ACCUM_EVERY))
             accelerate.print(f'[{i}] loss: {loss.item():.3f}')
 
-        optim.step()
-        optim.zero_grad()
+    optim.step()
+    optim.zero_grad()
 
     if divisible_by(i, GENERATE_EVERY):
         model.eval()
