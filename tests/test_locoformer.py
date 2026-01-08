@@ -292,3 +292,37 @@ def test_locoformer_multi_segment(recurrent_cache):
     logits_stateful = torch.cat(logits_stateful, dim = 1)
     
     assert torch.allclose(logits_full, logits_stateful, atol = 1e-5)
+
+def test_locoformer_episode_id():
+    dim, window_size = 128, 8
+    model = Locoformer(
+        embedder = nn.Embedding(256, dim), unembedder = nn.Linear(dim, 256),
+        transformer = dict(dim = dim, depth = 1, window_size = window_size)
+    )
+
+    # basic and consistency
+    seq, ep_id = torch.randint(0, 256, (1, 8)), torch.zeros((1, 8), dtype = torch.long)
+    _, cache = model(seq, episode_id = ep_id)
+    with pytest.raises(AssertionError):
+        model(seq, cache = cache) # missing episode_id
+
+    # isolation & stateful forward
+    model = Locoformer(
+        embedder = nn.Linear(window_size, dim, bias = False),
+        unembedder = nn.Linear(dim, 1),
+        transformer = dict(dim = dim, depth = 1, window_size = 4, heads = 1)
+    ).eval()
+    
+    win1, win2 = torch.randn(1, 4, window_size), torch.randn(1, 4, window_size)
+    ep0, ep1 = torch.zeros((1, 4), dtype = torch.long), torch.ones((1, 4), dtype = torch.long)
+    
+    _, cache = model(win1, episode_id = ep0)
+    out_diff_ep, _ = model(win2, episode_id = ep1, cache = cache)
+    out_clean, _ = model(win2, episode_id = ep1)
+    
+    assert torch.allclose(out_diff_ep, out_clean, atol = 1e-5)
+
+    stateful_forward = model.get_stateful_forward(has_batch_dim = True, inference_mode = True)
+    for step in win2.unbind(dim = 1):
+        out = stateful_forward(step, episode_id = torch.ones((1,), dtype = torch.long))
+        assert out.shape == (1, 1)

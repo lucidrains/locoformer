@@ -58,7 +58,10 @@ TransformerMemory = namedtuple('TransformerMemory', (
     'gru_cache',
     'mem_mlp_cache',
     'mem_mlp_hidden_states',
-    'memory_segments'
+    'memory_segments',
+    'episode_id_segments',
+    'curr_episode_ids',
+    'passed_episode_ids'
 ))
 
 # helper functions
@@ -343,6 +346,7 @@ def calc_gae(
 # transformer-xl mask w/ flex attn
 
 flex_attention = None
+create_block_mask = None
 
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
@@ -554,6 +558,8 @@ class Attention(Module):
         kv_cache = None,
         past_segments = None,
         return_kv_cache = False,
+        episode_ids: Tensor | None = None,
+        past_episode_ids: Tensor | None = None
     ):
         seq_len = tokens.shape[-2]
 
@@ -585,28 +591,47 @@ class Attention(Module):
             k = cat((pk, k), dim = -2)
             v = cat((pv, v), dim = -2)
 
+        if exists(past_episode_ids) and exists(episode_ids):
+            all_episode_ids = cat((past_episode_ids, episode_ids), dim = -1)
+        else:
+            all_episode_ids = episode_ids
+
         q, k = self.rotary_embed.rotate_queries_with_cached_keys(q, k)
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
         i, j = sim.shape[-2:]
 
-        if self.fixed_window_size:
-            i_seq = arange(i, device = device)
-            j_seq = arange(j, device = device) - (j - i)
-            dist = einx.subtract('i, j -> i j', i_seq, j_seq)
-            causal_mask = (dist < 0) | (dist > (self.max_mem_segments * self.window_size))
+        if exists(flex_attention) and tokens.is_cuda:
+            mask = create_xl_mask(i, j, self.window_size, episode_ids = all_episode_ids, lookback_blocks = self.max_mem_segments, device = device)
+            out = flex_attention(q, k, v, block_mask = mask)
         else:
-            if not exists(self.causal_mask) or self.causal_mask.shape != (i, j):
-                self.causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
+            if self.fixed_window_size:
+                i_seq = arange(i, device = device)
+                j_seq = arange(j, device = device) - (j - i)
+                dist = einx.subtract('i, j -> i j', i_seq, j_seq)
+                causal_mask = (dist < 0) | (dist > (self.max_mem_segments * self.window_size))
+            else:
+                if not exists(self.causal_mask) or self.causal_mask.shape != (i, j):
+                    self.causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
 
-            causal_mask = self.causal_mask
+                causal_mask = self.causal_mask
 
-        sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+            # handle intra-episodic attention if needed
 
-        attn = sim.softmax(dim = -1)
+            if exists(all_episode_ids):
+                q_episode_ids = episode_ids
+                k_episode_ids = all_episode_ids
 
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+                intra_episode_mask = einx.not_equal('b i, b j -> b i j', q_episode_ids, k_episode_ids)
+                intra_episode_mask = rearrange(intra_episode_mask, 'b i j -> b 1 i j')
+                causal_mask = causal_mask | intra_episode_mask
+
+            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+
+            attn = sim.softmax(dim = -1)
+
+            out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
         out = out * self.to_v_gates(tokens)
 
@@ -745,7 +770,8 @@ class TransformerXL(Module):
         cache: TransformerMemory | None = None,
         return_kv_cache = False,
         condition: Tensor | None = None,
-        cond_mask: Tensor | None = None
+        cond_mask: Tensor | None = None,
+        episode_ids: Tensor | None = None
     ):
         curr_token_seq_len = x.shape[-2]
 
@@ -760,17 +786,32 @@ class TransformerXL(Module):
         kv_cache = gru_cache = mem_mlp_cache = mem_mlp_hidden_states = memory_segments = None
 
         if exists(cache):
-            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments = cache
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids = cache
             is_first_window = total_tokens < self.window_size
         else:
             memory_segments = deque(maxlen = self.max_mem_segments)
+            episode_id_segments = deque(maxlen = self.max_mem_segments)
+            curr_episode_ids = None
+            passed_episode_ids = None
 
         # handle memory segments
 
         past_segments = None
+        past_episode_ids = None
+
         if len(memory_segments) > 0:
             past_segments = stack(list(memory_segments), dim = 0)
             past_segments = rearrange(past_segments, 'l depth kv b h n d -> depth kv b h (l n) d')
+
+            episode_id_segments_list = [e for e in episode_id_segments if exists(e)]
+            if len(episode_id_segments_list) > 0:
+                past_episode_ids = cat(episode_id_segments_list, dim = -1)
+
+        if exists(curr_episode_ids):
+            if exists(past_episode_ids):
+                past_episode_ids = cat((past_episode_ids, curr_episode_ids), dim = -1)
+            else:
+                past_episode_ids = curr_episode_ids
 
         kv_cache = default(kv_cache, (None,) * num_layers)
         gru_cache = default(gru_cache, (None,) * num_layers)
@@ -830,7 +871,7 @@ class TransformerXL(Module):
             if exists(past_segments):
                 layer_past_segments = past_segments[layer_index]
 
-            x, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, past_segments = layer_past_segments, return_kv_cache = True)
+            x, (next_kv_cache, values) = attn(x, **cond_kwargs, value_residual = value_residual, kv_cache = layer_kv_cache, past_segments = layer_past_segments, return_kv_cache = True, episode_ids = episode_ids, past_episode_ids = past_episode_ids)
 
             # handle storing of memory
 
@@ -871,7 +912,7 @@ class TransformerXL(Module):
         if exists(next_gru_hiddens):
             next_gru_hiddens = stack(next_gru_hiddens)
 
-        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache, next_mem_mlp_hidden_states, memory_segments)
+        next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache, next_mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids)
 
         return embed, next_cache
 
@@ -1686,6 +1727,21 @@ class Locoformer(Module):
                 if exists(cond_mask):
                     cond_mask = cond_mask.unsqueeze(state_time_dim)
 
+            # handle episode_id
+
+            episode_id = override_kwargs.get('episode_id')
+
+            if exists(episode_id):
+                episode_id = episode_id.to(self.device)
+
+                if not has_batch_dim and episode_id.ndim == 0:
+                    episode_id = rearrange(episode_id, '... -> 1 ...')
+
+                if not has_time_dim and episode_id.ndim < (2 if has_batch_dim else 1):
+                    episode_id = episode_id.unsqueeze(state_time_dim)
+
+                override_kwargs['episode_id'] = episode_id
+
             # forwards
 
             out, cache = self.forward(
@@ -1910,7 +1966,8 @@ class Locoformer(Module):
         detach_cache = False,
         return_values = False,
         return_state_pred = False,
-        return_raw_value_logits = False
+        return_raw_value_logits = False,
+        episode_id: Tensor | None = None
     ):
 
         state = state.to(self.device)
@@ -1951,7 +2008,17 @@ class Locoformer(Module):
 
         time = tokens.shape[-2]
 
-        # an assert - make sure during training or inference, forward never gets anything that crosses the window segment boundary, to open up some possibilities with extending memory
+        # determine if we have episode ids
+
+        has_episode_id = exists(episode_id)
+
+        if is_start_of_sequence:
+            passed_episode_ids = has_episode_id
+        else:
+            *_, passed_episode_ids = cache
+            assert xnor(has_episode_id, passed_episode_ids), 'episode_id must be passed in if it was passed in the first window, and vice versa'
+
+        # time
 
         assert ((total_tokens % self.window_size) + time) <= self.window_size
 
@@ -1959,8 +2026,10 @@ class Locoformer(Module):
 
         if not exists(cache):
             memory_segments = deque(maxlen = self.max_mem_segments)
+            episode_id_segments = deque(maxlen = self.max_mem_segments)
+            curr_episode_ids = None
         else:
-            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments = cache
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = cache
 
         attn_cache = cache
 
@@ -1969,7 +2038,8 @@ class Locoformer(Module):
             condition = condition,
             cond_mask = cond_mask,
             cache = attn_cache,
-            return_kv_cache = True
+            return_kv_cache = True,
+            episode_ids = episode_id
         )
 
         # unembed to actions - in language models this would be the next state
@@ -2011,20 +2081,28 @@ class Locoformer(Module):
 
         # handle curtailing kv cache at the right intervals
 
-        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments = cache
+        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = cache
+
+        # accumulate curr_episode_ids
+
+        curr_episode_ids = safe_cat(curr_episode_ids, episode_id, dim = -1)
 
         if self.fixed_window_size or divisible_by(total_tokens, self.window_size * 2):
             kv_cache = kv_cache[..., -self.window_size:, :]
+            curr_episode_ids = curr_episode_ids[..., -self.window_size:] if exists(curr_episode_ids) else None
 
         if self.recurrent_cache and divisible_by(total_tokens, self.window_size):
             kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
+            if exists(curr_episode_ids):
+                curr_episode_ids = torch.roll(curr_episode_ids, shifts = -1, dims = 0)
 
             if exists(gru_cache):
                 gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
 
         if divisible_by(total_tokens, self.window_size):
             memory_segments.append(kv_cache[..., -self.window_size:, :].detach())
+            episode_id_segments.append(curr_episode_ids[..., -self.window_size:].detach() if exists(curr_episode_ids) else None)
 
-        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments)
+        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids)
 
         return out, cache
