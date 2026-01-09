@@ -326,3 +326,95 @@ def test_locoformer_episode_id():
     for step in win2.unbind(dim = 1):
         out = stateful_forward(step, episode_id = torch.ones((1,), dtype = torch.long))
         assert out.shape == (1, 1)
+
+def test_reward_shaping_validation():
+    # should pass
+    Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256),
+        transformer = dict(dim = 128, depth = 1, window_size = 8),
+        reward_shaping_fns = [lambda s: 1.]
+    )
+
+    # should pass (2d with string path)
+    Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256),
+        transformer = dict(dim = 128, depth = 1, window_size = 8),
+        reward_shaping_fns = [(lambda s: 1., 'reward')]
+    )
+
+    # should pass (2d with 0 index)
+    Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256),
+        transformer = dict(dim = 128, depth = 1, window_size = 8),
+        reward_shaping_fns = [(lambda s: 1., ('reward', 0))]
+    )
+
+    # should fail (2d with non-0 index)
+    with pytest.raises(AssertionError):
+        Locoformer(
+            embedder = nn.Embedding(256, 128),
+            unembedder = nn.Linear(128, 256),
+            transformer = dict(dim = 128, depth = 1, window_size = 8),
+            reward_shaping_fns = [(lambda s: 1., ('reward', 1))]
+        )
+
+    # should fail (3d without store field)
+    with pytest.raises(AssertionError):
+        Locoformer(
+            embedder = nn.Embedding(256, 128),
+            unembedder = nn.Linear(128, 256),
+            transformer = dict(dim = 128, depth = 1, window_size = 8),
+            reward_shaping_fns = [[lambda s: 1.]]
+        )
+
+    # should pass (3d with store field)
+    Locoformer(
+        embedder = nn.Embedding(256, 128),
+        unembedder = nn.Linear(128, 256),
+        transformer = dict(dim = 128, depth = 1, window_size = 8),
+        reward_shaping_fns = [[(lambda s: 1., ('reward', 1))]]
+    )
+
+def test_reward_shaping_storage():
+    from memmap_replay_buffer import ReplayBuffer
+    import numpy as np
+
+    model = Locoformer(
+        embedder = nn.Linear(10, 128),
+        unembedder = nn.Linear(128, 10),
+        transformer = dict(dim = 128, depth = 1, window_size = 8),
+        reward_shaping_fns = [[
+            (lambda state: 1.0, 'scalar_reward'),
+            (lambda state: 2.0, ('vector_reward', 1))
+        ]]
+    )
+
+    replay = ReplayBuffer(
+        './replay_test_storage',
+        max_episodes = 1,
+        max_timesteps = 10,
+        fields = dict(
+            state = ('float', (10,)),
+            action = ('float', (10,)),
+            scalar_reward = 'float',
+            vector_reward = ('float', (2,)),
+            reward = 'float', # needed for wrap_env_functions
+        )
+    )
+
+    # mock env output
+    state = torch.randn(10)
+    
+    with replay.one_episode():
+        model.state_and_command_to_rewards(state, replay_buffer = replay, env_index = 0)
+
+    assert replay.data['scalar_reward'][0, 0] == 1.0
+    assert replay.data['vector_reward'][0, 0, 1] == 2.0
+    assert replay.data['vector_reward'][0, 0, 0] == 0.0
+
+    # cleanup
+    import shutil
+    shutil.rmtree('./replay_test_storage', ignore_errors = True)

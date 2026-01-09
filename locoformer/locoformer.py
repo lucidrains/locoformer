@@ -1278,11 +1278,40 @@ class Locoformer(Module):
 
         self.has_reward_shaping = exists(reward_shaping_fns)
 
-        if is_bearable(reward_shaping_fns, OneRewardShaper):
-            reward_shaping_fns = [reward_shaping_fns]
+        if self.has_reward_shaping:
+            if is_bearable(reward_shaping_fns, OneRewardShaper):
+                reward_shaping_fns = [reward_shaping_fns]
+
+            is_multiple = is_bearable(reward_shaping_fns, list[list[MaybeOneRewardShaper]])
+            is_single = is_bearable(reward_shaping_fns, list[MaybeOneRewardShaper])
+
+            assert is_multiple or is_single, 'reward shaping functions must be either list of shapers (2d) or list of list of shapers (3d)'
+
+            self.reward_shaping_fns_multiple_envs = is_multiple
+
+            # validation
+
+            all_shaper_lists = reward_shaping_fns if is_multiple else [reward_shaping_fns]
+
+            for shaper_list in all_shaper_lists:
+                for shaper in shaper_list:
+                    if not exists(shaper):
+                        continue
+
+                    has_store_field = isinstance(shaper, tuple) and len(shaper) == 2 and exists(shaper[1])
+
+                    if not is_multiple:
+                        if not has_store_field:
+                            continue
+
+                        store_path = shaper[1]
+                        store_field_name, store_field_idx = (store_path, 0) if isinstance(store_path, str) else store_path
+
+                        assert store_field_idx == 0, f'if reward shaping is 2d, store field index must be 0, but got {store_field_idx}'
+                    else:
+                        assert has_store_field, 'reward shaping with multiple envs (3d) must have a store field'
 
         self.reward_shaping_fns = reward_shaping_fns
-        self.reward_shaping_fns_multiple_envs = is_bearable(reward_shaping_fns, list[list[OneRewardShaper]])
 
         # loss related
 
@@ -1594,7 +1623,7 @@ class Locoformer(Module):
             if isinstance(reward_store_path, tuple):
                 store_field_name, store_field_index = reward_store_path
             else:
-                store_field_name, store_field_index = reward_store_path, slice()
+                store_field_name, store_field_index = reward_store_path, 0 # if not a tuple, assume it is a string field name, and we will store at 0th index (for scalar fields)
 
             assert callable(fn)
 
@@ -1625,7 +1654,12 @@ class Locoformer(Module):
             if exists(replay_buffer) and exists(reward_store_path):
                 eps_index, time_index = buffer.episode_index, buffer.timestep_index
 
-                buffer.data[store_field_name][eps_index, time_index, store_field_index] = reward
+                buffer_field = buffer.data[store_field_name]
+
+                if buffer_field.ndim == 2:
+                    buffer_field[eps_index, time_index] = reward
+                else:
+                    buffer_field[eps_index, time_index, store_field_index] = reward
 
         # cast to Tensor if returns a float, just make it flexible for researcher
 
