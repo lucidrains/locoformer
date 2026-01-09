@@ -49,7 +49,8 @@ from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 from memmap_replay_buffer import ReplayBuffer, ReplayDataset
 
 from torch_einops_utils import (
-    pad_at_dim
+    pad_at_dim,
+    lens_to_mask
 )
 
 # constants
@@ -135,11 +136,6 @@ def is_empty(t):
 
 def tree_map_tensor(x, fn):
     return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
-
-def lens_to_mask(lens, max_len):
-    device = lens.device
-    seq = arange(max_len, device = device)
-    return einx.less('j, i -> i j', seq, lens)
 
 def safe_cat(t, next_t, dim = -1):
     if not exists(t):
@@ -1107,7 +1103,11 @@ class StateEmbedder(Module):
 
 # class
 
-OneRewardShaper = Callable[..., float | Tensor]
+RewardShapingFn = Callable[..., float | Tensor]
+
+RewardStorePath = str | tuple[str, int]
+
+OneRewardShaper = RewardShapingFn | tuple[RewardShapingFn, RewardStorePath | None]
 
 MaybeOneRewardShaper = OneRewardShaper | None
 
@@ -1560,9 +1560,11 @@ class Locoformer(Module):
         self,
         state,
         commands = None,
+        replay_buffer = None,
         env_index: int | None = None
     ) -> Tensor:
 
+        buffer = replay_buffer
         assert self.has_reward_shaping
         assert xnor(exists(env_index), self.reward_shaping_fns_multiple_envs), f'`env_index` must be passed in if multiple reward shaping functions are defined, and vice versa (not passed in if only single list of reward shaping functions)'
 
@@ -1570,18 +1572,60 @@ class Locoformer(Module):
 
         reward_shaping_fns = self.reward_shaping_fns[env_index] if exists(env_index) else self.reward_shaping_fns
 
-        for fn in reward_shaping_fns:
-            param_names = get_param_names(fn)
-            param_names = set(param_names) & {'state', 'command'}
+        # ready a dictionary that contains all data possible for use for reward shaping
 
-            if param_names == {'state'}: # only state
-                reward = fn(state = state)
-            elif param_names == {'state', 'command'}: # state and command
-                reward = fn(state = state, command = commands)
+        reward_shaping_inputs = dict(
+            state = lambda: state,
+            commands = lambda: commands,
+            actions = lambda: buffer.data['action'][buffer.episode_index, :buffer.timestep_index]
+        )
+
+        valid_reward_shaping_param_names = set(reward_shaping_inputs.keys())
+
+        # go through the functions
+
+        for reward_shaping_info in reward_shaping_fns:
+
+            if isinstance(reward_shaping_info, tuple):
+                fn, reward_store_path = reward_shaping_info
             else:
-                raise ValueError('invalid number of arguments for reward shaping function')
+                fn, reward_store_path = reward_shaping_info, None
 
+            if isinstance(reward_store_path, tuple):
+                store_field_name, store_field_index = reward_store_path
+            else:
+                store_field_name, store_field_index = reward_store_path, slice()
+
+            assert callable(fn)
+
+            param_names = get_param_names(fn)
+            assert set(param_names).issubset(valid_reward_shaping_param_names), f'your reward shaping function needs to have param names within the set of {valid_reward_shaping_param_names}'
+
+            fn_params = dict()
+
+            for input_name in param_names:
+
+                # lazy init
+
+                reward_shaping_input = reward_shaping_inputs[input_name]
+
+                if callable(reward_shaping_input):
+                    reward_shaping_input = reward_shaping_input()
+                    reward_shaping_inputs[input_name] = reward_shaping_input
+
+                fn_params[input_name] = reward_shaping_input
+
+            # invoke reward function
+
+            reward = fn(**fn_params)
             rewards.append(reward)
+
+            # maybe store
+
+            if exists(replay_buffer) and exists(reward_store_path):
+                eps_index, time_index = buffer.episode_index, buffer.timestep_index
+
+                buffer.data[store_field_name][eps_index, time_index, store_field_index] = reward
 
         # cast to Tensor if returns a float, just make it flexible for researcher
 
@@ -1631,7 +1675,7 @@ class Locoformer(Module):
 
             return env_reset_out_dict
 
-        def wrapped_step(action, *args, command = None, env_index = None, **kwargs):
+        def wrapped_step(action, *args, command = None, replay_buffer = None, env_index = None, **kwargs):
 
             if is_tensor(action):
                 if action.numel() == 1:
@@ -1650,7 +1694,7 @@ class Locoformer(Module):
             env_step_out_dict['reward'] = env_step_out_dict['reward'] / reward_norm
 
             if self.has_reward_shaping:
-                shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['state'], command, env_index = env_index)
+                shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['state'], command, replay_buffer = replay_buffer, env_index = env_index)
 
                 if exists(shaped_rewards):
                     env_step_out_dict['shaped_rewards'] = shaped_rewards
@@ -1780,6 +1824,7 @@ class Locoformer(Module):
         embed_past_action = False,
         max_timesteps = None,
         use_vision = False,
+        replay_buffer = None,
         action_select_kwargs: dict = dict(),
         state_embed_kwargs: dict = dict(),
         state_id_kwarg: dict = dict(),
@@ -1844,7 +1889,12 @@ class Locoformer(Module):
 
                 # pass to environment
 
-                step_dict = env_step(action, command = maybe_command, env_index = env_index)
+                step_dict = env_step(
+                    action,
+                    command = maybe_command,
+                    replay_buffer = replay_buffer,
+                    env_index = env_index
+                )
 
                 derived, next_state, reward, terminated, truncated = pick(step_dict, ('derived_state', 'state', 'reward', 'terminated', 'truncated'))
 

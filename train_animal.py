@@ -175,7 +175,9 @@ def main(
             use_accelerated = False
         ),
         reward_shaping_fns = [
-            [humanoid_reward_shaping],
+            [
+                (humanoid_reward_shaping, ('shaped_reward', 1))
+            ],
             []
         ],
         use_spo = True,
@@ -233,7 +235,8 @@ def main(
                     reward      = 'float',
                     value       = 'float',
                     done        = 'bool',
-                    condition   = ('float', 2)
+                    condition   = ('float', 2),
+                    shaped_reward = ('float', 2)
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
@@ -286,6 +289,7 @@ def main(
                 action_select_kwargs = action_select_kwargs,
                 state_embed_kwargs = state_embed_kwargs,
                 state_id_kwarg = state_id_kwarg,
+                replay_buffer = replay,
                 env_index = env_index,
                 state_entropy_bonus_weight = state_entropy_bonus_weight,
                 embed_past_action = embed_past_action
