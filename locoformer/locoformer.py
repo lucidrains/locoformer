@@ -48,6 +48,10 @@ from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
 from memmap_replay_buffer import ReplayBuffer, ReplayDataset
 
+from torch_einops_utils import (
+    pad_at_dim
+)
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -136,19 +140,6 @@ def lens_to_mask(lens, max_len):
     device = lens.device
     seq = arange(max_len, device = device)
     return einx.less('j, i -> i j', seq, lens)
-
-def pad_at_dim(
-    t,
-    pad: tuple[int, int],
-    dim = -1,
-    value = 0.
-):
-    if pad == (0, 0):
-        return t
-
-    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
-    zeros = ((0, 0) * dims_from_right)
-    return F.pad(t, (*zeros, *pad), value = value)
 
 def safe_cat(t, next_t, dim = -1):
     if not exists(t):

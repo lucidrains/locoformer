@@ -37,6 +37,7 @@ dependencies = [
     "memmap-replay-buffer>=0.0.10",
     "rotary-embedding-torch",
     "torch>=2.8",
+    "torch-einops-utils>=0.0.6",
     "x-evolution>=0.1.23",
     "x-mlps-pytorch",
 ]
