@@ -53,7 +53,9 @@ def get_snapshot(env, shape):
 # it randomly selects pairs of episodes, and then order them with increasing cumulative rewards
 # allow researchers to construct it however they wish
 
-def create_episode_mapping_from_replay(buffer):
+def create_episode_mapping_from_replay(
+    buffer
+):
     episodes = torch.arange(buffer.num_episodes)
     cum_rewards = torch.from_numpy(buffer.meta_data['cum_rewards'][:buffer.num_episodes])
 

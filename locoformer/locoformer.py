@@ -1591,6 +1591,7 @@ class Locoformer(Module):
         commands = None,
         action = None,
         replay_buffer = None,
+        env_step_info = None,
         env_index: int | None = None
     ) -> Tensor:
 
@@ -1609,7 +1610,9 @@ class Locoformer(Module):
             commands = lambda: commands,
             command = lambda: commands,
             action = lambda: action,
-            actions = lambda: buffer.data['action'][buffer.episode_index, :buffer.timestep_index]
+            actions = lambda: buffer.data['action'][buffer.episode_index, :buffer.timestep_index],
+            env_step_info = lambda: env_step_info,
+            buffer = lambda: replay_buffer
         )
 
         valid_reward_shaping_param_names = set(reward_shaping_inputs.keys())
@@ -1731,7 +1734,15 @@ class Locoformer(Module):
             env_step_out_dict['reward'] = env_step_out_dict['reward'] / reward_norm
 
             if self.has_reward_shaping:
-                shaped_rewards = self.state_and_command_to_rewards(env_step_out_dict['state'], commands = command, action = action, replay_buffer = replay_buffer, env_index = env_index)
+
+                shaped_rewards = self.state_and_command_to_rewards(
+                    env_step_out_dict['state'],
+                    commands = command,
+                    action = action,
+                    replay_buffer = replay_buffer,
+                    env_step_info = env_step_out_dict['info'],
+                    env_index = env_index
+                )
 
                 if exists(shaped_rewards):
                     env_step_out_dict['shaped_rewards'] = shaped_rewards
