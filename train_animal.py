@@ -41,30 +41,26 @@ HUMANOID_OBS_CONFIG = (
     ('rest', 340)
 )
 
-@check_has_param_attr('state', 'height')
-@check_has_param_attr('state', 'v_x')
+@check_has_param_attr('state_named', 'height')
+@check_has_param_attr('state_named', 'v_x')
 def reward_humanoid_walking(
-    state,
+    state_named,
     s_height = 1.0,
     s_vel = 1.25,
     height_nominal = 1.4,
     height_threshold = 0.4
 ):
     # maintaining nominal height
-    height_error = (state.height - height_nominal).pow(2)
+    height_error = (state_named.height - height_nominal).pow(2)
     height_reward = (-height_error / s_height).exp()
 
     # falling
-    fall_penalty = (state.height < (height_nominal - height_threshold)).float() * -10.
+    fall_penalty = (state_named.height < (height_nominal - height_threshold)).float() * -10.
 
     # forward velocity reward
-    vel_reward = state.v_x * s_vel
+    vel_reward = state_named.v_x * s_vel
 
     return height_reward + vel_reward + fall_penalty
-
-def humanoid_reward_shaping(state):
-    state_named = tensor_to_dict(state, HUMANOID_OBS_CONFIG)
-    return reward_humanoid_walking(state_named)
 
 # helper functions
 
@@ -174,9 +170,10 @@ def main(
         calc_gae_kwargs = dict(
             use_accelerated = False
         ),
+        state_named_config = HUMANOID_OBS_CONFIG,
         reward_shaping_fns = [
             [
-                (humanoid_reward_shaping, ('shaped_reward', 1))
+                (reward_humanoid_walking, ('shaped_reward', 1))
             ],
             []
         ],

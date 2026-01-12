@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from typing import Callable
+from typing import Callable, Any
 from types import SimpleNamespace
 from functools import partial, wraps
 
@@ -10,7 +10,7 @@ from collections import namedtuple, deque
 
 from glom import glom
 
-from inspect import signature
+from inspect import signature, Parameter
 
 import numpy as np
 from numpy import ndarray
@@ -1105,6 +1105,10 @@ class StateEmbedder(Module):
 
 RewardShapingFn = Callable[..., float | Tensor]
 
+RewardShapingInputFn = Callable[..., Any]
+
+StateNamedConfig = tuple[tuple[str, int] | str]
+
 RewardStorePath = str | tuple[str, int]
 
 OneRewardShaper = RewardShapingFn | tuple[RewardShapingFn, RewardStorePath | None]
@@ -1154,6 +1158,8 @@ class Locoformer(Module):
             list[MaybeOneRewardShaper] |
             list[list[MaybeOneRewardShaper]]
         ) = None,
+        computed_reward_shaping_input_fns: dict[str, RewardShapingInputFn] = dict(),
+        state_named_config: StateNamedConfig | None = None,
         num_reward_bins = 32,
         hl_gauss_loss_kwargs = dict(),
         value_loss_weight = 0.5,
@@ -1311,7 +1317,12 @@ class Locoformer(Module):
                     else:
                         assert has_store_field, 'reward shaping with multiple envs (3d) must have a store field'
 
+        if exists(state_named_config):
+            assert 'state_named' not in computed_reward_shaping_input_fns, '`state_named` is already present in `computed_reward_shaping_input_fns`'
+            computed_reward_shaping_input_fns['state_named'] = lambda state: tensor_to_dict(state, state_named_config)
+
         self.reward_shaping_fns = reward_shaping_fns
+        self.computed_reward_shaping_input_fns = computed_reward_shaping_input_fns
 
         # loss related
 
@@ -1615,6 +1626,28 @@ class Locoformer(Module):
             buffer = lambda: replay_buffer
         )
 
+        def resolve_inputs(fn):
+            sig = signature(fn)
+            names = sig.parameters.keys()
+            resolved = dict()
+
+            for name in names:
+                if name not in reward_shaping_inputs:
+                    continue
+
+                val = reward_shaping_inputs[name]
+                if callable(val):
+                    val = val()
+                    reward_shaping_inputs[name] = val
+                resolved[name] = val
+
+            return resolved
+
+        for key, input_fn in self.computed_reward_shaping_input_fns.items():
+            assert key not in reward_shaping_inputs, f'reward shaping input key "{key}" already exists'
+
+            reward_shaping_inputs[key] = lambda fn = input_fn: fn(**resolve_inputs(fn))
+
         valid_reward_shaping_param_names = set(reward_shaping_inputs.keys())
 
         # go through the functions
@@ -1633,22 +1666,12 @@ class Locoformer(Module):
 
             assert callable(fn)
 
-            param_names = get_param_names(fn)
-            assert set(param_names).issubset(valid_reward_shaping_param_names), f'your reward shaping function needs to have param names within the set of {valid_reward_shaping_param_names}'
+            sig = signature(fn)
+            for name, p in sig.parameters.items():
+                if p.default == Parameter.empty:
+                    assert name in valid_reward_shaping_param_names, f'your reward shaping function needs to have param "{name}" within the set of {valid_reward_shaping_param_names}'
 
-            fn_params = dict()
-
-            for input_name in param_names:
-
-                # lazy init
-
-                reward_shaping_input = reward_shaping_inputs[input_name]
-
-                if callable(reward_shaping_input):
-                    reward_shaping_input = reward_shaping_input()
-                    reward_shaping_inputs[input_name] = reward_shaping_input
-
-                fn_params[input_name] = reward_shaping_input
+            fn_params = resolve_inputs(fn)
 
             # invoke reward function
 

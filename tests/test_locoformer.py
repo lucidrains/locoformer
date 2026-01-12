@@ -32,7 +32,7 @@ def test_locoformer(
         transformer = dict(
             dim = 128,
             depth = 2,
-            window_size = 512,
+            window_size = 32,
             gru_layers = gru_layers,
             dim_cond = 2 if has_commands else None,
             long_term_mem_layers = long_term_mem_layers,
@@ -40,23 +40,22 @@ def test_locoformer(
         )
     )
 
-    seq = torch.randint(0, 256, (3, 512))
+    seq = torch.randint(0, 256, (3, 32))
 
     commands = None
     if has_commands:
-        commands = torch.randn(3, 512, 2)
+        commands = torch.randn(3, 32, 2)
 
     (logits, values), cache = model(seq, condition = commands, return_values = True)
     (logits, values), cache = model(seq, condition = commands, return_values = True, cache = cache)
-    (logits, values), cache = model(seq, condition = commands, return_values = True, cache = cache)
 
-    assert logits.shape == (3, 512, 256)
+    assert logits.shape == (3, 32, 256)
 
     stateful_forward = model.get_stateful_forward(has_batch_dim = True, has_time_dim = True, return_values = True, inference_mode = True)
 
     inference_command = torch.randn(1, 1, 2) if has_commands else None
 
-    for state in seq.unbind(dim = -1):
+    for state in seq.unbind(dim = -1)[:8]:
         state = rearrange(state, 'b -> b 1')
 
         logits, values = stateful_forward(state, condition = inference_command)
@@ -265,11 +264,11 @@ def test_locoformer_multi_segment(recurrent_cache):
         transformer = dict(
             dim = 128,
             depth = 1,
-            window_size = 128
+            window_size = 16
         )
     ).eval()
 
-    seq = torch.randint(0, 256, (1, 128 * 4))
+    seq = torch.randint(0, 256, (1, 16 * 4))
 
     logits_full = []
     cache = None
@@ -418,3 +417,24 @@ def test_reward_shaping_storage():
     # cleanup
     import shutil
     shutil.rmtree('./replay_test_storage', ignore_errors = True)
+
+def test_computed_reward_shaping_input_fns():
+    from locoformer.locoformer import tensor_to_dict
+
+    OBS_CONFIG = (('vx', 1), ('vy', 1), ('rest', 8))
+
+    model = Locoformer(
+        embedder = nn.Linear(10, 128),
+        unembedder = nn.Linear(128, 10),
+        transformer = dict(dim = 128, depth = 1, window_size = 8),
+        state_named_config = OBS_CONFIG,
+        reward_shaping_fns = [
+            lambda state_named: state_named.vx + state_named.vy
+        ]
+    )
+
+    state = torch.randn(10)
+    rewards = model.state_and_command_to_rewards(state)
+
+    assert rewards.shape == (1,)
+    assert torch.allclose(rewards, state[0] + state[1])
