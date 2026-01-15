@@ -59,27 +59,6 @@ HUMANOID_OBS_CONFIG = (
     ('rest', 286)
 )
 
-@check_has_param_attr('state_named', 'height')
-@check_has_param_attr('state_named', 'v_x')
-def reward_humanoid_walking(
-    state_named,
-    s_height = 1.0,
-    s_vel = 1.25,
-    height_nominal = 1.4,
-    height_threshold = 0.4
-):
-    # maintaining nominal height
-    height_error = (state_named.height - height_nominal).pow(2)
-    height_reward = (-height_error / s_height).exp()
-
-    # falling
-    fall_penalty = (state_named.height < (height_nominal - height_threshold)).float() * -10.
-
-    # forward velocity reward
-    vel_reward = state_named.v_x * s_vel
-
-    return height_reward + vel_reward + fall_penalty
-
 # helper functions
 
 def exists(v):
