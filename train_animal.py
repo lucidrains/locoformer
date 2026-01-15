@@ -27,18 +27,36 @@ from torch.optim import Adam
 
 from einops import rearrange, einsum
 
-from locoformer.locoformer import Locoformer, ReplayBuffer, check_has_param_attr, tensor_to_dict
-from x_mlps_pytorch import Feedforwards, MLP
+from locoformer.locoformer import (
+    Locoformer,
+    ReplayBuffer,
+    check_has_param_attr,
+    tensor_to_dict,
+    reward_linear_velocity_command_tracking,
+    reward_angular_velocity_command_tracking,
+    reward_base_linear_velocity_penalty,
+    reward_base_angular_velocity_penalty,
+    reward_base_height_penalty,
+    reward_joint_velocity_penalty,
+    reward_torque_penalty,
+    reward_alive
+)
+
+from x_mlps_pytorch import Feedforwards
 
 # humanoid observation config
 
 HUMANOID_OBS_CONFIG = (
-    ('height', 1),
+    ('x_z', 1),   # height
     ('quat', 4),
-    ('v_x', 1),
-    ('v_y', 1),
+    ('joint_q', 17),
+    ('v_xy', 2),
     ('v_z', 1),
-    ('rest', 340)
+    ('w_xy', 2),
+    ('w_z', 1),
+    ('joint_v', 17),
+    ('tau', 17),
+    ('rest', 286)
 )
 
 @check_has_param_attr('state_named', 'height')
@@ -173,7 +191,14 @@ def main(
         state_named_config = HUMANOID_OBS_CONFIG,
         reward_shaping_fns = [
             [
-                (reward_humanoid_walking, ('shaped_reward', 1))
+                (reward_linear_velocity_command_tracking, ('shaped_reward', 0)),
+                (reward_angular_velocity_command_tracking, ('shaped_reward', 1)),
+                (reward_base_linear_velocity_penalty,      ('shaped_reward', 2)),
+                (reward_base_angular_velocity_penalty,     ('shaped_reward', 3)),
+                (reward_base_height_penalty,               ('shaped_reward', 4)),
+                (reward_joint_velocity_penalty,            ('shaped_reward', 5)),
+                (reward_torque_penalty,                    ('shaped_reward', 6)),
+                (reward_alive,                             ('shaped_reward', 7)),
             ],
             []
         ],
@@ -233,7 +258,7 @@ def main(
                     value       = 'float',
                     done        = 'bool',
                     condition   = ('float', 2),
-                    shaped_reward = ('float', 2)
+                    shaped_reward = ('float', 8)
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'

@@ -117,6 +117,7 @@ def check_has_param_attr(
 
             if not (
                 param_name in bound_args and
+                exists(bound_args[param_name]) and
                 hasattr(bound_args[param_name], param_attr)
             ):
                 return default_value
@@ -243,59 +244,71 @@ class RemappedReplayDataset(Dataset):
 
 # reward functions - A.2
 
-@check_has_param_attr('state', 'v_xy')
-@check_has_param_attr('command', 'v_xy')
+@check_has_param_attr('state_named', 'v_xy', default_value = 0.)
+@check_has_param_attr('command', 'v_xy', default_value = 0.)
 def reward_linear_velocity_command_tracking(
-    state,
+    state_named,
     command,
     s1 = 1.
 ):
-    error = (state.v_xy - command.v_xy).norm(dim = -1).pow(2)
+    error = (state_named.v_xy - command.v_xy).norm(dim = -1).pow(2)
     return torch.exp(-error / s1)
 
-@check_has_param_attr('state', 'w_z')
-@check_has_param_attr('command', 'w_z')
+@check_has_param_attr('state_named', 'w_z', default_value = 0.)
+@check_has_param_attr('command', 'w_z', default_value = 0.)
 def reward_angular_velocity_command_tracking(
-    state,
+    state_named,
     command,
     s2 = 1.
 ):
-    error = (state.w_z - command.w_z).norm(dim = -1).pow(2)
+    error = (state_named.w_z - command.w_z).norm(dim = -1).pow(2)
     return torch.exp(-error / s2)
 
-@check_has_param_attr('state', 'v_z')
+@check_has_param_attr('state_named', 'v_z', default_value = 0.)
 def reward_base_linear_velocity_penalty(
-    state
+    state_named
 ):
-    return -state.v_z.norm(dim = -1).pow(2)
+    return -state_named.v_z.norm(dim = -1).pow(2)
 
-@check_has_param_attr('state', 'w_xy')
+@check_has_param_attr('state_named', 'w_xy', default_value = 0.)
 def reward_base_angular_velocity_penalty(
-    state
+    state_named
 ):
-    return -state.w_xy.norm(dim = -1).pow(2)
+    return -state_named.w_xy.norm(dim = -1).pow(2)
 
-@check_has_param_attr('state', 'x_z')
+@check_has_param_attr('state_named', 'x_z', default_value = 0.)
 def reward_base_height_penalty(
-    state,
+    state_named,
     x_z_nominal = 0.27
 ):
-    return -(state.x_z - x_z_nominal).norm(dim = -1).pow(2)
+    return -(state_named.x_z - x_z_nominal).norm(dim = -1).pow(2)
 
-@check_has_param_attr('state', 'joint_q')
-def reward_joint_acceleration_penalty(
-    state
+@check_has_param_attr('state_named', 'joint_v', default_value = 0.)
+def reward_joint_velocity_penalty(
+    state_named
 ):
-    return -state.joint_q.norm(dim = -1).pow(2)
+    return -state_named.joint_v.norm(dim = -1).pow(2)
 
-@check_has_param_attr('state', 'tau')
 def reward_torque_penalty(
-    state
+    state_named = None,
+    action = None
 ):
-    return -state.tau.norm(dim = -1).pow(2)
+    # flexible torque penalty that can use either the explicit torques from state
+    # or fallback to using the action as a proxy for effort/torque
+
+    tau = None
+    if exists(state_named) and hasattr(state_named, 'tau'):
+        tau = state_named.tau
+    elif exists(action):
+        tau = action
+    
+    if not exists(tau):
+        return 0.
+
+    return -tau.norm(dim = -1).pow(2)
 
 def reward_alive(
-    state
+    state_named
 ):
     return 1.
 
