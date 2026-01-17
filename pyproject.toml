@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.1.18"
+version = "0.1.19"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -34,7 +34,7 @@ dependencies = [
     "glom",
     "hl-gauss-pytorch>=0.2.0",
     "hyper-connections>=0.3.16",
-    "memmap-replay-buffer>=0.0.10",
+    "memmap-replay-buffer>=0.0.19",
     "rotary-embedding-torch",
     "torch>=2.8",
     "torch-einops-utils>=0.0.7",
