@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.1.19"
+version = "0.1.20"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -17,7 +17,7 @@ keywords = [
     'cross-embodiment',
 ]
 
-classifiers=[
+classifiers = [
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
@@ -39,7 +39,7 @@ dependencies = [
     "torch>=2.8",
     "torch-einops-utils>=0.0.7",
     "x-evolution>=0.1.23",
-    "x-mlps-pytorch",
+    "x-mlps-pytorch"
 ]
 
 [project.urls]
@@ -59,7 +59,7 @@ test = [
 
 [tool.pytest.ini_options]
 pythonpath = [
-  "."
+    "."
 ]
 
 [build-system]

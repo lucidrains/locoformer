@@ -237,7 +237,9 @@ def main(
                     value       = 'float',
                     done        = 'bool',
                     condition   = ('float', 2),
-                    shaped_reward = ('float', 8)
+                    cond_mask   = 'bool',
+                    shaped_reward = ('float', 8),
+                    internal_state = ('float', dim_state)
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'

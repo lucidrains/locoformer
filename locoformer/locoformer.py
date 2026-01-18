@@ -89,6 +89,9 @@ def identity(t, *args, **kwargs):
 def pick(data, keys):
     return tuple(data[k] for k in keys)
 
+def compact_dict(d):
+    return {k: v for k, v in d.items() if exists(v)}
+
 def first(arr):
     return arr[0]
 
@@ -1722,16 +1725,24 @@ class Locoformer(Module):
         env_output_transforms: dict[str, Callable] = dict(),
         state_transform: Callable = identity,
         reward_norm = 1.,
+        num_envs = 1,
         command_generator: Callable = always(None)
     ):
+        is_vectorized = num_envs > 1
 
         def transform_output(el):
             if isinstance(el, ndarray):
-                return from_numpy(el)
+                el = from_numpy(el)
             elif isinstance(el, (int, bool, float)):
-                return tensor(el)
-            else:
-                return el
+                el = tensor(el)
+
+            if is_tensor(el) and el.dtype == torch.float64:
+                el = el.float()
+
+            if not is_vectorized and is_tensor(el):
+                el = rearrange(el, '... -> 1 ...')
+
+            return el
 
         def wrapped_reset(*args, **kwargs):
             env_reset_out =  env.reset(*args, **kwargs)
@@ -1754,7 +1765,15 @@ class Locoformer(Module):
         def wrapped_step(action, *args, command = None, replay_buffer = None, env_index = None, **kwargs):
 
             if is_tensor(action):
-                if action.numel() == 1:
+                action = action.detach().cpu().numpy()
+
+            if is_vectorized:
+                if np.issubdtype(action.dtype, np.integer) and action.shape[-1] == 1:
+                    action = rearrange(action, 'b 1 -> b')
+            else:
+                action = rearrange(action, '1 ... -> ...')
+
+                if np.issubdtype(action.dtype, np.integer) and action.size == 1:
                     action = action.item()
                 else:
                     action = action.tolist()
@@ -1785,7 +1804,7 @@ class Locoformer(Module):
 
                     # add shaped rewards to main reward
 
-                    env_step_out_dict['reward'] = env_step_out_dict['reward'] + shaped_rewards.sum()
+                    env_step_out_dict['reward'] = env_step_out_dict['reward'] + shaped_rewards.sum(dim = -1)
 
             derived_states = dict()
 
@@ -1838,13 +1857,16 @@ class Locoformer(Module):
                     cond_mask = rearrange(cond_mask, '... -> 1 ...')
 
             if not has_time_dim:
-                state = state.unsqueeze(state_time_dim)
+                state = rearrange(state, 'b ... -> b 1 ...')
 
                 if exists(condition):
                     condition = rearrange(condition, '... d -> ... 1 d')
 
                 if exists(cond_mask):
-                    cond_mask = cond_mask.unsqueeze(state_time_dim)
+                    if has_batch_dim and cond_mask.ndim == 0:
+                        cond_mask = repeat(cond_mask, '-> b', b = state.shape[0])
+
+                    cond_mask = rearrange(cond_mask, 'b ... -> b 1 ...')
 
             # handle episode_id
 
@@ -1857,7 +1879,7 @@ class Locoformer(Module):
                     episode_id = rearrange(episode_id, '... -> 1 ...')
 
                 if not has_time_dim and episode_id.ndim < (2 if has_batch_dim else 1):
-                    episode_id = episode_id.unsqueeze(state_time_dim)
+                    episode_id = rearrange(episode_id, 'b ... -> b 1 ...')
 
                 override_kwargs['episode_id'] = episode_id
 
@@ -1874,7 +1896,7 @@ class Locoformer(Module):
             # maybe remove batch or time
 
             if not has_time_dim:
-                out = tree_map_tensor(out, lambda t: t.squeeze(state_time_dim))
+                out = tree_map_tensor(out, lambda t: rearrange(t, 'b 1 ... -> b ...'))
 
             if not has_batch_dim:
                 out = tree_map_tensor(out, lambda t: rearrange(t, '1 ... -> ...'))
@@ -1905,6 +1927,7 @@ class Locoformer(Module):
         self,
         wrapped_env_functions: tuple[Callable, Callable],
         replay: ReplayBuffer,
+        num_envs: int = 1,
         embed_past_action = False,
         max_timesteps = None,
         use_vision = False,
@@ -1933,14 +1956,14 @@ class Locoformer(Module):
         max_timesteps = default(max_timesteps, replay.max_timesteps)
 
         stateful_forward = self.get_stateful_forward(
-            has_batch_dim = False,
+            has_batch_dim = True,
             has_time_dim = False,
             inference_mode = True
         )
 
-        cum_rewards = 0.
+        all_cum_rewards = torch.zeros(num_envs, device = self.device)
 
-        with replay.one_episode() as final_meta_data_store_dict:
+        with replay.batched_episode(num_envs):
 
             past_action = None
 
@@ -1954,7 +1977,7 @@ class Locoformer(Module):
                 (action_logits, state_pred), value = stateful_forward(
                     state_for_model,
                     condition = maybe_command,
-                    cond_mask = tensor(exists(maybe_command)),
+                    cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
                     state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state},
                     action_select_kwargs = action_select_kwargs,
                     state_id_kwarg = state_id_kwarg,
@@ -1991,25 +2014,24 @@ class Locoformer(Module):
                     state_id = state_id_kwarg.get('state_id', 0)
                     entropy = self.state_pred_head.entropy(state_pred, selector_index = state_id)
 
-                    state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum()
+                    state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum(dim = -1)
 
-                    reward = reward + state_entropy_bonus.item() # the entropy is directly related to log variance
+                    reward = reward.to(self.device).float() + state_entropy_bonus
 
                 # cum rewards
 
-                cum_rewards += reward
+                all_cum_rewards += reward.to(self.device).float()
 
                 # increment counters
-                # we will store the step with done=False, as only the bootstrap/boundary node is done=True
 
                 exceeds_max_timesteps = max_timesteps >= 0 and timestep == (max_timesteps - 1)
-                should_stop = truncated or terminated or tensor(exceeds_max_timesteps)
+                should_stop = (terminated | truncated).all() or exceeds_max_timesteps
 
                 # get log prob of action
 
                 action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
-                memory = replay.store(
+                replay.store_batch(**compact_dict(dict(
                     state = state,
                     state_image = state_image,
                     action = action,
@@ -2017,56 +2039,39 @@ class Locoformer(Module):
                     internal_state = internal_state,
                     reward = reward,
                     value = value,
-                    done = tensor(False),
+                    done = torch.zeros(num_envs, device = self.device, dtype = torch.bool),
                     condition = maybe_command,
-                    cond_mask = tensor(exists(maybe_command))
-                )
+                    cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool)
+                )))
 
                 timestep += 1
 
-                # break if done or exceed max timestep
+                # break if all done or exceed max timestep
                 if should_stop:
 
                     # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
-                    # only if terminated signal not detected
-                    if not terminated:
-                        next_state_for_model = next_state_image if use_vision else next_state
+                    # only for those not terminated
 
-                        _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = tensor(exists(maybe_command)), return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                    next_state_for_model = next_state_image if use_vision else next_state
 
-                        terminal_node = dict(
-                            state = next_state,
-                            state_image = next_state_image,
-                            internal_state = next_internal_state,
-                            value = next_value,
-                            reward = next_value,
-                            done = True,
-                            condition = maybe_command,
-                            cond_mask = exists(maybe_command)
-                        )
+                    _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool), return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                    bootstrap_value = torch.where(terminated.to(self.device), torch.zeros_like(next_value), next_value)
+                    bootstrap_reward = torch.where(terminated.to(self.device), torch.zeros_like(reward.to(self.device)), next_value)
 
-                    else:
-                        # terminal node - store a step with 0 reward and value, and done=True, to stop GAE scan
-                        terminal_node = dict(
-                            state = next_state,
-                            state_image = next_state_image,
-                            internal_state = next_internal_state,
-                            value = torch.zeros_like(value),
-                            reward = torch.zeros_like(reward),
-                            done = True,
-                            condition = maybe_command,
-                            cond_mask = exists(maybe_command)
-                        )
+                    replay.store_batch(**compact_dict(dict(
+                        state = next_state,
+                        state_image = next_state_image,
+                        internal_state = next_internal_state,
+                        value = bootstrap_value,
+                        reward = bootstrap_reward,
+                        done = torch.ones(num_envs, device = self.device, dtype = torch.bool),
+                        condition = maybe_command,
+                        cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool)
+                    )))
 
-                    terminal_node = {key: value for key, value in terminal_node.items() if key in memory._fields}
+                    # store the final cumulative rewards into meta data
 
-                    terminal_memory = memory._replace(**terminal_node)
-
-                    replay.store(**terminal_memory._asdict())
-
-                    # store the final cumulative reward into meta data
-
-                    final_meta_data_store_dict.update(cum_rewards = cum_rewards)
+                    replay.store_meta_batch(cum_rewards = all_cum_rewards)
 
                     break
 
@@ -2074,9 +2079,10 @@ class Locoformer(Module):
                 state_image = next_state_image
                 internal_state = next_internal_state
 
-                past_action = action
+                if embed_past_action:
+                    past_action = action
 
-        return cum_rewards
+        return all_cum_rewards.mean().item()
 
     def forward(
         self,

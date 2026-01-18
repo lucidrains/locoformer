@@ -100,6 +100,8 @@ def main(
     test_episode_mapping_constructor = False,
     test_mock_internal_states = False,
     test_mock_reward_shaping = False,
+    vectorized_env_indices = (),
+    num_vectorized_envs = 4,
     cpu = False
 ):
 
@@ -215,19 +217,28 @@ def main(
         if continuous:
             env_kwargs = dict(continuous = continuous)
 
-        env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
+        is_vectorized = env_index in vectorized_env_indices
 
-        env = gym.wrappers.RecordVideo(
-            env = env,
-            video_folder = video_folder,
-            name_prefix = f'{learn_cycle}-env-video',
-            episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
-            disable_logger = True
-        )
+        if is_vectorized:
+            env = gym.make_vec(env_name, num_envs = num_vectorized_envs, vectorization_mode = 'sync', render_mode = 'rgb_array', **env_kwargs)
+        else:
+            env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
 
-        dim_state = env.observation_space.shape[0]
+        if not is_vectorized:
+            env = gym.wrappers.RecordVideo(
+                env = env,
+                video_folder = video_folder,
+                name_prefix = f'{learn_cycle}-env-video',
+                episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
+                disable_logger = True
+            )
+
+        obs_space = env.single_observation_space if is_vectorized else env.observation_space
+        action_space = env.single_action_space if is_vectorized else env.action_space
+
+        dim_state = obs_space.shape[0]
         dim_state_image_shape = (3, vision_height_width_dim, vision_height_width_dim)
-        num_actions = env.action_space.n if not continuous else env.action_space.shape[0]
+        num_actions = action_space.n if not continuous else action_space.shape[0]
 
         # memory
 
@@ -248,7 +259,7 @@ def main(
                     done        = 'bool',
                     condition   = ('float', 2),
                     cond_mask   = 'bool',
-                    internal_state = ('float', 2)
+                    internal_state = ('float', dim_state)
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
@@ -296,16 +307,22 @@ def main(
 
         transforms.update(internal_state = derive_internal_state)
 
+        num_envs = num_vectorized_envs if is_vectorized else 1
+
         wrapped_env_functions = locoformer.wrap_env_functions(
             env,
-            env_output_transforms = transforms
+            env_output_transforms = transforms,
+            num_envs = num_envs
         )
 
-        for _ in tqdm(range(num_episodes_before_learn), leave = False):
+        num_rollouts = max(num_episodes_before_learn // num_envs, 1)
+
+        for _ in tqdm(range(num_rollouts), leave = False):
 
             cum_reward = locoformer.gather_experience_from_env_(
                 wrapped_env_functions,
                 replay,
+                num_envs = num_envs,
                 max_timesteps = max_timesteps,
                 use_vision = use_vision,
                 action_select_kwargs = action_select_kwargs,
