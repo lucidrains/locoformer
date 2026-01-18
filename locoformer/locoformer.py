@@ -1631,7 +1631,7 @@ class Locoformer(Module):
         reward_shaping_fns = self.reward_shaping_fns[env_index] if exists(env_index) else self.reward_shaping_fns
 
         # ready a dictionary that contains all data possible for use for reward shaping
-
+        
         reward_shaping_inputs = dict(
             state = lambda: state,
             commands = lambda: commands,
@@ -1661,7 +1661,6 @@ class Locoformer(Module):
 
         for key, input_fn in self.computed_reward_shaping_input_fns.items():
             assert key not in reward_shaping_inputs, f'reward shaping input key "{key}" already exists'
-
             reward_shaping_inputs[key] = lambda fn = input_fn: fn(**resolve_inputs(fn))
 
         valid_reward_shaping_param_names = set(reward_shaping_inputs.keys())
@@ -1764,19 +1763,22 @@ class Locoformer(Module):
 
         def wrapped_step(action, *args, command = None, replay_buffer = None, env_index = None, **kwargs):
 
-            if is_tensor(action):
-                action = action.detach().cpu().numpy()
+            if not is_tensor(action):
+                action = tensor(action)
 
             if is_vectorized:
-                if np.issubdtype(action.dtype, np.integer) and action.shape[-1] == 1:
+                if action.shape[-1] == 1:
                     action = rearrange(action, 'b 1 -> b')
-            else:
-                action = rearrange(action, '1 ... -> ...')
 
-                if np.issubdtype(action.dtype, np.integer) and action.size == 1:
+                action = action.detach().cpu().numpy()
+            else:
+                if action.ndim > 0 and action.shape[0] == 1:
+                    action = action[0]
+
+                if action.numel() == 1:
                     action = action.item()
                 else:
-                    action = action.tolist()
+                    action = action.detach().cpu().numpy().tolist()
 
             env_step_out = env.step(action, *args, **kwargs)
 
@@ -1790,8 +1792,12 @@ class Locoformer(Module):
 
             if self.has_reward_shaping:
 
+                state_for_reward_shaping = env_step_out_dict['state']
+                if not is_vectorized:
+                    state_for_reward_shaping = rearrange(state_for_reward_shaping, '1 ... -> ...')
+
                 shaped_rewards = self.state_and_command_to_rewards(
-                    env_step_out_dict['state'],
+                    state_for_reward_shaping,
                     commands = command,
                     action = action,
                     replay_buffer = replay_buffer,

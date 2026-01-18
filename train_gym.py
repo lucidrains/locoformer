@@ -259,7 +259,7 @@ def main(
                     done        = 'bool',
                     condition   = ('float', 2),
                     cond_mask   = 'bool',
-                    internal_state = ('float', dim_state)
+                    internal_state = ('float', 2)
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
@@ -303,7 +303,7 @@ def main(
 
         def derive_internal_state(step_output, env):
             state = step_output['state']
-            return state[:2]
+            return state[..., :2]
 
         transforms.update(internal_state = derive_internal_state)
 

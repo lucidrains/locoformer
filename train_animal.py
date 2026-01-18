@@ -239,7 +239,7 @@ def main(
                     condition   = ('float', 2),
                     cond_mask   = 'bool',
                     shaped_reward = ('float', 8),
-                    internal_state = ('float', dim_state)
+                    internal_state = ('float', 2)
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
@@ -272,8 +272,13 @@ def main(
 
             return get_snapshot(env, dim_state_image_shape[1:])
 
+        def derive_internal_state(step_output, env):
+            state = step_output['state']
+            return state[..., :2]
+
         transforms = dict(
             state_image = get_snapshot_from_env,
+            internal_state = derive_internal_state
         )
 
         wrapped_env_functions = locoformer.wrap_env_functions(
