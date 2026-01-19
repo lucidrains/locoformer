@@ -281,23 +281,18 @@ def main(
             internal_state = derive_internal_state
         )
 
-        wrapped_env_functions = locoformer.wrap_env_functions(
-            env,
-            env_output_transforms = transforms,
-            state_transform = state_transform
-        )
-
         for _ in range(num_episodes_before_learn):
 
             cum_reward = locoformer.gather_experience_from_env_(
-                wrapped_env_functions,
+                env,
                 replay,
                 max_timesteps = max_timesteps,
                 use_vision = use_vision,
+                env_output_transforms = transforms,
+                state_transform = state_transform,
                 action_select_kwargs = action_select_kwargs,
                 state_embed_kwargs = state_embed_kwargs,
                 state_id_kwarg = state_id_kwarg,
-                replay_buffer = replay,
                 env_index = env_index,
                 state_entropy_bonus_weight = state_entropy_bonus_weight,
                 embed_past_action = embed_past_action

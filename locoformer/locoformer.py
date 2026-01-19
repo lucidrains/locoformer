@@ -1935,13 +1935,14 @@ class Locoformer(Module):
     def gather_experience_from_env_(
         self,
         env: Any,
-        wrapped_env_functions: tuple[Callable, Callable],
         replay: ReplayBuffer,
         num_envs: int = 1,
+        env_output_transforms: dict[str, Callable] = dict(),
+        state_transform: Callable = identity,
+        reward_norm = 1.,
         embed_past_action = False,
         max_timesteps = None,
         use_vision = False,
-        replay_buffer = None,
         action_select_kwargs: dict = dict(),
         state_embed_kwargs: dict = dict(),
         state_id_kwarg: dict = dict(),
@@ -1953,6 +1954,14 @@ class Locoformer(Module):
     ):
 
         self.eval()
+
+        wrapped_env_functions = self.wrap_env_functions(
+            env = env,
+            env_output_transforms = env_output_transforms,
+            state_transform = state_transform,
+            reward_norm = reward_norm,
+            num_envs = num_envs
+        )
 
         env_reset, env_step = wrapped_env_functions
 
@@ -2037,7 +2046,7 @@ class Locoformer(Module):
                 step_dict = env_step(
                     action,
                     command = maybe_command,
-                    replay_buffer = replay_buffer,
+                    replay_buffer = replay,
                     env_index = env_index
                 )
 

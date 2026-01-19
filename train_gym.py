@@ -318,21 +318,15 @@ def main(
 
         num_envs = num_vectorized_envs if is_vectorized else 1
 
-        wrapped_env_functions = locoformer.wrap_env_functions(
-            env,
-            env_output_transforms = transforms,
-            num_envs = num_envs
-        )
-
         num_rollouts = max(num_episodes_before_learn // num_envs, 1)
 
         for _ in tqdm(range(num_rollouts), leave = False):
 
             cum_reward = locoformer.gather_experience_from_env_(
                 env,
-                wrapped_env_functions,
                 replay,
                 num_envs = num_envs,
+                env_output_transforms = transforms,
                 max_timesteps = max_timesteps,
                 use_vision = use_vision,
                 action_select_kwargs = action_select_kwargs,
