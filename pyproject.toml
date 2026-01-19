@@ -31,6 +31,7 @@ dependencies = [
     "discrete-continuous-embed-readout>=0.1.11",
     "einx>=0.3.0",
     "einops>=0.8.0",
+    "evolutionary-policy-optimization>=0.2.15",
     "glom",
     "hl-gauss-pytorch>=0.2.0",
     "hyper-connections>=0.3.16",
