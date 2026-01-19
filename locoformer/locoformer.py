@@ -1185,6 +1185,7 @@ class Locoformer(Module):
         recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
+        rand_env_param_samplers: dict[str, Callable] | list[dict[str, Callable]] | None = None,
         max_mem_segments = 1
     ):
         super().__init__()
@@ -1339,6 +1340,8 @@ class Locoformer(Module):
 
         self.reward_shaping_fns = reward_shaping_fns
         self.computed_reward_shaping_input_fns = computed_reward_shaping_input_fns
+
+        self.rand_env_param_samplers = rand_env_param_samplers
 
         # loss related
 
@@ -1931,6 +1934,7 @@ class Locoformer(Module):
     @beartype
     def gather_experience_from_env_(
         self,
+        env: Any,
         wrapped_env_functions: tuple[Callable, Callable],
         replay: ReplayBuffer,
         num_envs: int = 1,
@@ -1944,7 +1948,8 @@ class Locoformer(Module):
         env_index: int | None = None,
         state_entropy_bonus_weight = 0.,
         action_rescale_range: tuple[float, float] | None = None,
-        command_fn: Callable = always(None)
+        command_fn: Callable = always(None),
+        rand_env_param_samplers: dict[str, Callable] | None = None
     ):
 
         self.eval()
@@ -1966,6 +1971,33 @@ class Locoformer(Module):
             has_time_dim = False,
             inference_mode = True
         )
+
+        # handle domain randomization
+
+        rand_env_param_samplers = default(rand_env_param_samplers, self.rand_env_param_samplers)
+
+        if isinstance(rand_env_param_samplers, list):
+            assert exists(env_index), 'env_index must be passed in if rand_env_param_samplers is a list'
+            rand_env_param_samplers = rand_env_param_samplers[env_index]
+
+        sampled_env_params = dict()
+
+        if exists(rand_env_param_samplers):
+            for name, sampler in rand_env_param_samplers.items():
+                sampled_values = [sampler() for _ in range(num_envs)]
+
+                # set on env
+
+                if num_envs > 1:
+                    env.set_attr(name, sampled_values)
+                else:
+                    target_env = env
+                    while hasattr(target_env, 'env'):
+                        target_env = target_env.env
+
+                    setattr(target_env, name, sampled_values[0])
+
+                sampled_env_params[name] = tensor(sampled_values, device = self.device)
 
         all_cum_rewards = torch.zeros(num_envs, device = self.device)
 
@@ -2047,7 +2079,8 @@ class Locoformer(Module):
                     value = value,
                     done = torch.zeros(num_envs, device = self.device, dtype = torch.bool),
                     condition = maybe_command,
-                    cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool)
+                    cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
+                    **sampled_env_params
                 )))
 
                 timestep += 1
@@ -2072,7 +2105,8 @@ class Locoformer(Module):
                         reward = bootstrap_reward,
                         done = torch.ones(num_envs, device = self.device, dtype = torch.bool),
                         condition = maybe_command,
-                        cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool)
+                        cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
+                        **sampled_env_params
                     )))
 
                     # store the final cumulative rewards into meta data

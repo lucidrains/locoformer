@@ -12,6 +12,7 @@
 from fire import Fire
 from shutil import rmtree
 from tqdm import tqdm
+import random
 
 from accelerate import Accelerator
 
@@ -135,8 +136,15 @@ def main(
 
     # model
 
+    rand_env_param_samplers = [
+        None, # cartpole
+        dict(wind_power = lambda: random.uniform(0, 20)),
+        dict(wind_power = lambda: random.uniform(0, 20))
+    ]
+
     locoformer = Locoformer(
         reward_shaping_fns = reward_shaping_fns,
+        rand_env_param_samplers = rand_env_param_samplers,
         embedder = dict(
             dim = 64,
             dim_state = [8, 4], # 8 for lunar lander, 4 for cartpole
@@ -259,7 +267,8 @@ def main(
                     done        = 'bool',
                     condition   = ('float', 2),
                     cond_mask   = 'bool',
-                    internal_state = ('float', 2)
+                    internal_state = ('float', 2),
+                    wind_power = 'float'
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
@@ -320,6 +329,7 @@ def main(
         for _ in tqdm(range(num_rollouts), leave = False):
 
             cum_reward = locoformer.gather_experience_from_env_(
+                env,
                 wrapped_env_functions,
                 replay,
                 num_envs = num_envs,
