@@ -40,6 +40,8 @@ from assoc_scan import AssocScan
 
 from x_mlps_pytorch import MLP
 
+from evolutionary_policy_optimization.epo import LatentGenePool
+
 from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import EmbedAndReadout, Embed, Readout
@@ -692,7 +694,8 @@ class TransformerXL(Module):
         mem_kwargs: dict = dict(),
         max_mem_segments = 1,
         num_residual_streams = 1,
-        mhc_sinkhorn_iters = 4
+        mhc_sinkhorn_iters = 4,
+        has_latent_genes = False
     ):
         super().__init__()
         self.dim = dim
@@ -714,7 +717,7 @@ class TransformerXL(Module):
 
         # condition
 
-        condition = exists(dim_cond)
+        condition = exists(dim_cond) or has_latent_genes
 
         self.to_cond_tokens = MLP(dim_cond, dim * 2, activate_last = True) if exists(dim_cond) else None
 
@@ -774,6 +777,7 @@ class TransformerXL(Module):
         return_kv_cache = False,
         condition: Tensor | None = None,
         cond_mask: Tensor | None = None,
+        latent: Tensor | None = None,
         episode_ids: Tensor | None = None
     ):
         curr_token_seq_len = x.shape[-2]
@@ -840,6 +844,9 @@ class TransformerXL(Module):
         if exists(condition):
             assert exists(self.to_cond_tokens)
             cond_tokens = self.to_cond_tokens(condition)
+        
+        if exists(latent):
+            cond_tokens = default(cond_tokens, 0) + latent
 
         cond_kwargs = dict(cond = cond_tokens, cond_mask = cond_mask)
 
@@ -1186,12 +1193,17 @@ class Locoformer(Module):
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
         rand_env_param_samplers: dict[str, Callable] | list[dict[str, Callable]] | None = None,
-        max_mem_segments = 1
+        max_mem_segments = 1,
+        num_latent_genes = 0,
+        dim_latent = None,
+        latent_gene_pool_kwargs: dict = dict()
     ):
         super().__init__()
 
+        has_latent_genes = num_latent_genes > 1
+
         if isinstance(transformer, dict):
-            transformer = TransformerXL(max_mem_segments = max_mem_segments, **transformer)
+            transformer = TransformerXL(max_mem_segments = max_mem_segments, has_latent_genes = has_latent_genes, **transformer)
 
         self.transformer = transformer
 
@@ -1206,6 +1218,7 @@ class Locoformer(Module):
 
         action_embedder = None
         if isinstance(unembedder, dict):
+            unembedder = {**unembedder, 'dim': transformer.dim} if 'dim' not in unembedder else unembedder
             action_embedder, unembedder = EmbedAndReadout(
                 explicit_single_action_dim_given = True,
                 **unembedder,
@@ -1343,6 +1356,20 @@ class Locoformer(Module):
 
         self.rand_env_param_samplers = rand_env_param_samplers
 
+        # latent gene pool
+
+        self.latent_gene_pool = None
+        self.to_latent_cond = None
+
+        if has_latent_genes:
+            assert exists(dim_latent)
+            self.latent_gene_pool = LatentGenePool(
+                num_latents = num_latent_genes,
+                dim_latent = dim_latent,
+                **latent_gene_pool_kwargs
+            )
+            self.to_latent_cond = MLP(dim_latent, transformer.dim * 2)
+
         # loss related
 
         self.register_buffer('zero', tensor(0.), persistent = False)
@@ -1448,6 +1475,7 @@ class Locoformer(Module):
         episode_lens,
         condition: Tensor | None = None,
         cond_mask: Tensor | None = None,
+        latent_gene_id: Tensor | None = None,
         optims: list[Optimizer] | None = None,
         state_embed_kwargs: dict = dict(),
         action_select_kwargs: dict = dict(),
@@ -1487,7 +1515,8 @@ class Locoformer(Module):
             returns = returns,
             windowed_gae_mask = gae_mask,
             condition = condition,
-            cond_mask = cond_mask
+            cond_mask = cond_mask,
+            latent_gene_id = latent_gene_id
         )
 
         num_windows = math.ceil(seq_len / window_size)
@@ -1511,7 +1540,7 @@ class Locoformer(Module):
 
             data = SimpleNamespace(**dict(zip(windowed_data.keys(), window_tensors)))
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, latent_gene_id = data.latent_gene_id, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             log_prob = self.unembedder.log_prob(action_logits, data.action, **action_select_kwargs)
 
@@ -1842,6 +1871,7 @@ class Locoformer(Module):
             state: Tensor,
             condition: Tensor | None = None,
             cond_mask: Tensor | None = None,
+            latent_gene_id: Tensor | None = None,
             **override_kwargs
         ):
             nonlocal cache
@@ -1853,6 +1883,9 @@ class Locoformer(Module):
 
             if exists(cond_mask):
                 cond_mask = cond_mask.to(self.device)
+            
+            if exists(latent_gene_id):
+                latent_gene_id = latent_gene_id.to(self.device)
 
             # handle no batch or time, for easier time rolling out against envs
 
@@ -1898,6 +1931,7 @@ class Locoformer(Module):
                 state,
                 condition = condition,
                 cond_mask = cond_mask,
+                latent_gene_id = latent_gene_id,
                 cache = cache,
                 **{**kwargs, **override_kwargs}
             )
@@ -1950,8 +1984,12 @@ class Locoformer(Module):
         state_entropy_bonus_weight = 0.,
         action_rescale_range: tuple[float, float] | None = None,
         command_fn: Callable = always(None),
-        rand_env_param_samplers: dict[str, Callable] | None = None
+        rand_env_param_samplers: dict[str, Callable] | None = None,
+        latent_gene_id: int | Tensor | None = None
     ):
+
+        if isinstance(latent_gene_id, int):
+            latent_gene_id = torch.full((num_envs,), latent_gene_id, device = self.device, dtype = torch.long)
 
         self.eval()
 
@@ -2025,6 +2063,7 @@ class Locoformer(Module):
                     state_for_model,
                     condition = maybe_command,
                     cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
+                    latent_gene_id = latent_gene_id,
                     state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state},
                     action_select_kwargs = action_select_kwargs,
                     state_id_kwarg = state_id_kwarg,
@@ -2089,6 +2128,7 @@ class Locoformer(Module):
                     done = torch.zeros(num_envs, device = self.device, dtype = torch.bool),
                     condition = maybe_command,
                     cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
+                    latent_gene_id = latent_gene_id,
                     **sampled_env_params
                 )))
 
@@ -2102,7 +2142,7 @@ class Locoformer(Module):
 
                     next_state_for_model = next_state_image if use_vision else next_state
 
-                    _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool), return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                    _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool), latent_gene_id = latent_gene_id, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
                     bootstrap_value = torch.where(terminated.to(self.device), torch.zeros_like(next_value), next_value)
                     bootstrap_reward = torch.where(terminated.to(self.device), torch.zeros_like(reward.to(self.device)), next_value)
 
@@ -2115,12 +2155,13 @@ class Locoformer(Module):
                         done = torch.ones(num_envs, device = self.device, dtype = torch.bool),
                         condition = maybe_command,
                         cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
+                        latent_gene_id = latent_gene_id,
                         **sampled_env_params
                     )))
 
                     # store the final cumulative rewards into meta data
 
-                    replay.store_meta_batch(cum_rewards = all_cum_rewards)
+                    replay.store_meta_batch(**compact_dict(dict(cum_rewards = all_cum_rewards, latent_gene_id = latent_gene_id)))
 
                     break
 
@@ -2147,6 +2188,7 @@ class Locoformer(Module):
         return_values = False,
         return_state_pred = False,
         return_raw_value_logits = False,
+        latent_gene_id: Tensor | None = None,
         episode_id: Tensor | None = None
     ):
 
@@ -2163,7 +2205,24 @@ class Locoformer(Module):
 
         # embed
 
-        tokens = state_to_token(state, **state_embed_kwargs, **state_id_kwarg)
+        embed_kwargs = {**state_embed_kwargs, **state_id_kwarg}
+        
+        # filter kwargs if it is a standard torch module and doesn't explicitly accept them
+        
+        if not isinstance(state_to_token, (nn.Linear, nn.Embedding)):
+             tokens = state_to_token(state, **embed_kwargs)
+        else:
+             tokens = state_to_token(state)
+
+        # maybe fetch latent gene and condition
+
+        latent_cond = None
+        if exists(latent_gene_id) and exists(self.latent_gene_pool):
+            latent = self.latent_gene_pool(latent_id = latent_gene_id)
+            latent_cond = self.to_latent_cond(latent)
+
+            if latent_cond.ndim == 2:
+                latent_cond = rearrange(latent_cond, 'b d -> b 1 d')
 
         # maybe add past action
 
@@ -2217,6 +2276,7 @@ class Locoformer(Module):
             tokens,
             condition = condition,
             cond_mask = cond_mask,
+            latent = latent_cond,
             cache = attn_cache,
             return_kv_cache = True,
             episode_ids = episode_id

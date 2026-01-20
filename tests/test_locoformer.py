@@ -438,3 +438,93 @@ def test_computed_reward_shaping_input_fns():
 
     assert rewards.shape == (1,)
     assert torch.allclose(rewards, state[0] + state[1])
+
+def test_epo():
+    import numpy as np
+    import shutil
+    from memmap_replay_buffer import ReplayBuffer
+
+    shutil.rmtree('./replay_test_epo', ignore_errors = True)
+
+    model = Locoformer(
+        embedder = nn.Linear(10, 128),
+        unembedder = dict(
+            num_continuous = 10
+        ),
+        value_network = MLP(128, 64, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        num_latent_genes = 4,
+        dim_latent = 16,
+        latent_gene_pool_kwargs = dict(
+            frac_tournaments = 0.75,
+            frac_natural_selected = 0.75,
+            frac_elitism = 0.
+        ),
+        transformer = dict(
+            dim = 128,
+            depth = 1,
+            window_size = 8
+        )
+    )
+
+    replay = ReplayBuffer(
+        './replay_test_epo',
+        max_episodes = 4,
+        max_timesteps = 6,
+        fields = dict(
+            state = ('float', 10),
+            action = ('float', 10),
+            action_log_prob = ('float', 10),
+            reward = 'float',
+            value = 'float',
+            done = 'bool',
+            cond_mask = 'bool',
+            latent_gene_id = 'int'
+        ),
+        meta_fields = dict(
+            latent_gene_id = 'int',
+            cum_rewards = 'float'
+        )
+    )
+
+    class MockEnv:
+        def reset(self):
+            return np.random.normal(size = (10,)), {}
+
+        def step(self, action):
+            reward = float(np.sum(action))
+            return np.random.normal(size = (10,)), reward, False, False, {}
+
+    env = MockEnv()
+
+    # rollout for 4 genes
+
+    all_fitnesses = []
+
+    for gene_id in range(4):
+        
+        cum_reward = model.gather_experience_from_env_(
+            env = env,
+            replay = replay,
+            num_envs = 1,
+            max_timesteps = 5,
+            latent_gene_id = gene_id
+        )
+
+        all_fitnesses.append(cum_reward)
+
+    # verify storage in meta
+
+    assert 'latent_gene_id' in replay.meta_data
+    assert replay.meta_data['latent_gene_id'].shape == (4,) # 4 episodes
+    
+    # update gene pool
+
+    fitness = torch.tensor(all_fitnesses)
+    
+    model.latent_gene_pool.genetic_algorithm_step(fitness)
+
+    # cleanup
+    import shutil
+    shutil.rmtree('./replay_test_epo', ignore_errors = True)
