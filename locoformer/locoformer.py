@@ -1155,6 +1155,18 @@ def default_parse_env_step_out(step_out: tuple):
 
     return data_dict
 
+def default_domain_rand_handler(env, name, sampled_values):
+    num_envs = len(sampled_values)
+
+    if num_envs > 1:
+        env.set_attr(name, sampled_values)
+    else:
+        target_env = env
+        while hasattr(target_env, 'env'):
+            target_env = target_env.env
+
+        setattr(target_env, name, sampled_values[0])
+
 class Locoformer(Module):
     def __init__(
         self,
@@ -1193,6 +1205,7 @@ class Locoformer(Module):
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
         rand_env_param_samplers: dict[str, Callable] | list[dict[str, Callable]] | None = None,
+        env_domain_rand_handlers: dict[type, Callable] = dict(),
         max_mem_segments = 1,
         num_latent_genes = 0,
         dim_latent = None,
@@ -1355,6 +1368,7 @@ class Locoformer(Module):
         self.computed_reward_shaping_input_fns = computed_reward_shaping_input_fns
 
         self.rand_env_param_samplers = rand_env_param_samplers
+        self.env_domain_rand_handlers = env_domain_rand_handlers
 
         # latent gene pool
 
@@ -2030,19 +2044,21 @@ class Locoformer(Module):
         sampled_env_params = dict()
 
         if exists(rand_env_param_samplers):
+            # determine handler based on env type
+
+            handler = default_domain_rand_handler
+
+            for env_type, custom_handler in self.env_domain_rand_handlers.items():
+                if isinstance(env, env_type):
+                    handler = custom_handler
+                    break
+
             for name, sampler in rand_env_param_samplers.items():
                 sampled_values = [sampler() for _ in range(num_envs)]
 
-                # set on env
+                # set on env via handler
 
-                if num_envs > 1:
-                    env.set_attr(name, sampled_values)
-                else:
-                    target_env = env
-                    while hasattr(target_env, 'env'):
-                        target_env = target_env.env
-
-                    setattr(target_env, name, sampled_values[0])
+                handler(env, name, sampled_values)
 
                 sampled_env_params[name] = tensor(sampled_values, device = self.device)
 
