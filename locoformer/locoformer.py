@@ -699,6 +699,10 @@ class TransformerXL(Module):
     ):
         super().__init__()
         self.dim = dim
+        self.heads = heads
+        self.dim_head = dim_head
+        self.expansion_factor = expansion_factor
+        self.dim_cond = dim_cond
 
         # memory
 
@@ -1214,7 +1218,11 @@ class Locoformer(Module):
         max_mem_segments = 1,
         num_latent_genes = 0,
         dim_latent = None,
-        latent_gene_pool_kwargs: dict = dict()
+        latent_gene_pool_kwargs: dict = dict(),
+        actor_depth = 0,
+        critic_depth = 0,
+        actor_transformer_kwargs: dict = dict(),
+        critic_transformer_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -1224,6 +1232,46 @@ class Locoformer(Module):
             transformer = TransformerXL(max_mem_segments = max_mem_segments, has_latent_genes = has_latent_genes, **transformer)
 
         self.transformer = transformer
+
+        # actor / critic decoupled transformers
+
+        self.has_actor_transformer = actor_depth > 0
+        self.actor_transformer = None
+
+        if self.has_actor_transformer:
+            transformer_kwargs = dict(
+                dim = transformer.dim,
+                heads = transformer.heads,
+                dim_head = transformer.dim_head,
+                expansion_factor = transformer.expansion_factor,
+                dim_cond = transformer.dim_cond,
+                window_size = transformer.window_size,
+                depth = actor_depth,
+                max_mem_segments = max_mem_segments
+            )
+
+            transformer_kwargs.update(actor_transformer_kwargs)
+
+            self.actor_transformer = TransformerXL(**transformer_kwargs)
+
+        self.has_critic_transformer = critic_depth > 0
+        self.critic_transformer = None
+
+        if self.has_critic_transformer:
+            transformer_kwargs = dict(
+                dim = transformer.dim,
+                heads = transformer.heads,
+                dim_head = transformer.dim_head,
+                expansion_factor = transformer.expansion_factor,
+                dim_cond = transformer.dim_cond,
+                window_size = transformer.window_size,
+                depth = critic_depth,
+                max_mem_segments = max_mem_segments
+            )
+
+            transformer_kwargs.update(critic_transformer_kwargs)
+
+            self.critic_transformer = TransformerXL(**transformer_kwargs)
 
         # handle state embedder
 
@@ -1236,10 +1284,9 @@ class Locoformer(Module):
 
         action_embedder = None
         if isinstance(unembedder, dict):
-            unembedder = dict(
-                dim = transformer.dim,
-                **unembedder
-            )
+            unembedder_kwargs = dict(dim = transformer.dim)
+            unembedder_kwargs.update(unembedder)
+            unembedder = unembedder_kwargs
 
             action_embedder, unembedder = EmbedAndReadout(
                 explicit_single_action_dim_given = True,
@@ -1410,14 +1457,20 @@ class Locoformer(Module):
     def actor_parameters(self):
         return [
             *self.policy_network.parameters(),
-            *self.unembedder.parameters()
+            *self.unembedder.parameters(),
+            *(self.actor_transformer.parameters() if self.has_actor_transformer else [])
         ]
 
     def critic_parameters(self):
-        if not exists(self.to_value_pred):
-            return []
+        params = []
 
-        return self.to_value_pred.parameters()
+        if exists(self.to_value_pred):
+            params.extend(self.to_value_pred.parameters())
+
+        if self.has_critic_transformer:
+            params.extend(self.critic_transformer.parameters())
+
+        return params
 
     @beartype
     def learn(
@@ -2213,7 +2266,7 @@ class Locoformer(Module):
     def forward(
         self,
         state: Tensor,
-        cache: TransformerMemory | None = None,
+        cache: TransformerMemory | tuple | None = None,
         condition: Tensor | None = None,
         cond_mask: Tensor | None = None,
         past_action: Tensor | None = None,
@@ -2260,11 +2313,21 @@ class Locoformer(Module):
             if latent_cond.ndim == 2:
                 latent_cond = rearrange(latent_cond, 'b d -> b 1 d')
 
+        # handle multi-heads cache
+
+        backbone_cache = actor_cache = critic_cache = None
+
+        if exists(cache):
+            if isinstance(cache, (tuple, list)) and len(cache) == 3 and not isinstance(cache, TransformerMemory):
+                backbone_cache, actor_cache, critic_cache = cache
+            else:
+                backbone_cache = cache
+
         # maybe add past action
 
         # determine if first window and start of sequence
 
-        total_tokens = cache.total_tokens if exists(cache) else 0
+        total_tokens = backbone_cache.total_tokens if exists(backbone_cache) else 0
 
         is_start_of_sequence = total_tokens == 0
 
@@ -2290,7 +2353,7 @@ class Locoformer(Module):
         if is_start_of_sequence:
             passed_episode_ids = has_episode_id
         else:
-            *_, passed_episode_ids = cache
+            passed_episode_ids = backbone_cache.passed_episode_ids
             assert xnor(has_episode_id, passed_episode_ids), 'episode_id must be passed in if it was passed in the first window, and vice versa'
 
         # time
@@ -2299,28 +2362,52 @@ class Locoformer(Module):
 
         # attention
 
-        if not exists(cache):
+        if not exists(backbone_cache):
             memory_segments = deque(maxlen = self.max_mem_segments)
             episode_id_segments = deque(maxlen = self.max_mem_segments)
             curr_episode_ids = None
         else:
-            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = cache
+            total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = backbone_cache
 
-        attn_cache = cache
-
-        embed, cache = self.transformer(
+        embed, backbone_cache = self.transformer(
             tokens,
             condition = condition,
             cond_mask = cond_mask,
             latent = latent_cond,
-            cache = attn_cache,
+            cache = backbone_cache,
             return_kv_cache = True,
             episode_ids = episode_id
         )
 
+        # maybe pass through decoupled actor / critic transformers
+
+        actor_embed = embed
+        if self.has_actor_transformer:
+            actor_embed, actor_cache = self.actor_transformer(
+                 embed,
+                 condition = condition,
+                 cond_mask = cond_mask,
+                 latent = latent_cond,
+                 cache = actor_cache,
+                 return_kv_cache = True,
+                 episode_ids = episode_id
+            )
+
+        critic_embed = embed
+        if self.has_critic_transformer:
+            critic_embed, critic_cache = self.critic_transformer(
+                 embed,
+                 condition = condition,
+                 cond_mask = cond_mask,
+                 latent = latent_cond,
+                 cache = critic_cache,
+                 return_kv_cache = True,
+                 episode_ids = episode_id
+            )
+
         # unembed to actions - in language models this would be the next state
 
-        policy_embed = self.policy_network(embed)
+        policy_embed = self.policy_network(actor_embed)
 
         action_logits = self.unembedder(policy_embed, **action_select_kwargs)
 
@@ -2333,7 +2420,7 @@ class Locoformer(Module):
 
             if self.can_pred_state:
                 state_id = state_id_kwarg.get('state_id', 0)
-                state_pred_embed = self.state_pred_network(embed)
+                state_pred_embed = self.state_pred_network(actor_embed)
                 state_pred = self.state_pred_head(state_pred_embed, selector_index = state_id)
 
             out = (out, state_pred)
@@ -2348,16 +2435,16 @@ class Locoformer(Module):
         if return_values:
             assert exists(self.to_value_pred)
 
-            values = self.to_value_pred(embed)
+            values = self.to_value_pred(critic_embed)
 
             if not return_raw_value_logits:
                 values = self.hl_gauss_loss(values) # converts the value logits to scalar values
 
             out = (out, values)
 
-        # handle curtailing kv cache at the right intervals
+        # handle curtailing backbone kv cache at the right intervals
 
-        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = cache
+        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = backbone_cache
 
         # accumulate curr_episode_ids
 
@@ -2379,6 +2466,11 @@ class Locoformer(Module):
             memory_segments.append(kv_cache[..., -self.window_size:, :].detach())
             episode_id_segments.append(curr_episode_ids[..., -self.window_size:].detach() if exists(curr_episode_ids) else None)
 
-        cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids)
+        backbone_cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids)
+
+        if self.has_actor_transformer or self.has_critic_transformer:
+            cache = (backbone_cache, actor_cache, critic_cache)
+        else:
+            cache = backbone_cache
 
         return out, cache

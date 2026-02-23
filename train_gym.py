@@ -110,7 +110,9 @@ def main(
     num_vectorized_envs = 4,
     cpu = False,
     use_wandb = False,
-    wandb_project = 'locoformer-gym'
+    wandb_project = 'locoformer-gym',
+    actor_depth = 0,
+    critic_depth = 0
 ):
 
     if clear_folders:
@@ -200,7 +202,9 @@ def main(
             use_accelerated = False
         ),
         use_spo = False,
-        asymmetric_spo = False
+        asymmetric_spo = False,
+        actor_depth = actor_depth,
+        critic_depth = critic_depth
     ).to(device)
 
     optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
