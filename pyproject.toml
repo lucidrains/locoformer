@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.1.27"
+version = "0.1.28"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -45,7 +45,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://pypi.org/project/locoformer/"
-Repository = "https://github.com/lucidrains/locoformer"
+Repository = "https://codeberg.org/lucidrains/locoformer"
 
 [project.optional-dependencies]
 
@@ -76,3 +76,8 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["locoformer"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/locoformer",
+]
