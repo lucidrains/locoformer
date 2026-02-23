@@ -5,11 +5,15 @@
 #     "gymnasium[box2d]>=1.0.0",
 #     "locoformer>=0.0.12",
 #     "moviepy",
-#     "tqdm"
+#     "tqdm",
+#     "wandb"
 # ]
 # ///
 
 from fire import Fire
+import os
+os.environ['MUJOCO_GL'] = 'osmesa'
+from pathlib import Path
 from shutil import rmtree
 from tqdm import tqdm
 import random
@@ -28,6 +32,7 @@ from torch.optim import Adam
 from einops import rearrange, einsum
 
 from locoformer.locoformer import Locoformer, ReplayBuffer
+import wandb
 
 from x_mlps_pytorch import Feedforwards, MLP
 
@@ -103,12 +108,17 @@ def main(
     test_mock_reward_shaping = False,
     vectorized_env_indices = (),
     num_vectorized_envs = 4,
-    cpu = False
+    cpu = False,
+    use_wandb = False,
+    wandb_project = 'locoformer-gym'
 ):
 
     if clear_folders:
         rmtree(video_folder, ignore_errors = True)
         rmtree('./replay', ignore_errors = True)
+
+    if use_wandb:
+        wandb.init(project = wandb_project, config = dict(locals()))
 
     # possible envs
 
@@ -322,7 +332,7 @@ def main(
 
         for _ in tqdm(range(num_rollouts), leave = False):
 
-            cum_reward = locoformer.gather_experience_from_env_(
+            mean_cum_reward, steps_per_episode = locoformer.gather_experience_from_env_(
                 env,
                 replay,
                 num_envs = num_envs,
@@ -337,11 +347,27 @@ def main(
                 embed_past_action = embed_past_action
             )
 
-            pbar.set_postfix(reward = f'{cum_reward:.2f}')
+            pbar.set_postfix(reward = f'{mean_cum_reward:.2f}')
+
+            if use_wandb:
+                wandb_log = dict(
+                    mean_cum_reward = mean_cum_reward,
+                    steps_per_episode = steps_per_episode,
+                    env_index = env_index
+                )
+
+                # check for new videos
+
+                if not is_vectorized:
+                    video_files = sorted(list(Path(video_folder).glob(f'{learn_cycle}-env-video-episode-*.mp4')))
+                    if len(video_files) > 0:
+                        wandb_log['video'] = wandb.Video(str(video_files[-1]))
+
+                wandb.log(wandb_log)
 
         # learn if hit the number of learn timesteps
 
-        locoformer.learn(
+        actor_loss, critic_loss = locoformer.learn(
             optims,
             accelerator,
             replay,
@@ -354,6 +380,12 @@ def main(
             compute_state_pred_loss,
             create_episode_mapping_from_replay if test_episode_mapping_constructor else None
         )
+
+        if use_wandb:
+            wandb.log(dict(
+                actor_loss = actor_loss.item(),
+                critic_loss = critic_loss.item()
+            ))
 
 # main
 

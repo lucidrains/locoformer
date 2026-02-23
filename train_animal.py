@@ -6,13 +6,16 @@
 #     "locoformer>=0.0.12",
 #     "moviepy",
 #     "tqdm",
-#     "x-mlps-pytorch"
+#     "x-mlps-pytorch",
+#     "wandb"
 # ]
 # ///
-
-from fire import Fire
+import os
+os.environ['MUJOCO_GL'] = 'osmesa'
+from pathlib import Path
 from shutil import rmtree
 from tqdm import tqdm
+import wandb
 
 from accelerate import Accelerator
 
@@ -41,6 +44,8 @@ from locoformer.locoformer import (
     reward_torque_penalty,
     reward_alive
 )
+
+from fire import Fire
 
 from x_mlps_pytorch import Feedforwards
 
@@ -103,11 +108,16 @@ def main(
     epochs = 3,
     reward_range = (-10000., 10000.),
     num_reward_bins = 25_000,
-    cpu = False
+    cpu = False,
+    use_wandb = False,
+    wandb_project = 'locoformer-animal'
 ):
 
     if clear_video:
         rmtree(video_folder, ignore_errors = True)
+
+    if use_wandb:
+        wandb.init(project = wandb_project, config = dict(locals()))
 
     # possible envs
 
@@ -283,7 +293,7 @@ def main(
 
         for _ in range(num_episodes_before_learn):
 
-            cum_reward = locoformer.gather_experience_from_env_(
+            mean_cum_reward, steps_per_episode = locoformer.gather_experience_from_env_(
                 env,
                 replay,
                 max_timesteps = max_timesteps,
@@ -298,11 +308,26 @@ def main(
                 embed_past_action = embed_past_action
             )
 
-            pbar.set_postfix(reward = f'{cum_reward:.2f}')
+            pbar.set_postfix(reward = f'{mean_cum_reward:.2f}')
+
+            if use_wandb:
+                wandb_log = dict(
+                    mean_cum_reward = mean_cum_reward,
+                    steps_per_episode = steps_per_episode,
+                    env_index = env_index
+                )
+
+                # check for new videos
+
+                video_files = sorted(list(Path(video_folder).glob(f'{learn_cycle}-{env_short_name}-episode-*.mp4')))
+                if len(video_files) > 0:
+                    wandb_log['video'] = wandb.Video(str(video_files[-1]))
+
+                wandb.log(wandb_log)
 
         # learn
 
-        locoformer.learn(
+        actor_loss, critic_loss = locoformer.learn(
             optims,
             accelerator,
             replay,
@@ -315,6 +340,12 @@ def main(
             compute_state_pred_loss,
             env_state_pred_loss_weight
         )
+
+        if use_wandb:
+            wandb.log(dict(
+                actor_loss = actor_loss.item(),
+                critic_loss = critic_loss.item()
+            ))
 
         env.close()
 

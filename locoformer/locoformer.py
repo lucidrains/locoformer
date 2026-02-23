@@ -1236,9 +1236,14 @@ class Locoformer(Module):
 
         action_embedder = None
         if isinstance(unembedder, dict):
-            unembedder = {**unembedder, 'dim': transformer.dim} if 'dim' not in unembedder else unembedder
+            unembedder = dict(
+                dim = transformer.dim,
+                **unembedder
+            )
+
             action_embedder, unembedder = EmbedAndReadout(
                 explicit_single_action_dim_given = True,
+                readout_kwargs = dict(continuous_log_var_clamp = True),
                 **unembedder,
             )
 
@@ -1294,7 +1299,12 @@ class Locoformer(Module):
 
             selectors = [t.tolist() for t in arange(total_dim_states).split(dim_states)]
 
-            self.state_pred_head = Readout(transformer.dim, num_continuous = total_dim_states, selectors = selectors)
+            self.state_pred_head = Readout(
+                transformer.dim,
+                num_continuous = total_dim_states,
+                selectors = selectors,
+                continuous_log_var_clamp = True
+            )
 
         self.has_state_pred_loss = state_pred_loss_weight > 0.
         self.state_pred_loss_weight = state_pred_loss_weight
@@ -1447,6 +1457,9 @@ class Locoformer(Module):
 
         self, dl, *optims = accelerator.prepare(self, dl, *optims)
 
+        last_actor_loss = None
+        last_critic_loss = None
+
         for _ in range(epochs):
             for data in dl:
 
@@ -1472,7 +1485,11 @@ class Locoformer(Module):
                     accelerator = accelerator
                 )
 
+                last_actor_loss, last_critic_loss = actor_loss, critic_loss
+
                 accelerator.print(f'actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f}')
+
+        return last_actor_loss, last_critic_loss
 
     def evolve(
         self,
@@ -2069,7 +2086,7 @@ class Locoformer(Module):
 
         all_cum_rewards = torch.zeros(num_envs, device = self.device)
 
-        with replay.batched_episode(num_envs, latent_gene_id = latent_gene_id):
+        with replay.batched_episode(num_envs, **compact_dict(dict(latent_gene_id = latent_gene_id))):
 
             past_action = None
 
@@ -2191,7 +2208,7 @@ class Locoformer(Module):
                 if embed_past_action:
                     past_action = action
 
-        return all_cum_rewards.mean().item()
+        return all_cum_rewards.mean().item(), timestep
 
     def forward(
         self,
