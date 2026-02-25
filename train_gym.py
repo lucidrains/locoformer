@@ -3,7 +3,7 @@
 #     "accelerate",
 #     "fire",
 #     "gymnasium[box2d]>=1.0.0",
-#     "locoformer>=0.0.12",
+#     "locoformer>=0.2.0",
 #     "moviepy",
 #     "tqdm",
 #     "wandb"
@@ -371,6 +371,13 @@ def main(
 
         # learn if hit the number of learn timesteps
 
+        # env loss weights
+
+        env_loss_weights = [1.0, 1.0, 3.0] # CartPole, LunarLander (Disc), LunarLander (Cont)
+        env_loss_weight = env_loss_weights[env_index]
+
+        # learn if hit the number of learn timesteps
+
         actor_loss, critic_loss = locoformer.learn(
             optims,
             accelerator,
@@ -382,7 +389,8 @@ def main(
             epochs,
             use_vision,
             compute_state_pred_loss,
-            create_episode_mapping_from_replay if test_episode_mapping_constructor else None
+            env_loss_weight = env_loss_weight,
+            maybe_construct_trial_from_buffer = create_episode_mapping_from_replay if test_episode_mapping_constructor else None
         )
 
         if use_wandb:

@@ -3,16 +3,16 @@
 #     "accelerate",
 #     "fire",
 #     "gymnasium[mujoco]>=1.0.0",
-#     "locoformer>=0.0.12",
+#     "locoformer>=0.2.0",
 #     "moviepy",
 #     "tqdm",
-#     "x-mlps-pytorch",
 #     "wandb"
 # ]
 # ///
+
 import os
-os.environ['MUJOCO_GL'] = 'osmesa'
 from pathlib import Path
+from collections import deque
 from shutil import rmtree
 from tqdm import tqdm
 import wandb
@@ -110,6 +110,7 @@ def main(
     num_reward_bins = 25_000,
     cpu = False,
     use_wandb = False,
+    wandb_mode = 'online',
     wandb_project = 'locoformer-animal'
 ):
 
@@ -117,7 +118,7 @@ def main(
         rmtree(video_folder, ignore_errors = True)
 
     if use_wandb:
-        wandb.init(project = wandb_project, config = dict(locals()))
+        wandb.init(project = wandb_project, config = dict(locals()), mode = wandb_mode)
 
     # possible envs
 
@@ -145,6 +146,8 @@ def main(
         unembedder = dict(
             dim = 256,
             num_continuous = 17 + 6,
+            continuous_dist_type = 'beta',
+            continuous_dist_kwargs = dict(unimodal = True),
             selectors = [
                 list(range(17)),
                 list(range(17, 17 + 6))
@@ -173,6 +176,10 @@ def main(
         num_reward_bins = num_reward_bins,
         reward_range = reward_range,
         hl_gauss_loss_kwargs = dict(),
+        action_rescale_ranges = [
+            (-0.4, 0.4), # humanoid
+            (-1., 1.)    # cheetah
+        ],
         recurrent_cache = True,
         calc_gae_kwargs = dict(
             use_accelerated = False
@@ -203,6 +210,8 @@ def main(
     optims = [optim_base, optim_actor, optim_critic]
 
     # loop
+
+    rolling_rewards = {i: deque(maxlen = 100) for i in range(len(envs))}
 
     pbar = tqdm(range(num_learning_cycles), desc = 'learning cycles')
 
@@ -308,7 +317,17 @@ def main(
                 embed_past_action = embed_past_action
             )
 
-            pbar.set_postfix(reward = f'{mean_cum_reward:.2f}')
+            rolling_rewards[env_index].append(mean_cum_reward)
+
+            postfix = dict()
+            for i, env_rolling_reward in rolling_rewards.items():
+                if len(env_rolling_reward) == 0:
+                    continue
+
+                _, short_name, _, _, _ = envs[i]
+                postfix[short_name] = f'{sum(env_rolling_reward) / len(env_rolling_reward):.2f}'
+
+            pbar.set_postfix(**postfix)
 
             if use_wandb:
                 wandb_log = dict(

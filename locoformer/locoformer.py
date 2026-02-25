@@ -71,6 +71,14 @@ TransformerMemory = namedtuple('TransformerMemory', (
     'passed_episode_ids'
 ))
 
+DEFAULT_LOG_VAR_CLAMP_RANGE = (-6., 3.)
+
+CONTINUOUS_DIST_FROM_RANGES = {
+    'gaussian': (-1., 1.),
+    'beta': (0., 1.),
+    'kumaraswamy': (0., 1.)
+}
+
 # helper functions
 
 def exists(v):
@@ -99,6 +107,7 @@ def first(arr):
 
 def xnor(x, y):
     return not (x ^ y)
+
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -133,6 +142,19 @@ def check_has_param_attr(
     return decorator
 
 # tensor helpers
+
+def rescale(t, from_range, to_range):
+    if is_tensor(from_range):
+        from_min, from_max = from_range.unbind(dim = -1)
+    else:
+        from_min, from_max = from_range
+
+    if is_tensor(to_range):
+        to_min, to_max = to_range.unbind(dim = -1)
+    else:
+        to_min, to_max = to_range
+
+    return (t - from_min) / (from_max - from_min) * (to_max - to_min) + to_min
 
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
@@ -1194,8 +1216,10 @@ class Locoformer(Module):
         value_network: Module = nn.Identity(),
         policy_network: Module = nn.Identity(),
         state_pred_network: Module | None = None,
+        state_pred_loss_weight = 10.,
+        action_rescale_ranges: list[Any] | None = None,
+        vectorized_env_indices: tuple[int, ...] = (),
         embed_past_action = False,
-        state_pred_loss_weight = 0.05,
         reward_range: tuple[float, float] | None = None,
         reward_shaping_fns: (
             MaybeOneRewardShaper |
@@ -1213,6 +1237,7 @@ class Locoformer(Module):
         recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
+        spo_epsilon: float | tuple[float, float] = 0.05,
         rand_env_param_samplers: dict[str, Callable] | list[dict[str, Callable]] | None = None,
         env_domain_rand_handlers: dict[type, Callable] = dict(),
         max_mem_segments = 1,
@@ -1288,9 +1313,15 @@ class Locoformer(Module):
             unembedder_kwargs.update(unembedder)
             unembedder = unembedder_kwargs
 
+            dist_type = unembedder.get('continuous_dist_type', 'gaussian')
+            continuous_dist_kwargs = unembedder.pop('continuous_dist_kwargs', dict())
+
+            if dist_type == 'gaussian':
+                continuous_dist_kwargs.setdefault('log_var_clamp_range', DEFAULT_LOG_VAR_CLAMP_RANGE)
+
             action_embedder, unembedder = EmbedAndReadout(
                 explicit_single_action_dim_given = True,
-                readout_kwargs = dict(continuous_log_var_clamp = True),
+                readout_kwargs = dict(continuous_dist_kwargs = continuous_dist_kwargs),
                 **unembedder,
             )
 
@@ -1300,6 +1331,7 @@ class Locoformer(Module):
 
         self.past_action_embedder = None
         self.embed_past_action = embed_past_action
+        self.action_rescale_ranges = action_rescale_ranges
 
         if embed_past_action and exists(action_embedder):
             self.past_action_embedder = action_embedder
@@ -1350,7 +1382,7 @@ class Locoformer(Module):
                 transformer.dim,
                 num_continuous = total_dim_states,
                 selectors = selectors,
-                continuous_log_var_clamp = True
+                continuous_dist_kwargs = dict(log_var_clamp_range = (-6., 3.))
             )
 
         self.has_state_pred_loss = state_pred_loss_weight > 0.
@@ -1375,6 +1407,7 @@ class Locoformer(Module):
         self.use_spo = use_spo
 
         self.asymmetric_spo = asymmetric_spo
+        self.spo_epsilon = spo_epsilon
 
         # maybe recurrent kv cache, from Ding et al. https://arxiv.org/abs/2012.15688
 
@@ -1486,6 +1519,7 @@ class Locoformer(Module):
         use_vision = False,
         compute_state_pred_loss = False,
         state_pred_loss_weight = None,
+        env_loss_weight = None,
         maybe_construct_trial_from_buffer: Callable[[ReplayBuffer], Tensor] | None = None
     ):
         state_field = 'state_image' if use_vision else 'state'
@@ -1535,6 +1569,7 @@ class Locoformer(Module):
                     state_id_kwarg = state_id_kwarg,
                     compute_state_pred_loss = compute_state_pred_loss,
                     state_pred_loss_weight = state_pred_loss_weight,
+                    env_loss_weight = env_loss_weight,
                     accelerator = accelerator
                 )
 
@@ -1571,6 +1606,7 @@ class Locoformer(Module):
         state_id_kwarg: dict = dict(),
         compute_state_pred_loss = True,
         state_pred_loss_weight = None,
+        env_loss_weight = None,
         accelerator = None,
         max_grad_norm = 0.5
     ):
@@ -1636,9 +1672,10 @@ class Locoformer(Module):
             # update actor, classic clipped surrogate loss
 
             eps_clip = self.ppo_eps_clip
+            spo_eps_clip = self.spo_epsilon
             ratio = (log_prob - data.old_action_log_prob).exp()
 
-            calc_spo = lambda: -(ratio * data.advantage - (data.advantage.abs() * (ratio - 1.).square()) / (2 * eps_clip))
+            calc_spo = lambda: -(ratio * data.advantage - (data.advantage.abs() * (ratio - 1.).square()) / (2 * spo_eps_clip))
 
             calc_ppo = lambda: -torch.min(ratio * data.advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * data.advantage)
 
@@ -1700,6 +1737,11 @@ class Locoformer(Module):
                     windowed_soft_constrain_loss * self.ppo_soft_constrain_action_loss_weight
                 )
 
+            # maybe scale by environment weight
+
+            if exists(env_loss_weight):
+                windowed_actor_loss = windowed_actor_loss * env_loss_weight
+
             # windowed loss
 
             windowed_actor_loss.backward(retain_graph = True)
@@ -1709,6 +1751,10 @@ class Locoformer(Module):
             value_loss = self.hl_gauss_loss(value_logits, data.returns, reduction = 'none') * self.value_loss_weight
 
             windowed_critic_loss = value_loss[data.windowed_gae_mask].sum() / total_learnable_tokens
+
+            if exists(env_loss_weight):
+                windowed_critic_loss = windowed_critic_loss * env_loss_weight
+
             windowed_critic_loss.backward(retain_graph = True)
 
             # accumulate
@@ -2164,17 +2210,22 @@ class Locoformer(Module):
                 )
 
                 action = self.unembedder.sample(action_logits, **action_select_kwargs)
+                action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
-                # maybe clip
+                # maybe rescale for env
 
-                if exists(action_rescale_range):
-                    min_val, max_val = action_rescale_range
-                    action = (action + 1.) * 0.5 * (max_val - min_val) + min_val
+                env_action = action
+                rescale_range = default(action_rescale_range, self.action_rescale_ranges[env_index] if exists(self.action_rescale_ranges) and exists(env_index) else None)
+
+                if exists(rescale_range):
+                    dist_type = getattr(self.unembedder, 'continuous_dist_type', 'gaussian')
+                    from_range = CONTINUOUS_DIST_FROM_RANGES.get(dist_type, (-1., 1.))
+                    env_action = rescale(action, from_range, rescale_range)
 
                 # pass to environment
 
                 step_dict = env_step(
-                    action,
+                    env_action,
                     command = maybe_command,
                     replay_buffer = replay,
                     env_index = env_index
@@ -2203,10 +2254,6 @@ class Locoformer(Module):
 
                 exceeds_max_timesteps = max_timesteps >= 0 and timestep == (max_timesteps - 1)
                 should_stop = (terminated | truncated).all() or exceeds_max_timesteps
-
-                # get log prob of action
-
-                action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
 
                 replay.store_batch(**compact_dict(dict(
                     state = state,

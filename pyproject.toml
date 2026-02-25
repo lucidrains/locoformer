@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.1.29"
+version = "0.2.0"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,7 +28,7 @@ classifiers = [
 dependencies = [
     "assoc-scan>=0.0.4",
     "beartype",
-    "discrete-continuous-embed-readout>=0.1.14",
+    "discrete-continuous-embed-readout==0.2.0",
     "einx>=0.3.0",
     "einops>=0.8.0",
     "evolutionary-policy-optimization>=0.2.15",
