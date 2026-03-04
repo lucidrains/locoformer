@@ -73,12 +73,6 @@ TransformerMemory = namedtuple('TransformerMemory', (
 
 DEFAULT_LOG_VAR_CLAMP_RANGE = (-6., 3.)
 
-CONTINUOUS_DIST_FROM_RANGES = {
-    'gaussian': (-1., 1.),
-    'beta': (0., 1.),
-    'kumaraswamy': (0., 1.)
-}
-
 # helper functions
 
 def exists(v):
@@ -142,19 +136,6 @@ def check_has_param_attr(
     return decorator
 
 # tensor helpers
-
-def rescale(t, from_range, to_range):
-    if is_tensor(from_range):
-        from_min, from_max = from_range.unbind(dim = -1)
-    else:
-        from_min, from_max = from_range
-
-    if is_tensor(to_range):
-        to_min, to_max = to_range.unbind(dim = -1)
-    else:
-        to_min, to_max = to_range
-
-    return (t - from_min) / (from_max - from_min) * (to_max - to_min) + to_min
 
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
@@ -2209,18 +2190,19 @@ class Locoformer(Module):
                     return_state_pred = True
                 )
 
-                action = self.unembedder.sample(action_logits, **action_select_kwargs)
-                action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
-
-                # maybe rescale for env
-
-                env_action = action
                 rescale_range = default(action_rescale_range, self.action_rescale_ranges[env_index] if exists(self.action_rescale_ranges) and exists(env_index) else None)
 
+                sample_kwargs = {**action_select_kwargs}
                 if exists(rescale_range):
-                    dist_type = getattr(self.unembedder, 'continuous_dist_type', 'gaussian')
-                    from_range = CONTINUOUS_DIST_FROM_RANGES.get(dist_type, (-1., 1.))
-                    env_action = rescale(action, from_range, rescale_range)
+                    sample_kwargs['rescale_range'] = rescale_range
+
+                action = self.unembedder.sample(action_logits, **sample_kwargs)
+
+                action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
+
+                # pass to environment
+
+                env_action = action
 
                 # pass to environment
 
