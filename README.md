@@ -86,12 +86,24 @@ This open sourced work is sponsored by [Safe Sentinel](https://www.safesentinels
 
 ```bibtex
 @misc{ashlag2025stateentropyregularizationrobust,
-    title   = {State Entropy Regularization for Robust Reinforcement Learning}, 
+    title   = {State Entropy Regularization for Robust Reinforcement Learning},
     author  = {Yonatan Ashlag and Uri Koren and Mirco Mutti and Esther Derman and Pierre-Luc Bacon and Shie Mannor},
     year    = {2025},
     eprint  = {2506.07085},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2506.07085}, 
+    url     = {https://arxiv.org/abs/2506.07085},
+}
+```
+
+```bibtex
+@misc{osband2026delightfulpolicygradient,
+    title   = {Delightful Policy Gradient},
+    author  = {Ian Osband},
+    year    = {2026},
+    eprint  = {2603.14608},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.14608},
 }
 ```

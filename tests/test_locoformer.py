@@ -21,7 +21,7 @@ def test_locoformer(
     long_term_mem_layers,
     hyper_conn
 ):
-    
+
     model = Locoformer(
         embedder = nn.Embedding(256, 128),
         unembedder = nn.Linear(128, 256, bias = False),
@@ -287,9 +287,9 @@ def test_locoformer_multi_segment(recurrent_cache):
         step_seq = rearrange(step_seq, 'b -> b 1')
         logits = stateful_forward(step_seq)
         logits_stateful.append(logits)
-    
+
     logits_stateful = torch.cat(logits_stateful, dim = 1)
-    
+
     assert torch.allclose(logits_full, logits_stateful, atol = 1e-5)
 
 def test_locoformer_episode_id():
@@ -311,14 +311,14 @@ def test_locoformer_episode_id():
         unembedder = nn.Linear(dim, 1),
         transformer = dict(dim = dim, depth = 1, window_size = 4, heads = 1)
     ).eval()
-    
+
     win1, win2 = torch.randn(1, 4, window_size), torch.randn(1, 4, window_size)
     ep0, ep1 = torch.zeros((1, 4), dtype = torch.long), torch.ones((1, 4), dtype = torch.long)
-    
+
     _, cache = model(win1, episode_id = ep0)
     out_diff_ep, _ = model(win2, episode_id = ep1, cache = cache)
     out_clean, _ = model(win2, episode_id = ep1)
-    
+
     assert torch.allclose(out_diff_ep, out_clean, atol = 1e-5)
 
     stateful_forward = model.get_stateful_forward(has_batch_dim = True, inference_mode = True)
@@ -406,7 +406,7 @@ def test_reward_shaping_storage():
 
     # mock env output
     state = torch.randn(10)
-    
+
     with replay.one_episode():
         model.state_and_command_to_rewards(state, replay_buffer = replay, env_index = 0)
 
@@ -502,7 +502,7 @@ def test_epo():
     all_fitnesses = []
 
     for gene_id in range(4):
-        
+
         cum_reward = model.gather_experience_from_env_(
             env = env,
             replay = replay,
@@ -517,11 +517,11 @@ def test_epo():
 
     assert 'latent_gene_id' in replay.meta_data
     assert replay.meta_data['latent_gene_id'].shape == (4,) # 4 episodes
-    
+
     # update gene pool
 
     fitness = torch.tensor(all_fitnesses)
-    
+
     model.latent_gene_pool.genetic_algorithm_step(fitness)
 
     # cleanup

@@ -309,7 +309,7 @@ def reward_torque_penalty(
         tau = state_named.tau
     elif exists(action):
         tau = action
-    
+
     if not exists(tau):
         return 0.
 
@@ -546,7 +546,7 @@ class Attention(Module):
             self.to_value_residual_mix = Sequential(
                 LinearNoBias(dim, heads),
                 Rearrange('b n h -> b h n 1'),
-                nn.Sigmoid()                
+                nn.Sigmoid()
             )
 
         # fixed window size
@@ -728,7 +728,7 @@ class TransformerXL(Module):
 
         self.to_cond_tokens = MLP(dim_cond, dim * 2, activate_last = True) if exists(dim_cond) else None
 
-        norm_fn = partial(MaybeAdaRMSNormWrapper, dim = dim, dim_cond = (dim * 2) if condition else None) 
+        norm_fn = partial(MaybeAdaRMSNormWrapper, dim = dim, dim_cond = (dim * 2) if condition else None)
 
         # layers
 
@@ -851,7 +851,7 @@ class TransformerXL(Module):
         if exists(condition):
             assert exists(self.to_cond_tokens)
             cond_tokens = self.to_cond_tokens(condition)
-        
+
         if exists(latent):
             cond_tokens = default(cond_tokens, 0) + latent
 
@@ -1218,6 +1218,8 @@ class Locoformer(Module):
         recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
+        use_delight_pg = False, # https://arxiv.org/abs/2603.14608
+        delight_pg_temperature = 1.,
         spo_epsilon: float | tuple[float, float] = 0.05,
         rand_env_param_samplers: dict[str, Callable] | list[dict[str, Callable]] | None = None,
         env_domain_rand_handlers: dict[type, Callable] = dict(),
@@ -1388,6 +1390,8 @@ class Locoformer(Module):
         self.use_spo = use_spo
 
         self.asymmetric_spo = asymmetric_spo
+        self.use_delight_pg = use_delight_pg
+        self.delight_pg_temperature = delight_pg_temperature
         self.spo_epsilon = spo_epsilon
 
         # maybe recurrent kv cache, from Ding et al. https://arxiv.org/abs/2012.15688
@@ -1667,6 +1671,13 @@ class Locoformer(Module):
             else:
                 actor_loss = calc_ppo()
 
+            if self.use_delight_pg:
+                # Delightful Policy Gradient
+                # Ian Osband et al. - https://arxiv.org/abs/2603.14608
+                delight = (-log_prob * data.advantage) / self.delight_pg_temperature
+                delight_gate = delight.sigmoid().detach()
+                actor_loss = actor_loss * delight_gate
+
             # maybe entropy
 
             if self.ppo_entropy_weight > 0.:
@@ -1779,7 +1790,7 @@ class Locoformer(Module):
         reward_shaping_fns = self.reward_shaping_fns[env_index] if exists(env_index) else self.reward_shaping_fns
 
         # ready a dictionary that contains all data possible for use for reward shaping
-        
+
         reward_shaping_inputs = dict(
             state = lambda: state,
             commands = lambda: commands,
@@ -1999,7 +2010,7 @@ class Locoformer(Module):
 
             if exists(cond_mask):
                 cond_mask = cond_mask.to(self.device)
-            
+
             if exists(latent_gene_id):
                 latent_gene_id = latent_gene_id.to(self.device)
 
@@ -2324,9 +2335,9 @@ class Locoformer(Module):
         # embed
 
         embed_kwargs = {**state_embed_kwargs, **state_id_kwarg}
-        
+
         # filter kwargs if it is a standard torch module and doesn't explicitly accept them
-        
+
         if not isinstance(state_to_token, (nn.Linear, nn.Embedding)):
              tokens = state_to_token(state, **embed_kwargs)
         else:
