@@ -1605,11 +1605,15 @@ class Locoformer(Module):
 
         total_learnable_tokens = gae_mask.sum().item()
 
+        if not is_tensor(action_log_prob):
+            action_log_prob = self.unembedder.maybe_concat(action_log_prob, concat = True)
+
+        if action_log_prob.ndim == 3:
+            action_log_prob = action_log_prob.sum(dim = -1)
+
         advantage, returns = calc_gae(reward, value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
         advantage = normalize(advantage, mask = gae_mask)
-
-        advantage = rearrange(advantage, '... -> ... 1')
 
         past_action = pad_at_dim(action, (1, -1), dim = -2)
 
@@ -1652,13 +1656,18 @@ class Locoformer(Module):
 
             ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, latent_gene_id = data.latent_gene_id, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
-            log_prob = self.unembedder.log_prob(action_logits, data.action, **action_select_kwargs)
+            log_prob = self.unembedder.log_prob(action_logits, data.action, concat = True, **action_select_kwargs)
+
+            if log_prob.ndim == 3:
+                log_prob = log_prob.sum(dim = -1)
+
+            old_action_log_prob = data.old_action_log_prob
 
             # update actor, classic clipped surrogate loss
 
             eps_clip = self.ppo_eps_clip
             spo_eps_clip = self.spo_epsilon
-            ratio = (log_prob - data.old_action_log_prob).exp()
+            ratio = (log_prob - old_action_log_prob).exp()
 
             calc_spo = lambda: -(ratio * data.advantage - (data.advantage.abs() * (ratio - 1.).square()) / (2 * spo_eps_clip))
 
@@ -1681,9 +1690,12 @@ class Locoformer(Module):
             # maybe entropy
 
             if self.ppo_entropy_weight > 0.:
-                entropy = self.unembedder.entropy(action_logits, **action_select_kwargs)
+                entropy = self.unembedder.entropy(action_logits, concat = True, **action_select_kwargs)
 
                 if exists(entropy):
+                    if entropy.ndim == 3:
+                        entropy = entropy.sum(dim = -1)
+
                     actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
             windowed_actor_loss = actor_loss[data.windowed_gae_mask].sum() / total_learnable_tokens
@@ -2203,19 +2215,16 @@ class Locoformer(Module):
 
                 rescale_range = default(action_rescale_range, self.action_rescale_ranges[env_index] if exists(self.action_rescale_ranges) and exists(env_index) else None)
 
-                sample_kwargs = {**action_select_kwargs}
-                if exists(rescale_range):
-                    sample_kwargs['rescale_range'] = rescale_range
+                action = self.unembedder.sample(action_logits, **action_select_kwargs)
 
-                action = self.unembedder.sample(action_logits, **sample_kwargs)
+                action_log_prob = self.unembedder.log_prob(action_logits, action, concat = True, **action_select_kwargs)
 
-                action_log_prob = self.unembedder.log_prob(action_logits, action, **action_select_kwargs)
-
-                # pass to environment
+                # rescale action for environment
 
                 env_action = action
 
-                # pass to environment
+                if exists(rescale_range):
+                    env_action = self.unembedder.rescale_from_native(env_action, rescale_range, **action_select_kwargs)
 
                 step_dict = env_step(
                     env_action,

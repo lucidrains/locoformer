@@ -4,6 +4,7 @@
 #     "fire",
 #     "gymnasium[mujoco]>=1.0.0",
 #     "locoformer>=0.2.0",
+#     "discrete-continuous-embed-readout>=0.2.7",
 #     "moviepy",
 #     "tqdm",
 #     "wandb"
@@ -211,7 +212,7 @@ def main(
 
     # loop
 
-    rolling_rewards = {i: deque(maxlen = 100) for i in range(len(envs))}
+    rolling_rewards = {i: deque(maxlen = 20) for i in range(len(envs))}
 
     pbar = tqdm(range(num_learning_cycles), desc = 'learning cycles')
 
