@@ -372,7 +372,8 @@ def create_xl_mask(
     device = None
 ):
     assert kv_seq_len >= seq_len
-    assert window_size <= seq_len
+
+    # seq_len may be smaller than window_size (incremental inference, partial final window)
 
     offset = kv_seq_len - seq_len
 
@@ -698,7 +699,8 @@ class TransformerXL(Module):
         max_mem_segments = 1,
         num_residual_streams = 1,
         mhc_sinkhorn_iters = 4,
-        has_latent_genes = False
+        has_latent_genes = False,
+        recurrent_cache = True
     ):
         super().__init__()
         self.dim = dim
@@ -776,6 +778,7 @@ class TransformerXL(Module):
 
         self.fixed_window_size = fixed_window_size
         self.window_size = window_size
+        self.recurrent_cache = recurrent_cache
 
     def forward(
         self,
@@ -806,7 +809,7 @@ class TransformerXL(Module):
             memory_segments = deque(maxlen = self.max_mem_segments)
             episode_id_segments = deque(maxlen = self.max_mem_segments)
             curr_episode_ids = None
-            passed_episode_ids = None
+            passed_episode_ids = exists(episode_ids)
 
         # handle memory segments
 
@@ -928,6 +931,39 @@ class TransformerXL(Module):
 
         if exists(next_gru_hiddens):
             next_gru_hiddens = stack(next_gru_hiddens)
+
+        # accumulate current window episode ids
+
+        curr_episode_ids = safe_cat(curr_episode_ids, episode_ids, dim = -1)
+
+        # at window boundaries, move the previous window into memory segments, keeping only the current window in the kv cache
+
+        if is_window_boundary:
+
+            prev_window_kv = next_kv_cache[..., -2 * self.window_size:-self.window_size, :]
+
+            if not is_empty(prev_window_kv):
+                memory_segments.append(prev_window_kv.detach())
+
+                prev_window_episode_ids = curr_episode_ids[..., -2 * self.window_size:-self.window_size] if exists(curr_episode_ids) else None
+
+                episode_id_segments.append(prev_window_episode_ids.detach() if exists(prev_window_episode_ids) else None)
+
+            next_kv_cache = next_kv_cache[..., -self.window_size:, :]
+            curr_episode_ids = curr_episode_ids[..., -self.window_size:] if exists(curr_episode_ids) else None
+
+        # maybe recurrent cache
+
+        if self.recurrent_cache and is_window_boundary:
+            next_kv_cache = torch.roll(next_kv_cache, shifts = -1, dims = 0)
+
+            if exists(curr_episode_ids):
+                curr_episode_ids = torch.roll(curr_episode_ids, shifts = -1, dims = 0)
+
+            if exists(next_gru_hiddens):
+                next_gru_hiddens = torch.roll(next_gru_hiddens, shifts = -1, dims = 0)
+
+        # next cache
 
         next_cache = TransformerMemory(next_total_tokens, next_kv_cache, next_gru_hiddens, next_mem_mlp_cache, next_mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids)
 
@@ -1237,7 +1273,7 @@ class Locoformer(Module):
         has_latent_genes = num_latent_genes > 1
 
         if isinstance(transformer, dict):
-            transformer = TransformerXL(max_mem_segments = max_mem_segments, has_latent_genes = has_latent_genes, **transformer)
+            transformer = TransformerXL(max_mem_segments = max_mem_segments, has_latent_genes = has_latent_genes, recurrent_cache = recurrent_cache, **transformer)
 
         self.transformer = transformer
 
@@ -1255,7 +1291,8 @@ class Locoformer(Module):
                 dim_cond = transformer.dim_cond,
                 window_size = transformer.window_size,
                 depth = actor_depth,
-                max_mem_segments = max_mem_segments
+                max_mem_segments = max_mem_segments,
+                recurrent_cache = recurrent_cache
             )
 
             transformer_kwargs.update(actor_transformer_kwargs)
@@ -1274,7 +1311,8 @@ class Locoformer(Module):
                 dim_cond = transformer.dim_cond,
                 window_size = transformer.window_size,
                 depth = critic_depth,
-                max_mem_segments = max_mem_segments
+                max_mem_segments = max_mem_segments,
+                recurrent_cache = recurrent_cache
             )
 
             transformer_kwargs.update(critic_transformer_kwargs)
@@ -2490,32 +2528,6 @@ class Locoformer(Module):
                 values = self.hl_gauss_loss(values) # converts the value logits to scalar values
 
             out = (out, values)
-
-        # handle curtailing backbone kv cache at the right intervals
-
-        total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, _ = backbone_cache
-
-        # accumulate curr_episode_ids
-
-        curr_episode_ids = safe_cat(curr_episode_ids, episode_id, dim = -1)
-
-        if self.fixed_window_size or divisible_by(total_tokens, self.window_size * 2):
-            kv_cache = kv_cache[..., -self.window_size:, :]
-            curr_episode_ids = curr_episode_ids[..., -self.window_size:] if exists(curr_episode_ids) else None
-
-        if self.recurrent_cache and divisible_by(total_tokens, self.window_size):
-            kv_cache = torch.roll(kv_cache, shifts = -1, dims = 0)
-            if exists(curr_episode_ids):
-                curr_episode_ids = torch.roll(curr_episode_ids, shifts = -1, dims = 0)
-
-            if exists(gru_cache):
-                gru_cache = torch.roll(gru_cache, shifts = -1, dims = 0)
-
-        if divisible_by(total_tokens, self.window_size):
-            memory_segments.append(kv_cache[..., -self.window_size:, :].detach())
-            episode_id_segments.append(curr_episode_ids[..., -self.window_size:].detach() if exists(curr_episode_ids) else None)
-
-        backbone_cache = TransformerMemory(total_tokens, kv_cache, gru_cache, mem_mlp_cache, mem_mlp_hidden_states, memory_segments, episode_id_segments, curr_episode_ids, passed_episode_ids)
 
         if self.has_actor_transformer or self.has_critic_transformer:
             cache = (backbone_cache, actor_cache, critic_cache)
