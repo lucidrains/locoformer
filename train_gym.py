@@ -34,7 +34,7 @@ from einops import rearrange, einsum
 from locoformer.locoformer import Locoformer, ReplayBuffer
 import wandb
 
-from x_mlps_pytorch import Feedforwards, MLP
+from x_mlps_pytorch import Feedforwards
 
 # helper functions
 
@@ -119,6 +119,9 @@ def main(
         rmtree(video_folder, ignore_errors = True)
         rmtree('./replay', ignore_errors = True)
 
+    if isinstance(vectorized_env_indices, int):
+        vectorized_env_indices = (vectorized_env_indices,)
+
     if use_wandb:
         wandb.init(project = wandb_project, config = dict(locals()))
 
@@ -177,7 +180,12 @@ def main(
                 [0, 1],          # lunar lander continuous
             ]
         ),
-        state_pred_network = Feedforwards(dim = 64, depth = 1),
+        latent_dynamics = dict(
+            dim_action = 32,
+            use_ema_target = True,
+            target_ema_decay = 0.99,
+            predict_dist = True
+        ),
         embed_past_action = embed_past_action,
         transformer = dict(
             dim = 64,
@@ -207,7 +215,7 @@ def main(
         critic_depth = critic_depth
     ).to(device)
 
-    optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
+    optim_base = Adam(locoformer.base_parameters(), lr = learning_rate, betas = betas)
     optim_actor = Adam(locoformer.actor_parameters(), lr = learning_rate, betas = betas)
     optim_critic = Adam(locoformer.critic_parameters(), lr = learning_rate, betas = betas)
 

@@ -7,6 +7,7 @@ from functools import partial, wraps
 from pathlib import Path
 from contextlib import contextmanager
 from collections import namedtuple, deque
+from copy import deepcopy
 
 from glom import glom
 
@@ -38,7 +39,7 @@ from hl_gauss_pytorch import HLGaussLoss
 
 from assoc_scan import AssocScan
 
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch import MLP, create_mlp
 
 from evolutionary_policy_optimization.epo import LatentGenePool
 
@@ -102,7 +103,6 @@ def first(arr):
 def xnor(x, y):
     return not (x ^ y)
 
-
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -160,6 +160,26 @@ def normalize(t, mask = None, eps = 1e-5):
     var, mean = torch.var_mean(t_for_stats)
 
     return (t - mean) / var.sqrt().clamp_min(eps)
+
+def normalize_rollout_action(t):
+    # during rollout (no time dim), actions and log probs may come out of the readout with an extra trailing singleton dim
+    # or be squeezed of it entirely, normalize so they broadcast cleanly into the replay buffer fields
+
+    if t.ndim == 1:
+        return rearrange(t, 'b -> b 1')
+
+    if t.ndim == 3 and t.shape[-1] == 1:
+        return rearrange(t, 'b n 1 -> b n')
+
+    return t
+
+def embed_state(embedder, state, state_embed_kwargs, state_id_kwarg, internal_state):
+    embed_kwargs = {**state_embed_kwargs, **state_id_kwarg, 'internal_state': internal_state}
+
+    if isinstance(embedder, (nn.Linear, nn.Embedding)):
+        return embedder(state)
+
+    return embedder(state, **embed_kwargs)
 
 def tensor_to_dict(
     t: Tensor,
@@ -1172,6 +1192,143 @@ class StateEmbedder(Module):
 
         return token_embeds
 
+# forward dynamics model, SPR https://arxiv.org/abs/2007.05929
+# next latent prediction, residual formulation https://arxiv.org/abs/2511.05963
+# predicts next latent from current latent + action, supervised by EMA target
+# optionally diagonal gaussian over next latent, for state entropy bonus
+
+class ForwardDynamics(Module):
+    @beartype
+    def __init__(
+        self,
+        dim,
+        num_discrete = 0,
+        num_continuous = 0,
+        selectors: list | None = None,
+        dim_action = 32,
+        expansion_factor = 2.,
+        depth = 3,
+        residual = True,
+        predict_dist = False,
+        log_var_clamp_range = DEFAULT_LOG_VAR_CLAMP_RANGE,
+        use_projection = True,
+        use_ema_target = True,
+        target_ema_decay = 0.99
+    ):
+        super().__init__()
+
+        self.action_embedder = Embed(
+            dim_action,
+            num_discrete = num_discrete,
+            num_continuous = num_continuous,
+            selectors = selectors
+        )
+
+        # transition function, mlp with silu, optionally residual
+        # if predicting a distribution, outputs the mean and log variance of a diagonal gaussian over the next latent
+
+        dim_hidden = int(dim * expansion_factor)
+        dim_out = dim * (2 if predict_dist else 1)
+
+        self.to_dynamics = create_mlp(
+            dim_hidden,
+            depth,
+            dim_in = dim + dim_action,
+            dim_out = dim_out,
+            activation = nn.SiLU(),
+            bias = False
+        )
+
+        self.residual = residual
+        self.predict_dist = predict_dist
+        self.log_var_clamp_range = log_var_clamp_range
+
+        # projection head, applied to both the prediction and the target (ema copy)
+
+        self.proj_head = LinearNoBias(dim, dim) if use_projection else Identity()
+
+        self.use_ema_target = use_ema_target
+        self.target_ema_decay = target_ema_decay
+
+    def embed_action(
+        self,
+        action,
+        selector_index = None
+    ):
+        selector = self.action_embedder.get_selector(selector_index)
+
+        if selector.has_discrete and action.shape[-1] == 1:
+            action = rearrange(action, '... 1 -> ...')
+
+        return self.action_embedder(action, selector_index = selector_index)
+
+    def predict(
+        self,
+        latent,
+        action,
+        selector_index = None
+    ):
+        action_embed = self.embed_action(action, selector_index = selector_index)
+
+        out = self.to_dynamics(cat((latent, action_embed), dim = -1))
+
+        mean = out
+        log_var = None
+
+        if self.predict_dist:
+            mean, log_var = out.chunk(2, dim = -1)
+            log_var = log_var.clamp(*self.log_var_clamp_range)
+
+        if self.residual:
+            mean = mean + latent
+
+        mean = self.proj_head(mean)
+
+        return mean, log_var
+
+    def forward(
+        self,
+        latent,
+        action,
+        selector_index = None
+    ):
+        mean, _ = self.predict(latent, action, selector_index = selector_index)
+        return mean
+
+    def entropy(
+        self,
+        latent,
+        action,
+        selector_index = None
+    ):
+        _, log_var = self.predict(latent, action, selector_index = selector_index)
+
+        assert exists(log_var), 'entropy requires `predict_dist` to be enabled'
+
+        return 0.5 * (math.log(2 * math.pi * math.e) + log_var)
+
+    def calculate_loss(
+        self,
+        pred,
+        target,
+        log_var = None,
+        mask = None
+    ):
+        loss = F.smooth_l1_loss(pred, target, reduction = 'none').mean(dim = -1)
+
+        # when predicting a distribution, the log variance is calibrated with a gaussian likelihood on the scale
+        # the location (mean) is detached there, so it is trained purely with the smooth l1 loss
+        # this keeps the entropy a faithful measure of predictive uncertainty, for the state entropy bonus
+
+        if exists(log_var):
+            scale_loss = ((target - pred.detach()).pow(2) / log_var.exp() + log_var) * 0.5
+            loss = loss + scale_loss.mean(dim = -1)
+
+        if not exists(mask):
+            return loss
+
+        return loss[mask]
+
 # class
 
 RewardShapingFn = Callable[..., float | Tensor]
@@ -1234,6 +1391,8 @@ class Locoformer(Module):
         policy_network: Module = nn.Identity(),
         state_pred_network: Module | None = None,
         state_pred_loss_weight = 10.,
+        latent_dynamics: dict | Module | None = None,
+        latent_dynamics_loss_weight = 1.,
         action_rescale_ranges: list[Any] | None = None,
         vectorized_env_indices: tuple[int, ...] = (),
         embed_past_action = False,
@@ -1329,6 +1488,8 @@ class Locoformer(Module):
         # unembed state to actions or ssl predictions
 
         action_embedder = None
+        unembedder_kwargs = None
+
         if isinstance(unembedder, dict):
             unembedder_kwargs = dict(dim = transformer.dim)
             unembedder_kwargs.update(unembedder)
@@ -1347,6 +1508,17 @@ class Locoformer(Module):
             )
 
         self.unembedder = unembedder
+
+        # action config for the forward dynamics model, derived from the unembedder config
+
+        action_config_for_dynamics = dict()
+
+        if exists(unembedder_kwargs):
+            action_config_for_dynamics = dict(
+                num_discrete = unembedder_kwargs.get('num_discrete', 0),
+                num_continuous = unembedder_kwargs.get('num_continuous', 0),
+                selectors = unembedder_kwargs.get('selectors')
+            )
 
         # embedding past actions
 
@@ -1408,6 +1580,36 @@ class Locoformer(Module):
 
         self.has_state_pred_loss = state_pred_loss_weight > 0.
         self.state_pred_loss_weight = state_pred_loss_weight
+
+        # forward dynamics / latent world model (SPR style), https://arxiv.org/abs/2007.05929
+
+        self.latent_dynamics = None
+        self.has_latent_dynamics = exists(latent_dynamics)
+
+        self.use_ema_target = False
+        self.target_ema_decay = 0.
+        self.target_embedder = None
+        self.target_proj_head = None
+
+        self.latent_dynamics_loss_weight = latent_dynamics_loss_weight
+
+        if self.has_latent_dynamics:
+            if isinstance(latent_dynamics, dict):
+                latent_dynamics = ForwardDynamics(
+                    dim = transformer.dim,
+                    **{**action_config_for_dynamics, **latent_dynamics}
+                )
+
+            self.latent_dynamics = latent_dynamics
+            self.use_ema_target = latent_dynamics.use_ema_target
+            self.target_ema_decay = latent_dynamics.target_ema_decay
+
+            # target network, ema of the encoder and projection head
+            # only kept if ema target is enabled, otherwise the online encoder is detached for the target (as in NLP)
+
+            if self.use_ema_target:
+                self.target_embedder = deepcopy(self.embedder)
+                self.target_proj_head = deepcopy(latent_dynamics.proj_head)
 
         # ppo related
 
@@ -1517,6 +1719,21 @@ class Locoformer(Module):
             *(self.actor_transformer.parameters() if self.has_actor_transformer else [])
         ]
 
+    def base_parameters(self):
+        params = [
+            *self.embedder.parameters(),
+            *self.transformer.parameters()
+        ]
+
+        if self.can_pred_state:
+            params.extend(self.state_pred_network.parameters())
+            params.extend(self.state_pred_head.parameters())
+
+        if self.has_latent_dynamics:
+            params.extend(self.latent_dynamics.parameters())
+
+        return params
+
     def critic_parameters(self):
         params = []
 
@@ -1527,6 +1744,19 @@ class Locoformer(Module):
             params.extend(self.critic_transformer.parameters())
 
         return params
+
+    @torch.no_grad()
+    def update_target_network(self, decay = None):
+        if not (self.has_latent_dynamics and self.use_ema_target):
+            return
+
+        decay = default(decay, self.target_ema_decay)
+
+        for target_param, online_param in zip(self.target_embedder.parameters(), self.embedder.parameters()):
+            target_param.lerp_(online_param, 1. - decay)
+
+        for target_param, online_param in zip(self.target_proj_head.parameters(), self.latent_dynamics.proj_head.parameters()):
+            target_param.lerp_(online_param, 1. - decay)
 
     @beartype
     def learn(
@@ -1681,6 +1911,34 @@ class Locoformer(Module):
             else:
                 windowed_data[name] = (None,) * num_windows
 
+        # forward dynamics / latent world model loss (SPR style)
+        # given the latent and action at time t, predict the latent at time t + 1
+        # target is the latent at time t + 1 from the target network (ema of the encoder, or detached as in NLP)
+
+        latent_dynamics_loss = None
+
+        if (
+            self.has_latent_dynamics and
+            compute_state_pred_loss and
+            self.latent_dynamics_loss_weight > 0. and
+            gae_mask[:, :-1].any()
+        ):
+            latents = embed_state(self.embedder, state, state_embed_kwargs, state_id_kwarg, internal_state)
+
+            with torch.no_grad():
+                target_embedder = self.target_embedder if self.use_ema_target else self.embedder
+                target_proj_head = self.target_proj_head if self.use_ema_target else self.latent_dynamics.proj_head
+
+                target_latents = embed_state(target_embedder, state, state_embed_kwargs, state_id_kwarg, internal_state)
+
+            latent_pred, latent_log_var = self.latent_dynamics.predict(latents[:, :-1], action[:, :-1], **action_select_kwargs)
+            target = target_proj_head(target_latents[:, 1:])
+
+            latent_dynamics_loss = self.latent_dynamics.calculate_loss(latent_pred, target, log_var = latent_log_var, mask = gae_mask[:, :-1]).sum() / total_learnable_tokens
+            latent_dynamics_loss = latent_dynamics_loss * self.latent_dynamics_loss_weight * default(env_loss_weight, 1.)
+
+            latent_dynamics_loss.backward()
+
         mean_actor_loss = self.zero.clone()
         mean_critic_loss = self.zero.clone()
 
@@ -1817,7 +2075,14 @@ class Locoformer(Module):
                 optim.step()
                 optim.zero_grad()
 
+            # update target network (ema of the encoder)
+
+            self.update_target_network()
+
         # return losses for logging
+
+        if exists(latent_dynamics_loss):
+            mean_actor_loss.add_(latent_dynamics_loss)
 
         return mean_actor_loss.detach(), mean_critic_loss.detach()
 
@@ -2257,6 +2522,12 @@ class Locoformer(Module):
 
                 action_log_prob = self.unembedder.log_prob(action_logits, action, concat = True, **action_select_kwargs)
 
+                # actions and log probs may come out of the readout with an extra trailing singleton dim during rollout (no time dim)
+                # normalize so they broadcast cleanly into the replay buffer fields, regardless of number of envs
+
+                action = normalize_rollout_action(action)
+                action_log_prob = normalize_rollout_action(action_log_prob)
+
                 # rescale action for environment
 
                 env_action = action
@@ -2278,13 +2549,26 @@ class Locoformer(Module):
 
                 # maybe state entropy bonus
 
-                if state_entropy_bonus_weight > 0. and exists(state_pred):
-                    state_id = state_id_kwarg.get('state_id', 0)
-                    entropy = self.state_pred_head.entropy(state_pred, selector_index = state_id)
+                if state_entropy_bonus_weight > 0.:
+                    entropy = None
 
-                    state_entropy_bonus = (entropy * state_entropy_bonus_weight).sum(dim = -1)
+                    if exists(state_pred):
+                        state_id = state_id_kwarg.get('state_id', 0)
+                        entropy = self.state_pred_head.entropy(state_pred, selector_index = state_id).sum(dim = -1)
 
-                    reward = reward.to(self.device).float() + state_entropy_bonus
+                    if (
+                        not exists(entropy) and
+                        self.has_latent_dynamics and
+                        self.latent_dynamics.predict_dist
+                    ):
+                        latent = embed_state(self.embedder, state_for_model, state_embed_kwargs, state_id_kwarg, internal_state)
+
+                        # average over latent dims, as the entropy of a high-dimensional latent would otherwise dwarf the environment reward
+
+                        entropy = self.latent_dynamics.entropy(latent, action, selector_index = action_select_kwargs.get('selector_index')).mean(dim = -1)
+
+                    if exists(entropy):
+                        reward = reward.to(self.device).float() + entropy * state_entropy_bonus_weight
 
                 # cum rewards
 
@@ -2303,7 +2587,7 @@ class Locoformer(Module):
                     internal_state = internal_state,
                     reward = reward,
                     value = value,
-                    done = torch.zeros(num_envs, device = self.device, dtype = torch.bool),
+                    done = terminated.to(self.device),
                     condition = maybe_command,
                     cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
                     **sampled_env_params

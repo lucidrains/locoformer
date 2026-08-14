@@ -7,7 +7,7 @@ from x_mlps_pytorch import MLP
 
 from einops import rearrange
 
-from locoformer.locoformer import Locoformer
+from locoformer.locoformer import Locoformer, exists
 
 @param('gru_layers', (False, True))
 @param('recurrent_cache', (False, True))
@@ -527,3 +527,238 @@ def test_epo():
     # cleanup
     import shutil
     shutil.rmtree('./replay_test_epo', ignore_errors = True)
+
+def test_latent_dynamics_forward():
+    from locoformer.locoformer import ForwardDynamics
+
+    # discrete action - drawn from an embedding table of width dim_action
+
+    dynamics = ForwardDynamics(
+        dim = 64,
+        num_discrete = 6,
+        num_continuous = 3,
+        selectors = [
+            [[4, 5]],
+            [[0, 1, 2, 3]],
+            [0, 1],
+        ],
+        dim_action = 32
+    )
+
+    assert len(dynamics.to_dynamics.layers) == 5 # create_mlp: proj in + 3 hidden layers with silu + proj out
+
+    latent = torch.randn(2, 4, 64)
+
+    discrete_action = torch.randint(0, 2, (2, 4, 1))
+    pred = dynamics(latent, discrete_action, selector_index = 0)
+    assert pred.shape == (2, 4, 64)
+
+    continuous_action = torch.randn(2, 4, 2)
+    pred = dynamics(latent, continuous_action, selector_index = 2)
+    assert pred.shape == (2, 4, 64)
+
+    # loss
+
+    target = torch.randn(2, 4, 64)
+    mask = torch.ones(2, 4, dtype = torch.bool)
+
+    loss = dynamics.calculate_loss(pred, target, mask = mask)
+    assert loss.shape == (8,)
+    assert loss.dtype == torch.float32
+
+def test_latent_dynamics_residual_and_probabilistic():
+    import torch.nn.functional as F
+    from locoformer.locoformer import ForwardDynamics
+
+    # without residual, the prediction should not add the latent back
+
+    dynamics = ForwardDynamics(
+        dim = 64,
+        num_discrete = 6,
+        num_continuous = 2,
+        selectors = [
+            [[4, 5]],
+            [[0, 1, 2, 3]],
+            [0, 1],
+        ],
+        residual = False
+    )
+
+    latent = torch.randn(2, 4, 64)
+    action = torch.randint(0, 2, (2, 4, 1))
+
+    pred = dynamics(latent, action, selector_index = 0)
+    assert pred.shape == (2, 4, 64)
+
+    # predicting a distribution, for a state entropy bonus during rollout
+
+    dynamics = ForwardDynamics(
+        dim = 64,
+        num_discrete = 6,
+        num_continuous = 2,
+        selectors = [
+            [[4, 5]],
+            [[0, 1, 2, 3]],
+            [0, 1],
+        ],
+        predict_dist = True
+    )
+
+    assert dynamics.predict_dist
+
+    # forward returns the mean, in both train and eval mode
+
+    dynamics.train()
+
+    pred = dynamics(latent, action, selector_index = 0)
+    assert pred.shape == (2, 4, 64)
+
+    dynamics.eval()
+
+    mean_pred = dynamics(latent, action, selector_index = 0)
+    assert mean_pred.shape == (2, 4, 64)
+    assert torch.allclose(pred, mean_pred)
+
+    # entropy of the predicted distribution
+
+    entropy = dynamics.entropy(latent, action, selector_index = 0)
+    assert entropy.shape == (2, 4, 64)
+    assert torch.isfinite(entropy).all()
+
+    # smooth l1 loss, with the log variance calibrated through the likelihood on the scale
+
+    target = torch.randn(2, 4, 64)
+
+    mean_pred, log_var = dynamics.predict(latent, action, selector_index = 0)
+
+    loss = dynamics.calculate_loss(mean_pred, target, log_var = log_var)
+    assert loss.shape == (2, 4)
+
+    expected_location_loss = F.smooth_l1_loss(mean_pred, target, reduction = 'none').mean(dim = -1)
+    expected_scale_loss = ((target - mean_pred.detach()).pow(2) / log_var.exp() + log_var) * 0.5
+    expected_loss = expected_location_loss + expected_scale_loss.mean(dim = -1)
+
+    assert torch.allclose(loss, expected_loss)
+
+    # loss without log variance is plain smooth l1
+
+    dynamics = ForwardDynamics(
+        dim = 64,
+        num_discrete = 6,
+        num_continuous = 2,
+        selectors = [
+            [[4, 5]],
+            [[0, 1, 2, 3]],
+            [0, 1],
+        ],
+    )
+
+    pred = dynamics(latent, action, selector_index = 0)
+    loss = dynamics.calculate_loss(pred, target)
+    assert loss.shape == (2, 4)
+
+    expected_loss = F.smooth_l1_loss(pred, target, reduction = 'none').mean(dim = -1)
+    assert torch.allclose(loss, expected_loss)
+
+    # entropy not available if not predicting a distribution
+
+    with pytest.raises(AssertionError):
+        dynamics.entropy(latent, action, selector_index = 0)
+
+@param('use_ema_target', (None, True, False))
+@param('predict_dist', (False, True))
+def test_latent_dynamics_ppo(use_ema_target, predict_dist):
+    from torch.optim import Adam
+
+    # `use_ema_target` = None means no SPR, otherwise SPR with or without ema target network
+
+    has_spr = exists(use_ema_target)
+
+    latent_dynamics = None
+
+    if has_spr:
+        latent_dynamics = dict(
+            dim_action = 32,
+            use_ema_target = use_ema_target,
+            target_ema_decay = 0.99,
+            predict_dist = predict_dist
+        )
+
+    model = Locoformer(
+        embedder = dict(dim = 64, dim_state = 4),
+        unembedder = dict(
+            dim = 64,
+            num_discrete = 2,
+            num_continuous = 0,
+        ),
+        transformer = dict(
+            dim = 64,
+            dim_head = 32,
+            heads = 4,
+            depth = 2,
+            window_size = 32,
+        ),
+        discount_factor = 0.99,
+        policy_network = nn.Identity(),
+        value_network = nn.Identity(),
+        dim_value_input = 64,
+        reward_range = (-300., 300.),
+        latent_dynamics = latent_dynamics
+    )
+
+    assert model.has_latent_dynamics == has_spr
+    assert model.use_ema_target == (use_ema_target is True)
+
+    # ema target network is only kept when ema target is enabled
+
+    if use_ema_target is True:
+        assert model.target_embedder is not None
+        assert model.target_proj_head is not None
+    else:
+        assert model.target_embedder is None
+        assert model.target_proj_head is None
+
+    b, n = 4, 32
+
+    state = torch.randn(b, n, 4)
+    action = torch.randint(0, 2, (b, n, 1))
+    action_log_prob = torch.zeros(b, n, 1)
+    reward = torch.randn(b, n)
+    value = torch.zeros(b, n)
+    done = torch.zeros(b, n, dtype = torch.bool)
+    episode_lens = torch.full((b,), n)
+
+    optims = [Adam(model.base_parameters(), lr = 1e-3)]
+
+    target_weight_before = model.target_embedder.state_to_token[0].layers[0].weight.clone() if use_ema_target is True else None
+    dynamics_weight_before = model.latent_dynamics.to_dynamics.layers[0][0].weight.clone() if has_spr else None
+    embedder_weight_before = model.embedder.state_to_token[0].layers[0].weight.clone()
+
+    actor_loss, critic_loss = model.ppo(
+        state,
+        None,
+        action,
+        action_log_prob,
+        reward,
+        value,
+        done,
+        episode_lens,
+        optims = optims,
+        state_embed_kwargs = dict(state_type = 'raw'),
+        action_select_kwargs = dict(selector_index = 0),
+        compute_state_pred_loss = True,
+    )
+
+    assert torch.isfinite(actor_loss) and torch.isfinite(critic_loss)
+
+    # embedder should be trained through the ppo loss, and through the latent prediction loss when spr is on
+
+    assert not torch.allclose(embedder_weight_before, model.embedder.state_to_token[0].layers[0].weight)
+
+    if has_spr:
+        assert not torch.allclose(dynamics_weight_before, model.latent_dynamics.to_dynamics.layers[0][0].weight)
+
+    # target network should be updated only via ema
+
+    if use_ema_target is True:
+        assert not torch.allclose(target_weight_before, model.target_embedder.state_to_token[0].layers[0].weight)
