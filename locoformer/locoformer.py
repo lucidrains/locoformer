@@ -51,6 +51,8 @@ from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
 from memmap_replay_buffer import ReplayBuffer, ReplayDataset
 
+from env_ssl_wrapper import compose_env
+
 from torch_einops_utils import (
     pad_at_dim,
     lens_to_mask
@@ -2203,26 +2205,22 @@ class Locoformer(Module):
     ):
         is_vectorized = num_envs > 1
 
-        def transform_output(el):
-            if isinstance(el, ndarray):
-                el = from_numpy(el)
-            elif isinstance(el, (int, bool, float)):
-                el = tensor(el)
+        # standardize the environment interface via env-ssl-wrapper
+        # all environments are normalized to a common MDP contract:
+        # reset -> (obs, info), step -> (obs, reward, terminated, truncated, info),
+        # obs batched along a leading dim, numpy converted to float32 torch tensors,
+        # regardless of sim (gymnasium, legacy gym, dm_control, isaac, robosuite, ...)
 
-            if is_tensor(el) and el.dtype == torch.float64:
-                el = el.float()
-
-            if not is_vectorized and is_tensor(el):
-                el = rearrange(el, '... -> 1 ...')
-
-            return el
+        wrapped_env = compose_env(
+            env,
+            'auto_batch',
+            ('tensor', dict(device = self.device))
+        )
 
         def wrapped_reset(*args, **kwargs):
-            env_reset_out =  env.reset(*args, **kwargs)
+            env_reset_out = wrapped_env.reset(*args, **kwargs)
 
-            env_reset_out_torch = tree_map(transform_output, env_reset_out)
-
-            env_reset_out_dict = self.parse_env_reset_out(env_reset_out_torch)
+            env_reset_out_dict = self.parse_env_reset_out(env_reset_out)
 
             env_reset_out_dict['state'] = state_transform(env_reset_out_dict['state'])
 
@@ -2244,21 +2242,19 @@ class Locoformer(Module):
                 if action.shape[-1] == 1:
                     action = rearrange(action, 'b 1 -> b')
 
-                action = action.detach().cpu().numpy()
+                env_action = action.detach().cpu().numpy()
             else:
                 if action.ndim > 0 and action.shape[0] == 1:
                     action = action[0]
 
                 if action.numel() == 1:
-                    action = action.item()
+                    env_action = action.item()
                 else:
-                    action = action.detach().cpu().numpy().tolist()
+                    env_action = action.detach().cpu().numpy().tolist()
 
-            env_step_out = env.step(action, *args, **kwargs)
+            env_step_out = wrapped_env.step(env_action, *args, **kwargs)
 
-            env_step_out_torch = tree_map(transform_output, env_step_out)
-
-            env_step_out_dict = self.parse_env_step_out(env_step_out_torch)
+            env_step_out_dict = self.parse_env_step_out(env_step_out)
 
             env_step_out_dict['state'] = state_transform(env_step_out_dict['state'])
 
@@ -2273,7 +2269,7 @@ class Locoformer(Module):
                 shaped_rewards = self.state_and_command_to_rewards(
                     state_for_reward_shaping,
                     commands = command,
-                    action = action,
+                    action = env_action,
                     replay_buffer = replay_buffer,
                     env_step_info = env_step_out_dict['info'],
                     env_index = env_index

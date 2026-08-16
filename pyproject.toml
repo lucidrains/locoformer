@@ -1,6 +1,6 @@
 [project]
 name = "locoformer"
-version = "0.2.7"
+version = "0.2.8"
 description = "LocoFormer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -31,6 +31,7 @@ dependencies = [
     "discrete-continuous-embed-readout>=0.2.7",
     "einx>=0.3.0",
     "einops>=0.8.0",
+    "env-ssl-wrapper>=0.1.1",
     "evolutionary-policy-optimization>=0.2.15",
     "glom",
     "hl-gauss-pytorch>=0.2.5",
