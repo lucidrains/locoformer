@@ -625,7 +625,7 @@ def test_latent_dynamics_residual_and_probabilistic():
     assert entropy.shape == (2, 4, 64)
     assert torch.isfinite(entropy).all()
 
-    # smooth l1 loss, with the log variance calibrated through the likelihood on the scale
+    # cosine similarity loss, with the log variance calibrated through the likelihood on the scale
 
     target = torch.randn(2, 4, 64)
 
@@ -634,13 +634,13 @@ def test_latent_dynamics_residual_and_probabilistic():
     loss = dynamics.calculate_loss(mean_pred, target, log_var = log_var)
     assert loss.shape == (2, 4)
 
-    expected_location_loss = F.smooth_l1_loss(mean_pred, target, reduction = 'none').mean(dim = -1)
+    expected_location_loss = 2. - F.cosine_similarity(mean_pred, target, dim = -1)
     expected_scale_loss = ((target - mean_pred.detach()).pow(2) / log_var.exp() + log_var) * 0.5
     expected_loss = expected_location_loss + expected_scale_loss.mean(dim = -1)
 
     assert torch.allclose(loss, expected_loss)
 
-    # loss without log variance is plain smooth l1
+    # loss without log variance is plain cosine similarity
 
     dynamics = ForwardDynamics(
         dim = 64,
@@ -657,7 +657,7 @@ def test_latent_dynamics_residual_and_probabilistic():
     loss = dynamics.calculate_loss(pred, target)
     assert loss.shape == (2, 4)
 
-    expected_loss = F.smooth_l1_loss(pred, target, reduction = 'none').mean(dim = -1)
+    expected_loss = 2. - F.cosine_similarity(pred, target, dim = -1)
     assert torch.allclose(loss, expected_loss)
 
     # entropy not available if not predicting a distribution

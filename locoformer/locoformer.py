@@ -1316,10 +1316,10 @@ class ForwardDynamics(Module):
         log_var = None,
         mask = None
     ):
-        loss = F.smooth_l1_loss(pred, target, reduction = 'none').mean(dim = -1)
+        loss = 2. - F.cosine_similarity(pred, target, dim = -1)
 
         # when predicting a distribution, the log variance is calibrated with a gaussian likelihood on the scale
-        # the location (mean) is detached there, so it is trained purely with the smooth l1 loss
+        # the location (mean) is detached there, so it is trained purely with the cosine similarity loss
         # this keeps the entropy a faithful measure of predictive uncertainty, for the state entropy bonus
 
         if exists(log_var):
