@@ -722,7 +722,8 @@ class TransformerXL(Module):
         num_residual_streams = 1,
         mhc_sinkhorn_iters = 4,
         has_latent_genes = False,
-        recurrent_cache = True
+        recurrent_cache = True,
+        use_episode_ids = True
     ):
         super().__init__()
         self.dim = dim
@@ -802,6 +803,11 @@ class TransformerXL(Module):
         self.window_size = window_size
         self.recurrent_cache = recurrent_cache
 
+        # whether to apply intra-episode attention masking
+        # turn off for the policy transformer to allow for in-context adaptation across trials, as in the paper
+
+        self.use_episode_ids = use_episode_ids
+
     def forward(
         self,
         x,
@@ -813,6 +819,11 @@ class TransformerXL(Module):
         episode_ids: Tensor | None = None
     ):
         curr_token_seq_len = x.shape[-2]
+
+        # if episode ids are turned off, ignore them entirely
+
+        if not self.use_episode_ids:
+            episode_ids = None
 
         # cache and residuals
 
@@ -1078,9 +1089,9 @@ class MemoryMLP(Module):
         loss_weight = self.to_loss_weight(tokens)
 
         # employ lookahead, from https://arxiv.org/abs/2601.00671
+        # wrap around - the last value predicts the first, so every token participates in memory formation
 
-        keys, loss_weight = keys[..., :-1, :], loss_weight[..., :-1, :]
-        values = values[:, 1:]
+        values = torch.roll(values, shifts = -1, dims = 1)
 
         grad = self.grad_fn(memories, (keys, values, loss_weight))
 
@@ -1427,7 +1438,8 @@ class Locoformer(Module):
         actor_depth = 0,
         critic_depth = 0,
         actor_transformer_kwargs: dict = dict(),
-        critic_transformer_kwargs: dict = dict()
+        critic_transformer_kwargs: dict = dict(),
+        use_cross_episode_attention = False
     ):
         super().__init__()
 
@@ -1442,6 +1454,14 @@ class Locoformer(Module):
 
         self.has_actor_transformer = actor_depth > 0
         self.actor_transformer = None
+
+        # whether the policy attention transformer may attend across episodes, for in-context adaptation as in the paper
+        # requires a decoupled actor transformer, as the shared backbone must stay masked for the value and world model heads
+
+        if (not self.has_actor_transformer) and use_cross_episode_attention:
+            raise ValueError('`use_cross_episode_attention = True` requires `actor_depth > 0`, as the shared backbone must stay masked for the value and world model heads')
+
+        self.use_cross_episode_attention = use_cross_episode_attention
 
         if self.has_actor_transformer:
             transformer_kwargs = dict(
@@ -1458,7 +1478,7 @@ class Locoformer(Module):
 
             transformer_kwargs.update(actor_transformer_kwargs)
 
-            self.actor_transformer = TransformerXL(**transformer_kwargs)
+            self.actor_transformer = TransformerXL(use_episode_ids = not use_cross_episode_attention, **transformer_kwargs)
 
         self.has_critic_transformer = critic_depth > 0
         self.critic_transformer = None
@@ -1639,6 +1659,12 @@ class Locoformer(Module):
         # maybe recurrent kv cache, from Ding et al. https://arxiv.org/abs/2012.15688
 
         self.recurrent_cache = recurrent_cache
+
+        # for keeping the transformer-xl cache across trials within the same environment
+        # as in the paper - memory persists across trials, reset on environment change
+
+        self.rollout_env = None
+        self.rollout_stateful_forward = None
 
         # environment returns to dictionary
 
@@ -1825,7 +1851,8 @@ class Locoformer(Module):
                     compute_state_pred_loss = compute_state_pred_loss,
                     state_pred_loss_weight = state_pred_loss_weight,
                     env_loss_weight = env_loss_weight,
-                    accelerator = accelerator
+                    accelerator = accelerator,
+                    episode_indices = getattr(data, '_episode_indices', None)
                 )
 
                 last_actor_loss, last_critic_loss = actor_loss, critic_loss
@@ -1863,7 +1890,8 @@ class Locoformer(Module):
         state_pred_loss_weight = None,
         env_loss_weight = None,
         accelerator = None,
-        max_grad_norm = 0.5
+        max_grad_norm = 0.5,
+        episode_indices: Tensor | None = None
     ):
         state_pred_loss_weight = default(state_pred_loss_weight, self.state_pred_loss_weight)
 
@@ -1887,6 +1915,15 @@ class Locoformer(Module):
 
         past_action = pad_at_dim(action, (1, -1), dim = -2)
 
+        # derive per-timestep episode ids, so the value and world model heads are always masked across episodes
+        # if multi-trial construction provides per-token episode indices, offset them per batch item to keep them unique
+
+        episode_id = episode_indices
+
+        if exists(episode_id):
+            episode_id = episode_id * state.shape[0] + repeat(arange(state.shape[0], device = self.device), 'b -> b 1')
+        else:
+            episode_id = repeat(arange(state.shape[0], device = self.device), 'b -> b n', n = seq_len)
         data_dict = dict(
             state = state,
             internal_state = internal_state,
@@ -1900,7 +1937,8 @@ class Locoformer(Module):
             windowed_gae_mask = gae_mask,
             condition = condition,
             cond_mask = cond_mask,
-            latent_gene_id = latent_gene_id
+            latent_gene_id = latent_gene_id,
+            episode_id = episode_id
         )
 
         num_windows = math.ceil(seq_len / window_size)
@@ -1952,7 +1990,7 @@ class Locoformer(Module):
 
             data = SimpleNamespace(**dict(zip(windowed_data.keys(), window_tensors)))
 
-            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, latent_gene_id = data.latent_gene_id, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
+            ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, latent_gene_id = data.latent_gene_id, episode_id = data.episode_id, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             log_prob = self.unembedder.log_prob(action_logits, data.action, concat = True, **action_select_kwargs)
 
@@ -2451,11 +2489,15 @@ class Locoformer(Module):
 
         max_timesteps = default(max_timesteps, replay.max_timesteps)
 
-        stateful_forward = self.get_stateful_forward(
-            has_batch_dim = True,
-            has_time_dim = False,
-            inference_mode = True
-        )
+        # keep the transformer-xl cache across trials within the same environment
+        # as in the paper - memory persists across trials, resets when the environment changes
+
+        if (not exists(self.rollout_stateful_forward)) or (self.rollout_env is not env):
+            stateful_forward = self.get_stateful_forward(has_batch_dim = True, has_time_dim = False, inference_mode = True)
+            self.rollout_stateful_forward = stateful_forward
+            self.rollout_env = env
+
+        stateful_forward = self.rollout_stateful_forward
 
         # handle domain randomization
 
@@ -2787,7 +2829,7 @@ class Locoformer(Module):
 
             if self.can_pred_state:
                 state_id = state_id_kwarg.get('state_id', 0)
-                state_pred_embed = self.state_pred_network(actor_embed)
+                state_pred_embed = self.state_pred_network(embed)
                 state_pred = self.state_pred_head(state_pred_embed, selector_index = state_id)
 
             out = (out, state_pred)

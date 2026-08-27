@@ -326,6 +326,72 @@ def test_locoformer_episode_id():
         out = stateful_forward(step, episode_id = torch.ones((1,), dtype = torch.long))
         assert out.shape == (1, 1)
 
+@param('use_cross_episode_attention', (False, True))
+def test_locoformer_cross_episode_attention(use_cross_episode_attention):
+
+    dim, window_size = 64, 4
+
+    model = Locoformer(
+        embedder = dict(dim = dim, dim_state = 4),
+        unembedder = dict(
+            dim = dim,
+            num_discrete = 2,
+        ),
+        transformer = dict(
+            dim = dim,
+            dim_head = 32,
+            heads = 1,
+            depth = 1,
+            window_size = window_size,
+        ),
+        actor_depth = 1,
+        use_cross_episode_attention = use_cross_episode_attention,
+        policy_network = nn.Identity(),
+        value_network = nn.Identity(),
+        dim_value_input = dim,
+        reward_range = (-1., 1.),
+        state_pred_network = nn.Identity()
+    ).eval()
+
+    win1, win2 = torch.randn(1, 4, 4), torch.randn(1, 4, 4)
+    ep0, ep1 = torch.zeros((1, 4), dtype = torch.long), torch.ones((1, 4), dtype = torch.long)
+
+    forward_kwargs = dict(
+        state_embed_kwargs = dict(state_type = 'raw'),
+        action_select_kwargs = dict(selector_index = 0),
+        state_id_kwarg = dict(state_id = 0),
+        return_values = True,
+        return_state_pred = True
+    )
+
+    _, cache = model(win1, episode_id = ep0, **forward_kwargs)
+    ((act_diff, state_pred_diff), value_diff), _ = model(win2, episode_id = ep1, cache = cache, **forward_kwargs)
+    ((act_clean, state_pred_clean), value_clean), _ = model(win2, episode_id = ep1, **forward_kwargs)
+
+    act_diff, = act_diff # discrete logits are returned as a 1-tuple
+    act_clean, = act_clean
+
+    # policy attention transformer may be turned on / off for cross-episode attention (in-context adaptation, as in the paper)
+
+    if use_cross_episode_attention:
+        assert not torch.allclose(act_diff, act_clean, atol = 1e-5)
+    else:
+        assert torch.allclose(act_diff, act_clean, atol = 1e-5)
+
+    # value and world model heads are always masked across episodes
+
+    assert torch.allclose(value_diff, value_clean, atol = 1e-5)
+    assert torch.allclose(state_pred_diff, state_pred_clean, atol = 1e-5)
+
+def test_locoformer_cross_episode_attention_requires_actor():
+    with pytest.raises(ValueError):
+        Locoformer(
+            embedder = nn.Linear(4, 64, bias = False),
+            unembedder = nn.Linear(64, 1),
+            transformer = dict(dim = 64, depth = 1, window_size = 4),
+            use_cross_episode_attention = True
+        )
+
 def test_reward_shaping_validation():
     # should pass
     Locoformer(
@@ -527,6 +593,72 @@ def test_epo():
     # cleanup
     import shutil
     shutil.rmtree('./replay_test_epo', ignore_errors = True)
+
+def test_cross_episodic_rollout_memory():
+    import numpy as np
+    import shutil
+    from memmap_replay_buffer import ReplayBuffer
+
+    model = Locoformer(
+        embedder = nn.Linear(10, 128),
+        unembedder = dict(
+            num_continuous = 10
+        ),
+        value_network = MLP(128, 64, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        transformer = dict(
+            dim = 128,
+            depth = 1,
+            window_size = 8
+        )
+    )
+
+    class MockEnv:
+        def reset(self):
+            return np.random.normal(size = (10,)), {}
+
+        def step(self, action):
+            return np.random.normal(size = (10,)), 1., False, False, {}
+
+    replay = ReplayBuffer(
+        './replay_test_cross_episodic',
+        max_episodes = 8,
+        max_timesteps = 8,
+        fields = dict(
+            state = ('float', 10),
+            action = ('float', 10),
+            action_log_prob = ('float', 10),
+            reward = 'float',
+            value = 'float',
+            done = 'bool',
+            cond_mask = 'bool'
+        ),
+        meta_fields = dict(
+            cum_rewards = 'float'
+        )
+    )
+
+    env = MockEnv()
+
+    model.gather_experience_from_env_(env, replay, num_envs = 1, max_timesteps = 3)
+
+    first_stateful_forward = model.rollout_stateful_forward
+    assert exists(first_stateful_forward)
+
+    # cache should persist across trials within the same environment
+
+    model.gather_experience_from_env_(env, replay, num_envs = 1, max_timesteps = 3)
+    assert model.rollout_stateful_forward is first_stateful_forward
+
+    # cache should reset on environment change
+
+    model.gather_experience_from_env_(MockEnv(), replay, num_envs = 1, max_timesteps = 3)
+    assert model.rollout_stateful_forward is not first_stateful_forward
+
+    # cleanup
+
+    shutil.rmtree('./replay_test_cross_episodic', ignore_errors = True)
 
 def test_latent_dynamics_forward():
     from locoformer.locoformer import ForwardDynamics
