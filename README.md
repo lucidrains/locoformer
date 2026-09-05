@@ -58,6 +58,28 @@ action_logits, _ = locoformer(
 action = locoformer.unembedder.sample(action_logits, selector_index = 0) # (1, 1, 12)
 ```
 
+## Sim-to-Real Bipedal Locomotion (Microduck)
+
+You can train an adaptive bipedal walking gait for the [Microduck](https://github.com/pollen-robotics/reachy2_microduck) biped robot from scratch using `Locoformer` and PPO
+
+An emergent bipedal walking gait starts emerging before **2M steps**
+
+```shell
+$ uv run train_microduck.py
+```
+
+To render periodic evaluation videos or resume from the saved best checkpoint:
+
+```shell
+# render periodic evaluation videos to videos/
+$ uv run train_microduck.py --eval_video True --eval_every 20
+
+# resume training from best checkpoint
+$ uv run train_microduck.py --resume True
+```
+
+Special thanks to [Pollen Robotics 🤗](https://www.pollen-robotics.com/) for their open sourcing of this sim2real env!
+
 ## Sponsors
 
 This open sourced work is sponsored by [Safe Sentinel](https://www.safesentinels.com/)

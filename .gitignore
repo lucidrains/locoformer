@@ -160,6 +160,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# microduck asset clone (auto-cloned by train_microduck.py)
+microduck_rl/
+
 # mypy
 .mypy_cache/
 .dmypy.json
