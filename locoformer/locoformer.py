@@ -26,7 +26,6 @@ import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 from torch.utils.data import Dataset, DataLoader
-from torch.distributions import Normal
 from torch.optim import Optimizer
 
 import einx
@@ -46,6 +45,12 @@ from evolutionary_policy_optimization.epo import LatentGenePool
 from x_evolution import EvoStrategy
 
 from discrete_continuous_embed_readout import EmbedAndReadout, Embed, Readout
+from discrete_continuous_embed_readout.discrete_continuous_embed_readout import (
+    ContinuousDistribution,
+    CONTINUOUS_DISTRIBUTIONS
+)
+
+from mean_conc_beta import Beta
 
 from hyper_connections import mc_get_init_and_expand_reduce_stream_functions
 
@@ -75,6 +80,33 @@ TransformerMemory = namedtuple('TransformerMemory', (
 ))
 
 DEFAULT_LOG_VAR_CLAMP_RANGE = (-6., 3.)
+
+# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1)
+
+class BetaDist(ContinuousDistribution):
+    def __init__(self, eps = 1e-5, **kwargs):
+        super().__init__(eps = eps)
+        kwargs.pop('unimodal', None) # mean-conc-beta is always unimodal by construction
+        self.beta = Beta(eps = eps, **kwargs)
+
+    @property
+    def default_range(self):
+        return (-1., 1.)
+
+    def clip_sampled(self, sampled):
+        return sampled.clamp(min = -1. + self.eps, max = 1. - self.eps)
+
+    def dist(self, params):
+        return self.beta(params)
+
+    def mean(self, params):
+        return self.beta.mean(params)
+
+    def forward(self, params, differentiable = False):
+        sampled = self.beta.rsample(params) if differentiable else self.beta.sample(params)
+        return self.clip_sampled(sampled)
+
+CONTINUOUS_DISTRIBUTIONS['beta'] = BetaDist
 
 # helper functions
 

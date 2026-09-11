@@ -112,7 +112,8 @@ def main(
     use_wandb = False,
     wandb_project = 'locoformer-gym',
     actor_depth = 0,
-    critic_depth = 0
+    critic_depth = 0,
+    continuous_dist_type = 'beta'
 ):
 
     if clear_folders:
@@ -174,6 +175,7 @@ def main(
             dim = 64,
             num_discrete = 6,
             num_continuous = 3,
+            continuous_dist_type = continuous_dist_type,
             selectors = [
                 [[4, 5]],        # cart pole discrete
                 [[0, 1, 2, 3]],  # lunar lander discrete
