@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from x_mlps_pytorch import MLP
 
-from einops import rearrange
+from einops import rearrange, repeat
+from torch_einops_utils.shape import size
 
 from locoformer.locoformer import Locoformer, exists
 
@@ -107,7 +108,7 @@ def test_replay():
 
     dataloader = replay_buffer.dataloader(batch_size = 3)
 
-    assert next(iter(dataloader))['state'].shape[0] == 3
+    assert size(next(iter(dataloader))['state'], '[b] ...') == 3
 
     # we will now consider consecutive pairs of episodes as 2 trials to be used for in-context adaptation
     # but realistically there will be a function that converts a given ReplayBuffer -> Int[batch, episode_indices]
@@ -255,7 +256,8 @@ def test_memory():
     assert tokens.shape == (2, 32, 512)
 
 @param('recurrent_cache', (False, True))
-def test_locoformer_multi_segment(recurrent_cache):
+@param('gru_layers', (False, True))
+def test_locoformer_multi_segment(recurrent_cache, gru_layers):
     model = Locoformer(
         embedder = nn.Embedding(256, 128),
         unembedder = nn.Linear(128, 256, bias = False),
@@ -264,18 +266,25 @@ def test_locoformer_multi_segment(recurrent_cache):
         transformer = dict(
             dim = 128,
             depth = 1,
-            window_size = 16
+            window_size = 16,
+            gru_layers = gru_layers
         )
     ).eval()
 
-    seq = torch.randint(0, 256, (1, 16 * 4))
+    batch, window_size, num_segments = 3, 16, 4
+    seq = torch.randint(0, 256, (batch, window_size * num_segments))
+    ep_id = repeat(torch.arange(batch), 'b -> b n', n = window_size * num_segments)
 
     logits_full = []
     cache = None
 
-    for segment in seq.chunk(4, dim = -1):
-        logits, cache = model(segment, cache = cache)
+    for segment, segment_ep_id in zip(seq.chunk(num_segments, dim = -1), ep_id.chunk(num_segments, dim = -1)):
+        logits, cache = model(segment, episode_id = segment_ep_id, cache = cache)
         logits_full.append(logits)
+
+        # recurrent cache rolls the layer axis, never the batch-aligned episode ids
+
+        assert torch.equal(cache.curr_episode_ids, segment_ep_id)
 
     logits_full = torch.cat(logits_full, dim = 1)
 
@@ -283,9 +292,10 @@ def test_locoformer_multi_segment(recurrent_cache):
 
     logits_stateful = []
 
-    for step_seq in seq.unbind(dim = -1):
+    for step_seq, step_ep_id in zip(seq.unbind(dim = -1), ep_id.unbind(dim = -1)):
         step_seq = rearrange(step_seq, 'b -> b 1')
-        logits = stateful_forward(step_seq)
+        step_ep_id = rearrange(step_ep_id, 'b -> b 1')
+        logits = stateful_forward(step_seq, episode_id = step_ep_id)
         logits_stateful.append(logits)
 
     logits_stateful = torch.cat(logits_stateful, dim = 1)
@@ -308,14 +318,30 @@ def test_locoformer_episode_id():
     # isolation & stateful forward
     model = Locoformer(
         embedder = nn.Linear(window_size, dim, bias = False),
-        unembedder = nn.Linear(dim, 1),
-        transformer = dict(dim = dim, depth = 1, window_size = 4, heads = 1)
+        unembedder = dict(num_continuous = 1),
+        transformer = dict(dim = dim, depth = 1, window_size = 4, heads = 1),
+        embed_past_action = True,
+        num_latent_genes = 4,
+        dim_latent = 16,
+        latent_gene_pool_kwargs = dict(
+            frac_tournaments = 0.75,
+            frac_natural_selected = 0.75,
+            frac_elitism = 0.
+        )
     ).eval()
+
+    # derived conditioning modules must be included in the base optimizer group
+
+    base_param_ids = {id(p) for p in model.base_parameters()}
+    assert all(id(p) in base_param_ids for p in model.past_action_embedder.parameters())
+    assert all(id(p) in base_param_ids for p in model.to_latent_cond.parameters())
 
     win1, win2 = torch.randn(1, 4, window_size), torch.randn(1, 4, window_size)
     ep0, ep1 = torch.zeros((1, 4), dtype = torch.long), torch.ones((1, 4), dtype = torch.long)
 
-    _, cache = model(win1, episode_id = ep0)
+    _, cache = model(win1, episode_id = ep0, detach_cache = True)
+    assert not cache.kv_cache.requires_grad
+
     out_diff_ep, _ = model(win2, episode_id = ep1, cache = cache)
     out_clean, _ = model(win2, episode_id = ep1)
 
@@ -324,7 +350,7 @@ def test_locoformer_episode_id():
     stateful_forward = model.get_stateful_forward(has_batch_dim = True, inference_mode = True)
     for step in win2.unbind(dim = 1):
         out = stateful_forward(step, episode_id = torch.ones((1,), dtype = torch.long))
-        assert out.shape == (1, 1)
+        assert out.shape[:2] == (1, 1)
 
 @param('use_cross_episode_attention', (False, True))
 def test_locoformer_cross_episode_attention(use_cross_episode_attention):
@@ -355,6 +381,14 @@ def test_locoformer_cross_episode_attention(use_cross_episode_attention):
 
     win1, win2 = torch.randn(1, 4, 4), torch.randn(1, 4, 4)
     ep0, ep1 = torch.zeros((1, 4), dtype = torch.long), torch.ones((1, 4), dtype = torch.long)
+
+    # state embeddings must remain sensitive to state magnitude after transformer RMSNorm
+
+    far = model.embedder(win1, state_type = 'raw')
+    near = model.embedder(win1 * 0.1, state_type = 'raw')
+    unit = lambda t: t / t.norm(dim = -1, keepdim = True)
+
+    assert not torch.allclose(unit(far), unit(near), atol = 1e-3)
 
     forward_kwargs = dict(
         state_embed_kwargs = dict(state_type = 'raw'),
@@ -615,11 +649,18 @@ def test_cross_episodic_rollout_memory():
     )
 
     class MockEnv:
+        def __init__(self):
+            self.t = 0
+
         def reset(self):
-            return np.random.normal(size = (10,)), {}
+            self.t = 0
+            return np.zeros((10,), dtype = np.float32), {}
 
         def step(self, action):
-            return np.random.normal(size = (10,)), 1., False, False, {}
+            self.t += 1
+            terminated = self.t == 5
+            reward = 100. if terminated else 1.
+            return np.full((10,), self.t, dtype = np.float32), reward, terminated, False, {}
 
     replay = ReplayBuffer(
         './replay_test_cross_episodic',
@@ -639,22 +680,44 @@ def test_cross_episodic_rollout_memory():
         )
     )
 
+    gather = lambda env: model.gather_experience_from_env_(env, replay, num_envs = 1, max_timesteps = 9)
+
     env = MockEnv()
 
-    model.gather_experience_from_env_(env, replay, num_envs = 1, max_timesteps = 3)
+    cum_reward, steps = gather(env)
+    assert steps == 5 and np.isclose(cum_reward, 104.)
 
     first_stateful_forward = model.rollout_stateful_forward
     assert exists(first_stateful_forward)
 
-    # cache should persist across trials within the same environment
+    # reuse the rollout wrapper within the same environment
 
-    model.gather_experience_from_env_(env, replay, num_envs = 1, max_timesteps = 3)
+    cum_reward, steps = gather(env)
     assert model.rollout_stateful_forward is first_stateful_forward
+    assert steps == 5 and np.isclose(cum_reward, 104.)
 
-    # cache should reset on environment change
+    # reset the rollout wrapper on environment change
 
-    model.gather_experience_from_env_(MockEnv(), replay, num_envs = 1, max_timesteps = 3)
+    gather(MockEnv())
     assert model.rollout_stateful_forward is not first_stateful_forward
+
+    dl = replay.dataloader(batch_size = 3, shuffle = False)
+    batch = next(iter(dl))
+
+    # terminal transition is learnable; only the appended bootstrap node is done
+
+    assert (batch['_lens'] == 6).all()
+    assert (~batch['done'][:, :5]).all()
+    assert batch['done'][:, 5].all()
+    assert (batch['reward'][:, 4] == 100.).all()
+    assert (batch['value'][:, 5] == 0.).all()
+
+    # rollout log probs must match ppo, which resets the cache at episode boundaries
+
+    logits, _ = model(batch['state'])
+    recomputed_log_probs = model.unembedder.log_prob(logits, batch['action'], concat = True)
+
+    assert torch.allclose(recomputed_log_probs[:, :5], batch['action_log_prob'][:, :5], atol = 1e-5)
 
     # cleanup
 
@@ -894,3 +957,166 @@ def test_latent_dynamics_ppo(use_ema_target, predict_dist):
 
     if use_ema_target is True:
         assert not torch.allclose(target_weight_before, model.target_embedder.state_to_token[0].layers[0].weight)
+
+@param('per_action_dim', (False, True))
+def test_ppo_per_action_dim_and_grad_clipping(per_action_dim):
+    from torch.optim import SGD
+    from locoformer.locoformer import BetaDist
+
+    # default beta concentration at zero raw params, including the unimodal floor
+
+    unit_mean, conc = BetaDist(unimodal = True).beta.concentrations(torch.zeros(1, 2))
+    assert torch.allclose(unit_mean, torch.tensor([0.5]))
+    assert torch.allclose(conc, torch.tensor([8.]))
+
+    class SpySGD(SGD):
+        def step(self, *args, **kwargs):
+            self.grad_norm = torch.sqrt(sum(p.grad.norm().square() for group in self.param_groups for p in group['params'] if exists(p.grad)))
+            return super().step(*args, **kwargs)
+
+    b, n, dim_state, dim_action = 4, 16, 12, 6
+    window_size = 8
+
+    model = Locoformer(
+        embedder = dict(dim = 32, dim_state = dim_state),
+        unembedder = dict(
+            dim = 32,
+            num_continuous = dim_action,
+            continuous_dist_type = 'beta',
+            selectors = [list(range(dim_action))]
+        ),
+        transformer = dict(dim = 32, dim_head = 16, heads = 2, depth = 1, window_size = window_size),
+        policy_network = MLP(32, 32),
+        value_network = MLP(32, 32),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        per_action_dim = per_action_dim,
+        value_loss_weight = 100., # large critic loss should not throttle the actor
+        calc_gae_kwargs = dict(use_accelerated = False)
+    )
+
+    state = torch.randn(b, n, dim_state)
+    action = torch.zeros(b, n, dim_action)
+    action_log_prob = torch.zeros(b, n, dim_action)
+    reward = torch.randn(b, n)
+    value = torch.zeros(b, n)
+    done = torch.zeros(b, n, dtype = torch.bool)
+    episode_lens = torch.tensor([8, 6, 5, 3]) # second window is fully padded and should be skipped
+
+    max_grad_norm = 1e-3
+
+    optims = [
+        SpySGD(model.base_parameters(), lr = 1e-3),
+        SpySGD(model.actor_parameters(), lr = 1e-3),
+        SpySGD(model.critic_parameters(), lr = 1e-3)
+    ]
+
+    actor_loss, critic_loss = model.ppo(
+        state, None, action, action_log_prob, reward, value, done, episode_lens,
+        optims = optims,
+        state_embed_kwargs = dict(state_type = 'raw'),
+        action_select_kwargs = dict(selector_index = 0),
+        compute_state_pred_loss = False,
+        max_grad_norm = max_grad_norm
+    )
+
+    assert torch.isfinite(actor_loss) and torch.isfinite(critic_loss)
+
+    # each optimizer is clipped independently, so the actor is not throttled by the critic
+
+    assert optims[1].grad_norm > max_grad_norm * 0.5
+    assert optims[2].grad_norm <= max_grad_norm * 1.01
+
+def test_vectorized_gather_experience_early_stop():
+    import numpy as np
+    import shutil
+    from memmap_replay_buffer import ReplayBuffer
+    from locoformer.locoformer import calc_gae
+
+    shutil.rmtree('./replay_test_vec_stop', ignore_errors = True)
+
+    model = Locoformer(
+        embedder = dict(dim = 32, dim_state = 4),
+        unembedder = dict(dim = 32, num_continuous = 2, continuous_dist_type = 'beta', selectors = [[0, 1]]),
+        transformer = dict(dim = 32, dim_head = 16, heads = 2, depth = 1, window_size = 8),
+        policy_network = nn.Identity(),
+        value_network = nn.Identity(),
+        dim_value_input = 32,
+        reward_range = (-100., 100.),
+        calc_gae_kwargs = dict(use_accelerated = False)
+    ).eval()
+
+    class MockVecEnv:
+        def __init__(self):
+            self.t = 0
+
+        def reset(self):
+            self.t = 0
+            return np.zeros((2, 4), dtype = np.float32), {}
+
+        def step(self, action):
+            self.t += 1
+            obs = np.full((2, 4), float(self.t), dtype = np.float32)
+            # env 0 terminates at step 2 with reward 50; env 1 truncates at step 4 with reward 2
+            rew = np.array([50. if self.t == 2 else 10., 2.], dtype = np.float32)
+            term = np.array([self.t == 2, False], dtype = bool)
+            trunc = np.array([False, self.t == 4], dtype = bool)
+            return obs, rew, term, trunc, {}
+
+    replay = ReplayBuffer(
+        './replay_test_vec_stop',
+        max_episodes = 2,
+        max_timesteps = 8,
+        fields = dict(
+            state = ('float', 4),
+            action = ('float', 2),
+            action_log_prob = ('float', 2),
+            reward = 'float',
+            value = 'float',
+            done = 'bool',
+            cond_mask = 'bool'
+        ),
+        meta_fields = dict(cum_rewards = 'float'),
+        overwrite = True
+    )
+
+    mean_cum_reward, steps = model.gather_experience_from_env_(
+        MockVecEnv(),
+        replay,
+        num_envs = 2,
+        max_timesteps = 7,
+        state_embed_kwargs = dict(state_type = 'raw'),
+        action_select_kwargs = dict(selector_index = 0),
+        state_id_kwarg = dict(state_id = 0)
+    )
+
+    # env 0 accumulated 10 + 50 = 60 over 2 steps; env 1 accumulated 2 * 4 = 8 over 4 steps
+
+    assert steps == 4
+    assert np.isclose(mean_cum_reward, (60. + 8.) / 2.)
+
+    batch = next(iter(replay.dataloader(batch_size = 2, shuffle = False)))
+
+    # env 0 has 2 learnable steps and done=True for the padding steps after its terminal transition
+
+    assert batch['done'][0].tolist()[:5] == [False, False, True, True, True]
+    assert batch['reward'][0, 2].item() == 0. and batch['value'][0, 2].item() == 0.
+
+    # env 1 has 4 learnable steps and one bootstrap node at step 4
+
+    assert batch['done'][1].tolist()[:5] == [False, False, False, False, True]
+    assert torch.allclose(batch['reward'][1, 4], batch['value'][1, 4])
+
+    # batched GAE matches per-episode GAE
+
+    masks = ~batch['done'][:, :5]
+    gae_batch, ret_batch = calc_gae(batch['reward'][:, :5], batch['value'][:, :5], masks = masks, use_accelerated = False)
+    gae_0, ret_0 = calc_gae(batch['reward'][0:1, :3], batch['value'][0:1, :3], masks = masks[0:1, :3], use_accelerated = False)
+    gae_1, ret_1 = calc_gae(batch['reward'][1:2, :5], batch['value'][1:2, :5], masks = masks[1:2, :5], use_accelerated = False)
+
+    assert torch.allclose(gae_batch[0, :2], gae_0[0, :2], atol = 1e-5)
+    assert torch.allclose(ret_batch[0, :2], ret_0[0, :2], atol = 1e-5)
+    assert torch.allclose(gae_batch[1, :4], gae_1[0, :4], atol = 1e-5)
+    assert torch.allclose(ret_batch[1, :4], ret_1[0, :4], atol = 1e-5)
+
+    shutil.rmtree('./replay_test_vec_stop', ignore_errors = True)

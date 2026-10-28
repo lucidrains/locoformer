@@ -103,12 +103,15 @@ def main(
     betas = (0.9, 0.99),
     gae_lam = 0.95,
     ppo_eps_clip = 0.2,
-    ppo_entropy_weight = .02,
-    state_entropy_bonus_weight = .1,
+    ppo_entropy_weight = .002,
+    state_entropy_bonus_weight = 0.,
     batch_size = 64,
     epochs = 3,
-    reward_range = (-10000., 10000.),
-    num_reward_bins = 25_000,
+    reward_range = (-100., 500.),
+    num_reward_bins = 1_000,
+    test_mock_reward_shaping = False,
+    vectorized_env_indices = (),
+    num_vectorized_envs = 16,
     cpu = False,
     use_wandb = False,
     wandb_mode = 'online',
@@ -138,6 +141,23 @@ def main(
     device = accelerator.device
 
     # model
+
+    reward_shaping_fns = None
+
+    if test_mock_reward_shaping:
+        reward_shaping_fns = [
+            [
+                (reward_linear_velocity_command_tracking, ('shaped_reward', 0)),
+                (reward_angular_velocity_command_tracking, ('shaped_reward', 1)),
+                (reward_base_linear_velocity_penalty,      ('shaped_reward', 2)),
+                (reward_base_angular_velocity_penalty,     ('shaped_reward', 3)),
+                (reward_base_height_penalty,               ('shaped_reward', 4)),
+                (reward_joint_velocity_penalty,            ('shaped_reward', 5)),
+                (reward_torque_penalty,                    ('shaped_reward', 6)),
+                (reward_alive,                             ('shaped_reward', 7)),
+            ],
+            []
+        ]
 
     locoformer = Locoformer(
         embedder = dict(
@@ -181,30 +201,19 @@ def main(
             (-0.4, 0.4), # humanoid
             (-1., 1.)    # cheetah
         ],
+        vectorized_env_indices = vectorized_env_indices,
         recurrent_cache = True,
         calc_gae_kwargs = dict(
             use_accelerated = False
         ),
         state_named_config = HUMANOID_OBS_CONFIG,
-        reward_shaping_fns = [
-            [
-                (reward_linear_velocity_command_tracking, ('shaped_reward', 0)),
-                (reward_angular_velocity_command_tracking, ('shaped_reward', 1)),
-                (reward_base_linear_velocity_penalty,      ('shaped_reward', 2)),
-                (reward_base_angular_velocity_penalty,     ('shaped_reward', 3)),
-                (reward_base_height_penalty,               ('shaped_reward', 4)),
-                (reward_joint_velocity_penalty,            ('shaped_reward', 5)),
-                (reward_torque_penalty,                    ('shaped_reward', 6)),
-                (reward_alive,                             ('shaped_reward', 7)),
-            ],
-            []
-        ],
-        use_spo = True,
+        reward_shaping_fns = reward_shaping_fns,
+        use_spo = False,
         asymmetric_spo = False,
         max_mem_segments = 2
     ).to(device)
 
-    optim_base = Adam(locoformer.transformer.parameters(), lr = learning_rate, betas = betas)
+    optim_base = Adam(locoformer.base_parameters(), lr = learning_rate, betas = betas)
     optim_actor = Adam(locoformer.actor_parameters(), lr = learning_rate, betas = betas)
     optim_critic = Adam(locoformer.critic_parameters(), lr = learning_rate, betas = betas)
 
@@ -227,15 +236,20 @@ def main(
 
         pbar.set_description(f'environment: {env_name}')
 
-        env = gym.make(env_name, render_mode = 'rgb_array')
+        is_vectorized = env_index in vectorized_env_indices
 
-        env = gym.wrappers.RecordVideo(
-            env = env,
-            video_folder = video_folder,
-            name_prefix = f'{learn_cycle}-{env_short_name}',
-            episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
-            disable_logger = True
-        )
+        if is_vectorized:
+            env = gym.make_vec(env_name, num_envs = num_vectorized_envs, vectorization_mode = 'sync', render_mode = 'rgb_array' if use_vision else None)
+        else:
+            env = gym.make(env_name, render_mode = 'rgb_array')
+
+            env = gym.wrappers.RecordVideo(
+                env = env,
+                video_folder = video_folder,
+                name_prefix = f'{learn_cycle}-{env_short_name}',
+                episode_trigger = lambda eps: divisible_by(eps, record_every_episode),
+                disable_logger = True
+            )
 
         # memory
 
@@ -264,7 +278,9 @@ def main(
                 meta_fields = dict(
                     cum_rewards = 'float'
                 ),
-                circular = True
+                circular = True,
+                overwrite = True,
+                flush_every_store_step = 0
             )
 
             replay_buffers[env_index] = replay
@@ -301,11 +317,15 @@ def main(
             internal_state = derive_internal_state
         )
 
-        for _ in range(num_episodes_before_learn):
+        num_envs = num_vectorized_envs if is_vectorized else 1
+        num_rollouts = max(num_episodes_before_learn // num_envs, 1)
+
+        for _ in range(num_rollouts):
 
             mean_cum_reward, steps_per_episode = locoformer.gather_experience_from_env_(
                 env,
                 replay,
+                num_envs = num_envs,
                 max_timesteps = max_timesteps,
                 use_vision = use_vision,
                 env_output_transforms = transforms,

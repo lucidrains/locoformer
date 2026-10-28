@@ -24,7 +24,7 @@ import torch
 from torch import nn, cat, stack, arange, Tensor, tensor, is_tensor, from_numpy, nested
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm, Identity, Sequential
-from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
+from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
 
@@ -60,8 +60,14 @@ from env_ssl_wrapper import compose_env
 
 from torch_einops_utils import (
     pad_at_dim,
-    lens_to_mask
+    lens_to_mask,
+    safe_cat,
+    tree_map_tensor,
+    tree_map_detach,
+    z_score
 )
+
+from torch_einops_utils.shape import shape, size
 
 # constants
 
@@ -84,10 +90,10 @@ DEFAULT_LOG_VAR_CLAMP_RANGE = (-6., 3.)
 # beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1)
 
 class BetaDist(ContinuousDistribution):
-    def __init__(self, eps = 1e-5, **kwargs):
+    def __init__(self, eps = 1e-5, init_conc = 6., **kwargs):
         super().__init__(eps = eps)
         kwargs.pop('unimodal', None) # mean-conc-beta is always unimodal by construction
-        self.beta = Beta(eps = eps, **kwargs)
+        self.beta = Beta(eps = eps, init_conc = init_conc, **kwargs)
 
     @property
     def default_range(self):
@@ -177,24 +183,6 @@ def log(t, eps = 1e-20):
 def is_empty(t):
     return t.numel() == 0
 
-def tree_map_tensor(x, fn):
-    return tree_map(lambda t: t if not is_tensor(t) else fn(t), x)
-
-def safe_cat(t, next_t, dim = -1):
-    if not exists(t):
-        return next_t
-
-    return cat((t, next_t), dim = dim)
-
-def normalize(t, mask = None, eps = 1e-5):
-    if exists(mask):
-        assert mask.any()
-
-    t_for_stats = t[mask] if exists(mask) else t
-    var, mean = torch.var_mean(t_for_stats)
-
-    return (t - mean) / var.sqrt().clamp_min(eps)
-
 def normalize_rollout_action(t):
     # during rollout (no time dim), actions and log probs may come out of the readout with an extra trailing singleton dim
     # or be squeezed of it entirely, normalize so they broadcast cleanly into the replay buffer fields
@@ -202,7 +190,7 @@ def normalize_rollout_action(t):
     if t.ndim == 1:
         return rearrange(t, 'b -> b 1')
 
-    if t.ndim == 3 and t.shape[-1] == 1:
+    if t.ndim == 3 and size(t, '... [l]') == 1:
         return rearrange(t, 'b n 1 -> b n')
 
     return t
@@ -385,7 +373,7 @@ def calc_gae(
     lam = 0.95,
     use_accelerated = None
 ):
-    assert values.shape[-1] == rewards.shape[-1]
+    assert size(values, '... [l]') == size(rewards, '... [l]')
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
     values = F.pad(values, (0, 1), value = 0.)
@@ -624,7 +612,7 @@ class Attention(Module):
         episode_ids: Tensor | None = None,
         past_episode_ids: Tensor | None = None
     ):
-        seq_len = tokens.shape[-2]
+        seq_len = size(tokens, '... [n] d')
 
         device = tokens.device
 
@@ -663,7 +651,7 @@ class Attention(Module):
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
-        i, j = sim.shape[-2:]
+        i, j = shape(sim, '... [i j]')
 
         if exists(flex_attention) and tokens.is_cuda:
             mask = create_xl_mask(i, j, self.window_size, episode_ids = all_episode_ids, lookback_blocks = self.max_mem_segments, device = device)
@@ -675,7 +663,7 @@ class Attention(Module):
                 dist = einx.subtract('i, j -> i j', i_seq, j_seq)
                 causal_mask = (dist < 0) | (dist > (self.max_mem_segments * self.window_size))
             else:
-                if not exists(self.causal_mask) or self.causal_mask.shape != (i, j):
+                if not exists(self.causal_mask) or shape(self.causal_mask, 'i j') != (i, j):
                     self.causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
 
                 causal_mask = self.causal_mask
@@ -850,7 +838,7 @@ class TransformerXL(Module):
         latent: Tensor | None = None,
         episode_ids: Tensor | None = None
     ):
-        curr_token_seq_len = x.shape[-2]
+        curr_token_seq_len = size(x, '... [n] d')
 
         # if episode ids are turned off, ignore them entirely
 
@@ -966,7 +954,7 @@ class TransformerXL(Module):
 
                 if is_mem_layer:
                     # accumulate hidden states
-                    next_layer_hidden_states = safe_cat(layer_hidden_states, x, dim = -2)
+                    next_layer_hidden_states = safe_cat([layer_hidden_states, x], dim = -2)
 
                     if is_window_boundary:
                         mem_store_input, _ = maybe_mem_store_hc(next_layer_hidden_states)
@@ -999,7 +987,7 @@ class TransformerXL(Module):
 
         # accumulate current window episode ids
 
-        curr_episode_ids = safe_cat(curr_episode_ids, episode_ids, dim = -1)
+        curr_episode_ids = safe_cat([curr_episode_ids, episode_ids], dim = -1)
 
         # at window boundaries, move the previous window into memory segments, keeping only the current window in the kv cache
 
@@ -1020,10 +1008,8 @@ class TransformerXL(Module):
         # maybe recurrent cache
 
         if self.recurrent_cache and is_window_boundary:
+            # recurrent cache rolls the layer axis only; episode ids stay batch-aligned
             next_kv_cache = torch.roll(next_kv_cache, shifts = -1, dims = 0)
-
-            if exists(curr_episode_ids):
-                curr_episode_ids = torch.roll(curr_episode_ids, shifts = -1, dims = 0)
 
             if exists(next_gru_hiddens):
                 next_gru_hiddens = torch.roll(next_gru_hiddens, shifts = -1, dims = 0)
@@ -1109,7 +1095,7 @@ class MemoryMLP(Module):
         memories: dict[str, Tensor] | None = None
     ):
 
-        batch_size = tokens.shape[0]
+        batch_size = size(tokens, '[b] ...')
 
         if not exists(memories):
             memories = self.get_init_mlp_params(batch_size)
@@ -1149,7 +1135,7 @@ class MemoryMLP(Module):
         tokens, # (b n d)
         memories: dict[str, Tensor] | None = None
     ):
-        batch_size = tokens.shape[0]
+        batch_size = size(tokens, '[b] ...')
 
         if not exists(memories):
             memories = self.get_init_mlp_params(batch_size)
@@ -1190,7 +1176,7 @@ class StateEmbedder(Module):
         dim_states = (dim_state,) if not isinstance(dim_state, (tuple, list)) else dim_state
 
         self.dim_states = dim_states
-        self.state_to_token = ModuleList([MLP(dim_state, dim, bias = False) for dim_state in dim_states])
+        self.state_to_token = ModuleList([MLP(dim_state, dim) for dim_state in dim_states])
 
         # internal state embeds for each robot
 
@@ -1302,7 +1288,7 @@ class ForwardDynamics(Module):
     ):
         selector = self.action_embedder.get_selector(selector_index)
 
-        if selector.has_discrete and action.shape[-1] == 1:
+        if selector.has_discrete and size(action, '... [l]') == 1:
             action = rearrange(action, '... 1 -> ...')
 
         return self.action_embedder(action, selector_index = selector_index)
@@ -1458,6 +1444,7 @@ class Locoformer(Module):
         recurrent_cache = True,
         use_spo = False,        # simple policy optimization https://arxiv.org/abs/2401.16025 - Levine's group (PI) verified it is more stable than PPO
         asymmetric_spo = False, # https://openreview.net/pdf?id=BA6n0nmagi
+        per_action_dim = True,  # dimension-wise clipping / target (DISC) https://arxiv.org/abs/1905.02363
         use_delight_pg = False, # https://arxiv.org/abs/2603.14608
         delight_pg_temperature = 1.,
         spo_epsilon: float | tuple[float, float] = 0.05,
@@ -1684,6 +1671,7 @@ class Locoformer(Module):
         self.use_spo = use_spo
 
         self.asymmetric_spo = asymmetric_spo
+        self.per_action_dim = per_action_dim
         self.use_delight_pg = use_delight_pg
         self.delight_pg_temperature = delight_pg_temperature
         self.spo_epsilon = spo_epsilon
@@ -1784,6 +1772,12 @@ class Locoformer(Module):
             *self.embedder.parameters(),
             *self.transformer.parameters()
         ]
+
+        if exists(self.past_action_embedder):
+            params.extend(self.past_action_embedder.parameters())
+
+        if exists(self.to_latent_cond):
+            params.extend(self.to_latent_cond.parameters())
 
         if self.can_pred_state:
             params.extend(self.state_pred_network.parameters())
@@ -1928,8 +1922,15 @@ class Locoformer(Module):
         state_pred_loss_weight = default(state_pred_loss_weight, self.state_pred_loss_weight)
 
         window_size = self.window_size
+
+        def reduce_action_dim(t, mean = False):
+            if t.ndim < 3:
+                return t
+            return t.mean(dim = -1) if mean else t.sum(dim = -1)
+
         mask = ~done
-        seq_len = state.shape[1]
+        seq_len = size(state, 'b [n] ...')
+        batch_size = size(state, '[b] ...')
         padding_mask = einx.less('j, i -> i j', arange(seq_len, device = self.device), episode_lens)
         gae_mask = padding_mask & mask
 
@@ -1938,12 +1939,12 @@ class Locoformer(Module):
         if not is_tensor(action_log_prob):
             action_log_prob = self.unembedder.maybe_concat(action_log_prob, concat = True)
 
-        if action_log_prob.ndim == 3:
-            action_log_prob = action_log_prob.sum(dim = -1)
+        if not self.per_action_dim:
+            action_log_prob = reduce_action_dim(action_log_prob)
 
         advantage, returns = calc_gae(reward, value, masks = gae_mask, lam = self.gae_lam, gamma = self.discount_factor, **self.calc_gae_kwargs)
 
-        advantage = normalize(advantage, mask = gae_mask)
+        advantage = z_score(advantage, mask = gae_mask)
 
         past_action = pad_at_dim(action, (1, -1), dim = -2)
 
@@ -1953,9 +1954,9 @@ class Locoformer(Module):
         episode_id = episode_indices
 
         if exists(episode_id):
-            episode_id = episode_id * state.shape[0] + repeat(arange(state.shape[0], device = self.device), 'b -> b 1')
+            episode_id = episode_id * batch_size + repeat(arange(batch_size, device = self.device), 'b -> b 1')
         else:
-            episode_id = repeat(arange(state.shape[0], device = self.device), 'b -> b n', n = seq_len)
+            episode_id = repeat(arange(batch_size, device = self.device), 'b -> b n', n = seq_len)
         data_dict = dict(
             state = state,
             internal_state = internal_state,
@@ -2022,12 +2023,15 @@ class Locoformer(Module):
 
             data = SimpleNamespace(**dict(zip(windowed_data.keys(), window_tensors)))
 
+            if not data.windowed_gae_mask.any():
+                continue
+
             ((action_logits, maybe_state_pred), value_logits), cache = self.forward(data.state, past_action = data.past_action if self.embed_past_action else None, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': data.internal_state}, action_select_kwargs = action_select_kwargs, state_id_kwarg = state_id_kwarg, condition = data.condition, cond_mask = data.cond_mask, latent_gene_id = data.latent_gene_id, episode_id = data.episode_id, cache = cache, detach_cache = True, return_values = True, return_raw_value_logits = True, return_state_pred = True)
 
             log_prob = self.unembedder.log_prob(action_logits, data.action, concat = True, **action_select_kwargs)
 
-            if log_prob.ndim == 3:
-                log_prob = log_prob.sum(dim = -1)
+            if not self.per_action_dim:
+                log_prob = reduce_action_dim(log_prob)
 
             old_action_log_prob = data.old_action_log_prob
 
@@ -2036,13 +2040,14 @@ class Locoformer(Module):
             eps_clip = self.ppo_eps_clip
             spo_eps_clip = self.spo_epsilon
             ratio = (log_prob - old_action_log_prob).exp()
+            adv = rearrange(data.advantage, '... -> ... 1') if log_prob.ndim == 3 else data.advantage
 
-            calc_spo = lambda: -(ratio * data.advantage - (data.advantage.abs() * (ratio - 1.).square()) / (2 * spo_eps_clip))
+            calc_spo = lambda: -(ratio * adv - (adv.abs() * (ratio - 1.).square()) / (2 * spo_eps_clip))
 
-            calc_ppo = lambda: -torch.min(ratio * data.advantage, ratio.clamp(1. - eps_clip, 1. + eps_clip) * data.advantage)
+            calc_ppo = lambda: -torch.min(ratio * adv, ratio.clamp(1. - eps_clip, 1. + eps_clip) * adv)
 
             if self.asymmetric_spo:
-                actor_loss = torch.where(data.advantage >= 0, calc_ppo(), calc_spo())
+                actor_loss = torch.where(adv >= 0, calc_ppo(), calc_spo())
             elif self.use_spo:
                 actor_loss = calc_spo()
             else:
@@ -2051,9 +2056,11 @@ class Locoformer(Module):
             if self.use_delight_pg:
                 # Delightful Policy Gradient
                 # Ian Osband et al. - https://arxiv.org/abs/2603.14608
-                delight = (-log_prob * data.advantage) / self.delight_pg_temperature
+                delight = (-log_prob * adv) / self.delight_pg_temperature
                 delight_gate = delight.sigmoid().detach()
                 actor_loss = actor_loss * delight_gate
+
+            actor_loss = reduce_action_dim(actor_loss, mean = True)
 
             # maybe entropy
 
@@ -2061,8 +2068,7 @@ class Locoformer(Module):
                 entropy = self.unembedder.entropy(action_logits, concat = True, **action_select_kwargs)
 
                 if exists(entropy):
-                    if entropy.ndim == 3:
-                        entropy = entropy.sum(dim = -1)
+                    entropy = reduce_action_dim(entropy, mean = self.per_action_dim)
 
                     actor_loss = actor_loss - self.ppo_entropy_weight * entropy
 
@@ -2114,10 +2120,6 @@ class Locoformer(Module):
             if exists(env_loss_weight):
                 windowed_actor_loss = windowed_actor_loss * env_loss_weight
 
-            # windowed loss
-
-            windowed_actor_loss.backward(retain_graph = True)
-
             # update critic
 
             value_loss = self.hl_gauss_loss(value_logits, data.returns, reduction = 'none') * self.value_loss_weight
@@ -2127,23 +2129,27 @@ class Locoformer(Module):
             if exists(env_loss_weight):
                 windowed_critic_loss = windowed_critic_loss * env_loss_weight
 
-            windowed_critic_loss.backward(retain_graph = True)
+            # single combined backward pass per window
+
+            (windowed_actor_loss + windowed_critic_loss).backward()
 
             # accumulate
 
-            mean_actor_loss.add_(windowed_actor_loss)
-            mean_critic_loss.add_(windowed_critic_loss)
+            mean_actor_loss.add_(windowed_actor_loss.detach())
+            mean_critic_loss.add_(windowed_critic_loss.detach())
 
         # optimizer update
 
         if exists(optims):
 
-            if exists(accelerator):
-                accelerator.clip_grad_norm_(self.parameters(), max_grad_norm)
-            else:
-                nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+            clip_grad_norm = accelerator.clip_grad_norm_ if exists(accelerator) else nn.utils.clip_grad_norm_
 
             for optim in optims:
+                params = [p for group in optim.param_groups for p in group['params'] if exists(p.grad)]
+
+                if len(params) > 0:
+                    clip_grad_norm(params, max_grad_norm)
+
                 optim.step()
                 optim.zero_grad()
 
@@ -2281,11 +2287,12 @@ class Locoformer(Module):
         # obs batched along a leading dim, numpy converted to float32 torch tensors,
         # regardless of sim (gymnasium, legacy gym, dm_control, isaac, robosuite, ...)
 
-        wrapped_env = compose_env(
-            env,
-            'auto_batch',
-            ('tensor', dict(device = self.device))
-        )
+        wrappers = [('tensor', dict(device = self.device))]
+
+        if not is_vectorized:
+            wrappers.insert(0, 'auto_batch')
+
+        wrapped_env = compose_env(env, *wrappers)
 
         def wrapped_reset(*args, **kwargs):
             env_reset_out = wrapped_env.reset(*args, **kwargs)
@@ -2309,12 +2316,12 @@ class Locoformer(Module):
                 action = tensor(action)
 
             if is_vectorized:
-                if action.shape[-1] == 1:
+                if size(action, '... [l]') == 1:
                     action = rearrange(action, 'b 1 -> b')
 
                 env_action = action.detach().cpu().numpy()
             else:
-                if action.ndim > 0 and action.shape[0] == 1:
+                if action.ndim > 0 and size(action, '[b] ...') == 1:
                     action = action[0]
 
                 if action.numel() == 1:
@@ -2414,7 +2421,7 @@ class Locoformer(Module):
 
                 if exists(cond_mask):
                     if has_batch_dim and cond_mask.ndim == 0:
-                        cond_mask = repeat(cond_mask, '-> b', b = state.shape[0])
+                        cond_mask = repeat(cond_mask, '-> b', b = size(state, '[b] ...'))
 
                     cond_mask = rearrange(cond_mask, 'b ... -> b 1 ...')
 
@@ -2447,15 +2454,21 @@ class Locoformer(Module):
             # maybe remove batch or time
 
             if not has_time_dim:
-                out = tree_map_tensor(out, lambda t: rearrange(t, 'b 1 ... -> b ...'))
+                out = tree_map_tensor(lambda t: rearrange(t, 'b 1 ... -> b ...'), out)
 
             if not has_batch_dim:
-                out = tree_map_tensor(out, lambda t: rearrange(t, '1 ... -> ...'))
+                out = tree_map_tensor(lambda t: rearrange(t, '1 ... -> ...'), out)
 
             return out
 
         if inference_mode:
             stateful_forward = torch.inference_mode()(stateful_forward)
+
+        def reset_cache():
+            nonlocal cache
+            cache = None
+
+        stateful_forward.reset_cache = reset_cache
 
         # handle prompt
 
@@ -2528,6 +2541,8 @@ class Locoformer(Module):
             stateful_forward = self.get_stateful_forward(has_batch_dim = True, has_time_dim = False, inference_mode = True)
             self.rollout_stateful_forward = stateful_forward
             self.rollout_env = env
+        elif not self.use_cross_episode_attention:
+            self.rollout_stateful_forward.reset_cache()
 
         stateful_forward = self.rollout_stateful_forward
 
@@ -2561,6 +2576,8 @@ class Locoformer(Module):
                 sampled_env_params[name] = tensor(sampled_values, device = self.device)
 
         all_cum_rewards = torch.zeros(num_envs, device = self.device)
+        has_stopped = torch.zeros(num_envs, device = self.device, dtype = torch.bool)
+        needs_bootstrap = torch.zeros(num_envs, device = self.device, dtype = torch.bool)
 
         with replay.batched_episode(num_envs, **compact_dict(dict(latent_gene_id = latent_gene_id))):
 
@@ -2619,6 +2636,11 @@ class Locoformer(Module):
 
                 # maybe state entropy bonus
 
+                reward = reward.to(self.device).float()
+                value = value.to(self.device).float()
+                terminated_dev = terminated.to(self.device).bool()
+                truncated_dev = truncated.to(self.device).bool()
+
                 if state_entropy_bonus_weight > 0.:
                     entropy = None
 
@@ -2638,16 +2660,26 @@ class Locoformer(Module):
                         entropy = self.latent_dynamics.entropy(latent, action, selector_index = action_select_kwargs.get('selector_index')).mean(dim = -1)
 
                     if exists(entropy):
-                        reward = reward.to(self.device).float() + entropy * state_entropy_bonus_weight
+                        reward = reward + entropy * state_entropy_bonus_weight
 
-                # cum rewards
+                # mask out rewards and values for sub-envs that already finished on an earlier step
 
-                all_cum_rewards += reward.to(self.device).float()
+                active = ~has_stopped
+                bootstrap_value = torch.where(needs_bootstrap, value, torch.zeros_like(value))
 
-                # increment counters
+                all_cum_rewards += torch.where(active, reward, torch.zeros_like(reward))
+
+                store_value = torch.where(active, value, bootstrap_value)
+                store_reward = torch.where(active, reward, bootstrap_value)
+                store_done = has_stopped
+
+                # increment counters and update per-env stop flags
 
                 exceeds_max_timesteps = max_timesteps >= 0 and timestep == (max_timesteps - 1)
-                should_stop = (terminated | truncated).all() or exceeds_max_timesteps
+                newly_stopped = active & (terminated_dev | truncated_dev | exceeds_max_timesteps)
+                needs_bootstrap = newly_stopped & (~terminated_dev)
+                has_stopped = has_stopped | newly_stopped
+                should_stop = has_stopped.all().item()
 
                 replay.store_batch(**compact_dict(dict(
                     state = state,
@@ -2655,9 +2687,9 @@ class Locoformer(Module):
                     action = action,
                     action_log_prob = action_log_prob,
                     internal_state = internal_state,
-                    reward = reward,
-                    value = value,
-                    done = terminated.to(self.device),
+                    reward = store_reward,
+                    value = store_value,
+                    done = store_done,
                     condition = maybe_command,
                     cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
                     **sampled_env_params
@@ -2669,20 +2701,22 @@ class Locoformer(Module):
                 if should_stop:
 
                     # handle bootstrap value, which is a non-learnable timestep added with the next value for GAE
-                    # only for those not terminated
+                    # only for those that stopped on this final step without terminating
 
-                    next_state_for_model = next_state_image if use_vision else next_state
+                    bootstrap_value = torch.zeros_like(reward)
 
-                    _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool), latent_gene_id = latent_gene_id, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
-                    bootstrap_value = torch.where(terminated.to(self.device), torch.zeros_like(next_value), next_value)
-                    bootstrap_reward = torch.where(terminated.to(self.device), torch.zeros_like(reward.to(self.device)), next_value)
+                    if needs_bootstrap.any():
+                        next_state_for_model = next_state_image if use_vision else next_state
+
+                        _, next_value = stateful_forward(next_state_for_model, condition = maybe_command, cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool), latent_gene_id = latent_gene_id, return_values = True, state_embed_kwargs = {**state_embed_kwargs, 'internal_state': internal_state}, state_id_kwarg = state_id_kwarg, action_select_kwargs = action_select_kwargs)
+                        bootstrap_value = torch.where(needs_bootstrap, next_value.to(self.device).float(), bootstrap_value)
 
                     replay.store_batch(**compact_dict(dict(
                         state = next_state,
                         state_image = next_state_image,
                         internal_state = next_internal_state,
                         value = bootstrap_value,
-                        reward = bootstrap_reward,
+                        reward = bootstrap_value,
                         done = torch.ones(num_envs, device = self.device, dtype = torch.bool),
                         condition = maybe_command,
                         cond_mask = torch.full((num_envs,), exists(maybe_command), device = self.device, dtype = torch.bool),
@@ -2785,7 +2819,7 @@ class Locoformer(Module):
 
         # time
 
-        time = tokens.shape[-2]
+        time = size(tokens, '... [n] d')
 
         # determine if we have episode ids
 
@@ -2866,11 +2900,6 @@ class Locoformer(Module):
 
             out = (out, state_pred)
 
-        # maybe detach cache
-
-        if detach_cache:
-            cache = tree_map_tensor(cache, lambda t: t.detach())
-
         # handle returning of values
 
         if return_values:
@@ -2887,5 +2916,10 @@ class Locoformer(Module):
             cache = (backbone_cache, actor_cache, critic_cache)
         else:
             cache = backbone_cache
+
+        # maybe detach cache
+
+        if detach_cache:
+            cache = tree_map_detach(cache)
 
         return out, cache

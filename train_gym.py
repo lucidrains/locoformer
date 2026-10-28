@@ -86,34 +86,36 @@ def main(
     num_episodes_before_learn = 32,
     alternate_env_every = 1,
     max_timesteps = 500,
-    replay_buffer_size = 64,
+    replay_buffer_size = 32,
     use_vision = False,
     embed_past_action = False,
     vision_height_width_dim = 64,
     clear_folders = True,
     video_folder = 'recordings',
     record_every_episode = 250,
-    learning_rate = 8e-4,
+    learning_rate = 1e-3,
     discount_factor = 0.99,
     betas = (0.9, 0.99),
     gae_lam = 0.95,
     ppo_eps_clip = 0.2,
-    ppo_entropy_weight = .01,
-    state_entropy_bonus_weight = .05,
+    ppo_entropy_weight = .002,
+    state_entropy_bonus_weight = 0.,
     batch_size = 16,
-    epochs = 3,
+    epochs = 4,
     reward_range = (-300., 300.),
     test_episode_mapping_constructor = False,
     test_mock_internal_states = False,
     test_mock_reward_shaping = False,
+    test_domain_rand = False,
     vectorized_env_indices = (),
-    num_vectorized_envs = 4,
+    num_vectorized_envs = 16,
     cpu = False,
     use_wandb = False,
     wandb_project = 'locoformer-gym',
     actor_depth = 0,
     critic_depth = 0,
-    continuous_dist_type = 'beta'
+    continuous_dist_type = 'beta',
+    compute_state_pred_loss = False
 ):
 
     if clear_folders:
@@ -152,11 +154,14 @@ def main(
 
     # model
 
-    rand_env_param_samplers = [
-        None, # cartpole
-        dict(wind_power = lambda: random.uniform(0, 20)),
-        dict(wind_power = lambda: random.uniform(0, 20))
-    ]
+    rand_env_param_samplers = None
+
+    if test_domain_rand:
+        rand_env_param_samplers = [
+            None, # cartpole
+            dict(wind_power = lambda: random.uniform(0, 20)),
+            dict(wind_power = lambda: random.uniform(0, 20))
+        ]
 
     locoformer = Locoformer(
         reward_shaping_fns = reward_shaping_fns,
@@ -252,7 +257,7 @@ def main(
         is_vectorized = env_index in vectorized_env_indices
 
         if is_vectorized:
-            env = gym.make_vec(env_name, num_envs = num_vectorized_envs, vectorization_mode = 'sync', render_mode = 'rgb_array', **env_kwargs)
+            env = gym.make_vec(env_name, num_envs = num_vectorized_envs, vectorization_mode = 'sync', render_mode = 'rgb_array' if use_vision else None, **env_kwargs)
         else:
             env = gym.make(env_name, render_mode = 'rgb_array', **env_kwargs)
 
@@ -283,7 +288,6 @@ def main(
                 max_timesteps + 1, # one extra node for bootstrap node - not relevant for locoformer, but for completeness
                 fields = dict(
                     state       = ('float', dim_state),
-                    state_image = ('float', dim_state_image_shape),
                     action      = ('int', 1) if not continuous else ('float', num_actions),
                     action_log_prob = ('float', 1 if not continuous else num_actions),
                     reward      = 'float',
@@ -292,13 +296,15 @@ def main(
                     condition   = ('float', 2),
                     cond_mask   = 'bool',
                     internal_state = ('float', 2),
-                    wind_power = 'float'
+                    wind_power = 'float',
+                    **(dict(state_image = ('float', dim_state_image_shape)) if use_vision else dict())
                 ),
                 meta_fields = dict(
                     cum_rewards = 'float'
                 ),
                 circular = True,
-                overwrite = True
+                overwrite = True,
+                flush_every_store_step = 0
             )
 
             replay_buffers[env_index] = replay
@@ -309,8 +315,6 @@ def main(
             state_embed_kwargs = dict(state_type = 'image')
         else:
             state_embed_kwargs = dict(state_type = 'raw')
-
-        compute_state_pred_loss = True
 
         # specific embodiment state id and action selector id
 
@@ -408,6 +412,8 @@ def main(
                 actor_loss = actor_loss.item(),
                 critic_loss = critic_loss.item()
             ))
+
+        env.close()
 
 # main
 
